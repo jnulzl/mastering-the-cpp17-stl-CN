@@ -1,0 +1,195 @@
+C++ 标准库（standard library）肩负着两项截然不同却又同等重要的使命。其中一项使命，是为那些在许多不同程序中都有用、却未被纳入核心语言语法的具体数据类型或函数，提供坚如磐石的实现。正因如此，标准库才包含了 \texttt{std::\allowbreak{}string}、\texttt{std::\allowbreak{}regex}、\texttt{std::\allowbreak{}filesystem::\allowbreak{}exists} 等等。标准库的另一项使命，是为排序、查找、反转、整理等广为使用的算法（algorithm）提供同样可靠的实现。在本章中，我们将精确厘清：当我们说某段代码是“抽象”的时候，究竟意味着什么；并描述标准库用来提供抽象的两种手段：古典多态（classical polymorphism）与泛型编程（generic programming）。
+
+本章我们将讨论以下主题：
+
+具体（concrete）的单态（monomorphic）函数，其行为不可参数化
+
+通过基类、虚成员函数与继承实现的古典多态
+
+通过概念（concept）、要求（requirement）与模型（model）实现的泛型编程
+
+两种手段各自的实践优劣
+
+\section{具体的单态函数}
+
+抽象算法（abstract algorithm）与具体函数的区别何在？最好的说明方式莫过于举例。我们来编写一个函数，把数组中的每个元素都乘以 2：
+
+\begin{codebox}[cpp]
+    class array_of_ints {
+      int data[10] = {};
+      public:
+        int size() const { return 10; }
+        int& at(int i) { return data[i]; }
+    };
+    void double_each_element(array_of_ints& arr)
+    {
+      for (int i=0; i < arr.size(); ++i) {
+        arr.at(i) *= 2;
+      }
+    }
+\end{codebox}
+
+我们的 \texttt{double\_\allowbreak{}each\_\allowbreak{}element} 函数只能作用于 \texttt{array\_\allowbreak{}of\_\allowbreak{}int} 类型的对象；传入其他类型的对象将无法工作（甚至连编译都通不过）。我们把像这个版本的 \texttt{double\_\allowbreak{}each\_\allowbreak{}element} 这样的函数称为具体函数或单态函数。之所以称其为“具体”，是因为它们对我们而言抽象程度不足。试想一下，如果 C++ 标准库提供的 \texttt{sort} 例程只能作用于某一种特定的数据类型，那该有多么令人头疼！
+
+\section{古典多态函数}
+
+我们可以通过面向对象（OO）编程的技术来提高算法的抽象层次，正如 Java 与 C\# 等语言中所见。面向对象（OO）的做法是：先确切地确定哪些行为应当是可定制的，再将其声明为某个抽象基类的公有虚成员函数：
+
+\begin{codebox}[cpp]
+    class container_of_ints {
+      public:
+      virtual int size() const = 0;
+      virtual int& at(int) = 0;
+    };
+    class array_of_ints : public container_of_ints {
+      int data[10] = {};
+      public:
+        int size() const override { return 10; }
+        int& at(int i) override { return data[i]; }
+    };
+    class list_of_ints : public container_of_ints {
+      struct node {
+        int data;
+        node *next;
+      };
+      node *head_ = nullptr;
+      int size_ = 0;
+      public:
+       int size() const override { return size_; }
+       int& at(int i) override {
+        if (i >= size_) throw std::out_of_range("at");
+        node *p = head_;
+        for (int j=0; j < i; ++j) {
+          p = p->next;
+        }
+        return p->data;
+      }
+      ~list_of_ints();
+    };
+    void double_each_element(container_of_ints& arr)
+    {
+      for (int i=0; i < arr.size(); ++i) {
+        arr.at(i) *= 2;
+      }
+    }
+    void test()
+    {
+      array_of_ints arr;
+      double_each_element(arr);
+      list_of_ints lst;
+      double_each_element(lst);
+    }
+\end{codebox}
+
+在 \texttt{test} 函数内部，两次对 \texttt{double\_\allowbreak{}each\_\allowbreak{}element} 的调用都能通过编译，这是因为，在古典面向对象（OO）术语中，一个 \texttt{array\_\allowbreak{}of\_\allowbreak{}ints} IS-A \texttt{container\_\allowbreak{}of\_\allowbreak{}ints}（也就是说，它继承自 \texttt{container\_\allowbreak{}of\_\allowbreak{}ints} 并实现了相关的虚成员函数），而一个 \texttt{list\_\allowbreak{}of\_\allowbreak{}ints} 同样 IS-A \texttt{container\_\allowbreak{}of\_\allowbreak{}ints}。然而，任何一个 \texttt{container\_\allowbreak{}of\_\allowbreak{}ints} 对象的行为，都是由它的动态类型——也就是与该特定对象相关联的那张函数指针表——所参数化的。
+
+既然我们现在无需直接改动 \texttt{double\_\allowbreak{}each\_\allowbreak{}element} 的源代码——只需传入不同动态类型的对象——就能对其行为进行参数化，我们便说这个函数已经变得多态（polymorphic）了。
+
+但是，这个多态函数仍然只能处理那些继承自基类 \texttt{container\_\allowbreak{}of\_\allowbreak{}ints} 的类型。例如，你无法把一个 \texttt{std::\allowbreak{}vector<\allowbreak{}int>\allowbreak{}} 传给这个函数；如果强行尝试，就会得到编译错误。古典多态固然有用，但它并不能把我们一路带到完全的泛型性。
+
+古典（面向对象）多态的一个优点在于：源代码与编译器所生成的机器码之间，仍然保持着一一对应的关系。在机器码层面，我们依旧只有一个 \texttt{double\_\allowbreak{}each\_\allowbreak{}element} 函数，具有一个签名（signature）和定义良好的入口点。例如，我们可以取 \texttt{double\_\allowbreak{}each\_\allowbreak{}element} 的地址，把它当作函数指针来使用。
+
+\section{用模板进行泛型编程}
+
+在现代 C++ 中，编写一个完全泛型算法的典型方式，是把该算法实现为一个模板（template）。我们仍将以公有成员函数 \texttt{.size(\allowbreak{})\allowbreak{}} 与 \texttt{.at(\allowbreak{})\allowbreak{}} 的方式来实现这个函数模板，但不再要求参数 \texttt{arr} 是任何特定的类型。因为我们的新函数将是一个模板（template），所以我们等于在告诉编译器：“我不在乎 \texttt{arr} 究竟是什么类型。无论它是什么类型，就请以其作为参数类型，生成一个全新的函数（也就是一次模板实例化）。”
+
+\begin{codebox}[cpp]
+    template<class ContainerModel>
+    void double_each_element(ContainerModel& arr)
+    {
+      for (int i=0; i < arr.size(); ++i) {
+        arr.at(i) *= 2;
+      }
+    }
+    void test()
+    {
+      array_of_ints arr;
+      double_each_element(arr);
+      list_of_ints lst;
+      double_each_element(lst);
+      std::vector<int> vec = {1, 2, 3};
+      double_each_element(vec);
+    }
+\end{codebox}
+
+在大多数情况下，如果我们能用语言精确表述：模板类型参数 \texttt{Container\allowbreak{}Model} 究竟必须支持哪些操作，将有助于我们设计出更好的程序。这组操作合在一起，就构成了 C++ 中所谓的概念；在本例中，我们或许会说，名为 \texttt{Container} 的这个容器（container）概念由以下要素构成：“拥有一个名为 \texttt{size} 的成员函数，它把容器的大小作为一个 \texttt{int}（或与 \texttt{int} 可比较的类型）返回；并且拥有一个名为 \texttt{at} 的成员函数，它接受一个 \texttt{int} 索引（或可隐式从 \texttt{int} 转换而来的类型），并产生对容器第 index 个元素的非 \texttt{const} 引用。”每当某个类 \texttt{array\_\allowbreak{}of\_\allowbreak{}ints} 正确地提供了概念 \texttt{Container} 所要求的操作时，从而让 \texttt{array\_\allowbreak{}of\_\allowbreak{}ints} 可以与 \texttt{double\_\allowbreak{}each\_\allowbreak{}element} 配合使用，我们就说这个具体类 \texttt{array\_\allowbreak{}of\_\allowbreak{}ints} 是概念 \texttt{Container} 的一个模型（model）。这也就是我在前面的例子中把模板类型参数命名为 \texttt{Container\allowbreak{}Model} 的原因。
+
+把模板类型参数本身命名为 \texttt{Container} 会更符合传统，今后我也会这么做；之所以一开始没有这样命名，是不想让我们从一开始就误入歧途，把“\texttt{Container} 概念”与“恰好期望以一个建模了 \texttt{Container} 概念的具体类作为实参的、这个特定函数模板的那个特定模板类型参数”混为一谈。
+
+当我们用模板来实现一个抽象算法，从而使其行为可以在编译期由任何建模了相应概念的类型进行参数化时，我们就说：我们正在从事泛型编程。
+
+请注意，我们对容器概念的描述，并没有提及我们期望被包含元素的类型是 \texttt{int}；而这绝非偶然——我们发现，如今即使对于不包含 \texttt{int} 的容器，也能使用我们这个泛型的 \texttt{double\_\allowbreak{}each\_\allowbreak{}element} 函数！
+
+\begin{codebox}[cpp]
+    std::vector<double> vecd = {1.0, 2.0, 3.0};
+    double_each_element(vecd);
+\end{codebox}
+
+这种额外一层的泛型性，正是使用 C++ 模板进行泛型编程、相较于古典多态的一大好处。古典多态把不同类的变化行为，隐藏在一个稳定的接口签名（signature）背后（例如 \texttt{.at(\allowbreak{}i)\allowbreak{}} 总是返回 \texttt{int\&}）；然而一旦你开始折腾起变化的签名，古典多态就不再是称手的工具了。
+
+泛型编程的另一个优点，是通过增加内联（inlining）的机会而带来惊人的速度。在古典多态的例子中，必须反复查询 \texttt{container\_\allowbreak{}of\_\allowbreak{}int} 对象的虚表（vtable），以找到其特定虚 \texttt{at} 方法的地址，而且在编译期通常无法看穿这次虚分派（virtual dispatch）。
+
+模板函数 \texttt{double\_\allowbreak{}each\_\allowbreak{}element<\allowbreak{}array\_\allowbreak{}of\_\allowbreak{}int>\allowbreak{}} 则可以直接编译成对 \texttt{array\_\allowbreak{}of\_\allowbreak{}int::\allowbreak{}at} 的调用，甚至把这次调用完全内联（inlining）掉。
+
+正因为基于模板的泛型编程能够如此轻易地应对复杂的要求，并且在处理类型时——即便是像 \texttt{int} 这样古典多态无能为力的原始类型——也如此灵活，标准库才为其所有算法以及这些算法所操作的容器使用了模板。正因如此，标准库中“算法加容器”的那一部分，常被称为标准模板库（Standard Template Library，简称 STL）。
+
+没错——从技术上讲，STL 其实只是 C++ 标准库中很小的一部分！不过，正如在现实生活中一样，在本书中我们有时也会不小心：当我们本意是“标准库”时，却用了 STL 一词，或者反过来。
+
+在深入探究 STL 所提供的标准泛型算法之前，我们先来看几个手写的泛型算法。下面是一个名为 \texttt{count} 的函数模板，它返回容器中元素的总数：
+
+\begin{codebox}[cpp]
+    template<class Container>
+    int count(const Container& container)
+    {
+      int sum = 0;
+      for (auto&& elt : container) {
+        sum += 1;
+      }
+      return sum;
+    }
+\end{codebox}
+
+下面这个 \texttt{count\_\allowbreak{}if}，则返回满足用户所提供的谓词（predicate）函数的元素个数：
+
+\begin{codebox}[cpp]
+    template<class Container, class Predicate>
+    int count_if(const Container& container, Predicate pred)
+    {
+      int sum = 0;
+      for (auto&& elt : container) {
+        if (pred(elt)) {
+            sum += 1;
+        }
+      }
+      return sum;
+    }
+\end{codebox}
+
+这些函数的用法如下所示：
+
+\begin{codebox}[cpp]
+    std::vector<int> v = {3, 1, 4, 1, 5, 9, 2, 6};
+    assert(count(v) == 8);
+    int number_above =
+      count_if(v, [](int e) { return e > 5; });
+    int number_below =
+      count_if(v, [](int e) { return e < 5; });
+    assert(number_above == 2);
+    assert(number_below == 5);
+\end{codebox}
+
+在那个小小的表达式 \texttt{pred(\allowbreak{}elt)\allowbreak{}} 中，竟然蕴藏着如此巨大的威力！我鼓励你试着用古典多态把 \texttt{count\_\allowbreak{}if} 重新实现一遍，好体会一下整件事是在哪里瓦解的。现代 C++ 的语法糖之下，潜藏着大量变化的签名。例如，我们 \texttt{count\_\allowbreak{}if} 中基于范围的 for 循环语法，会被编译器转换（或者说“下沉”）为一个以 \texttt{container.\allowbreak{}begin(\allowbreak{})\allowbreak{}} 与 \texttt{container.\allowbreak{}end(\allowbreak{})\allowbreak{}} 表达的 for 循环，而这两者各自都需要返回一个迭代器（iterator），其类型依赖于 \texttt{container} 自身的类型。再举一例：在泛型编程的版本中，我们从未指定——也根本无需指定——\texttt{pred} 究竟以值还是以引用方式接受其参数 \texttt{elt}。试着用一个 \texttt{virtual bool operator(\allowbreak{})\allowbreak{}} 来实现它吧！
+
+说到迭代器：你可能已经注意到，本章中我们所有的示例函数（无论是单态、多态还是泛型），都是基于容器来表述的。当我们编写 \texttt{count} 时，统计的是整个容器里的元素个数；编写 \texttt{count\_\allowbreak{}if} 时，统计的是整个容器中相匹配的元素个数。这被证明是一种非常自然的写法，尤其在现代 C++ 中；以至于我们可以期待看到基于容器（或其近亲——基于范围（range））的算法，将在 C++20 或 C++23 中登场。然而，STL 要追溯到 20 世纪 90 年代乃至前现代 C++。因此，STL 的作者们假定：主要围绕容器开展工作会十分昂贵（要付出大量昂贵的拷贝构造——别忘了，移动语义（move semantics）与移动构造直到 C++11 才登场）；于是他们把 STL 设计成主要围绕一个轻量得多的概念来工作：迭代器。这将是我们下一章的主题。
+
+\section{小结}
+
+古典多态与泛型编程，都在处理一个根本性问题：如何对一个算法的行为进行参数化。例如，编写一个能够与任意匹配操作协同工作的查找函数。
+
+古典多态的解决思路是：指定一个带有封闭集合虚成员函数的抽象基类，并编写接受指向（或引用）继承自该基类的具象类实例的指针的多态函数。
+
+泛型编程的解决思路则是：指定一个带有封闭集合要求的概念，并用建模了该概念的具体类来实例化函数模板。
+
+古典多态在处理更高层次的参数化（例如，操纵任意签名的函数对象（function object））以及类型之间的关系（例如，操纵任意容器里的元素）时会陷入困境。因此，标准模板库大量使用了基于模板的泛型编程，而几乎不用古典多态。
+
+当你使用泛型编程时，若能牢记你的类型在概念层面的要求，甚至把它们明确地写下来，将会很有帮助；但在 C++17 之时，编译器尚无法直接帮你检查这些要求。

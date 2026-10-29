@@ -1,0 +1,1128 @@
+既然你已经认识了迭代器（iterator）类型——既有标准库提供的，也有用户自定义的——现在该来看看能用迭代器做些什么了。
+
+本章你将学到：
+
+\begin{itemize}
+\item 半开区间（half-open range）的概念，它精确规定了两个迭代器划定一个范围（range）的具体方式
+\item 如何把每一个标准算法归类为「只读（read-only）」「只写（write-only）」「变换（transformative）」或「重排（permutative）」；以及归类为「单范围（one-range）」「双范围（two-range）」或「一个半范围（one-and-a-half range）」
+\item 某些标准算法，例如 \texttt{merge} 与 \texttt{make\_\allowbreak{}heap}，不过是构建高层实体（如 \texttt{stable\_\allowbreak{}sort} 与 \texttt{priority\_\allowbreak{}queue}）所必需的砖块
+\item 如何基于 \texttt{operator<} 之外的比较器（comparator）对范围排序
+\item 如何使用擦除—移除惯用法（erase-remove idiom）来操纵已排序的数组
+\end{itemize}
+
+\section{关于头文件的一点说明}
+
+本章讨论的大部分函数模板都定义在标准头文件（header）\texttt{<algorithm>\allowbreak{}} 中。另一方面，那些特殊的迭代器类型一般都定义在 \texttt{<iterator>\allowbreak{}} 中。如果你想知道某个具体实体该去哪里找，我强烈建议你查阅诸如 \texttt{cppreference.\allowbreak{}com} 这样的在线参考来获取权威答案；不要瞎猜！
+
+\section{只读范围算法}
+
+在前面的章节里，我们动手实现了一个名叫 \texttt{distance} 的算法，以及另一个名叫 \texttt{count\_\allowbreak{}if} 的算法。这两个算法都出现在标准库中。
+
+\texttt{std::\allowbreak{}count\_\allowbreak{}if(\allowbreak{}a,\allowbreak{}b,\allowbreak{}p)\allowbreak{}} 返回 \texttt{a} 与 \texttt{b} 之间满足谓词（predicate）函数 \texttt{p} 的元素个数——也就是使得 \texttt{p(\allowbreak{}e)\allowbreak{}} 为 \texttt{true} 的元素 \texttt{e} 的个数。
+
+注意，每当我们说「\texttt{a} 与 \texttt{b} 之间」时，指的都是这样一个范围：它包含 \texttt{*a} 但不包含 \texttt{*b}——也就是数学家所谓的「半开区间（half-open range）」，用不对称记号 \texttt{[a,\allowbreak{}b)\allowbreak{}} 表示。我们为什么不该包含 \texttt{*b} 呢？首先，如果 \texttt{b} 是某个向量（\texttt{std::\allowbreak{}vector}）的 \texttt{end(\allowbreak{})\allowbreak{}}，那么它根本就不指向该向量的任何一个元素！所以一般而言，对范围末端进行解引用是一件危险的事。其次，使用半开区间还能方便地表示空范围；例如「从 \texttt{x} 到 \texttt{x}」就是一个由零个数据元素构成的空范围。
+
+半开区间在 C++ 中和在 C 中一样自然。几十年来，我们写下的 for 循环一直是从下界（含）到上界（不含）；这种惯用法如此常见，以至于偏离它往往意味着 bug：
+
+\begin{codebox}[cpp]
+    constexpr int N = 10;
+    int a[N];
+    // 一个正确的 for 循环。
+    for (int i=0; i < N; ++i) {
+      // ...
+    }
+    // 一种“有味道”的 for 循环。
+    for (int i=0; i <= N; ++i) {
+      // ...
+    }
+    // 对标准算法的正确调用。
+    std::count_if(std::begin(a), std::end(a), [](int){ return true; });
+    // 一个“有味道”的调用。
+    std::count_if(std::begin(a), std::end(a) - 1, [](int){ return true; });
+    // 一个“平凡”的调用：统计长度为零的范围。
+    std::count_if(std::begin(a), std::begin(a), [](int){ return true; });
+\end{codebox}
+
+\texttt{std::\allowbreak{}distance(\allowbreak{}a,\allowbreak{}b)\allowbreak{}} 返回 \texttt{a} 与 \texttt{b} 之间的元素个数——也就是为了让 \texttt{a} 到达 \texttt{b} 而必须对 \texttt{a} 施加 \texttt{++} 的次数。你可以认为这个函数的作用等价于 \texttt{std::\allowbreak{}count\_\allowbreak{}if(\allowbreak{}a,\allowbreak{}b,\allowbreak{}[](\allowbreak{}auto\&\&)\allowbreak{}\{return true;\})}。
+
+正如我们在第 2 章「迭代器与范围」中所见，如果所涉及的是随机访问迭代器（random-access iterator），那么这个数字可以迅速算作 \texttt{(\allowbreak{}b - a)\allowbreak{}}，标准库中的 \texttt{std::\allowbreak{}distance} 也正是这么做的。注意，如果你以「错误」的次序传入参数，\texttt{(\allowbreak{}b - a)\allowbreak{}} 可能是个负数！
+
+\begin{codebox}[cpp]
+    int a[] {1, 2, 3, 4, 5};
+    std::list<int> lst {1, 2, 3, 4, 5};
+    std::forward_list<int> flst {1, 2, 3, 4, 5};
+    assert(std::distance(std::begin(a), std::end(a)) == 5);
+    assert(std::distance(std::begin(lst), std::end(lst)) == 5);
+    assert(std::distance(std::begin(lst), std::end(lst)) == 5);
+    assert(std::distance(std::end(a), std::begin(a)) == -5);
+\end{codebox}
+
+当迭代器是随机访问迭代器时，\texttt{std::\allowbreak{}distance} 所做的无非是把它们相减；因此传入「次序颠倒」的实参是被 C++ 标准明确支持并认可的。然而，如果所涉及的无非是双向迭代器（bidirectional iterator）（比如 \texttt{std::\allowbreak{}list<\allowbreak{}int>\allowbreak{}::\allowbreak{}iterator}——参见第 4 章「容器动物园（The Container Zoo）」），那么「次序颠倒」的迭代器就不被支持了。你或许会期望 \texttt{std::\allowbreak{}distance(\allowbreak{}b,\allowbreak{}a)\allowbreak{} == -std::\allowbreak{}distance(\allowbreak{}a,\allowbreak{}b)\allowbreak{}} 对所有迭代器类型都成立；但试想一下，\texttt{std::\allowbreak{}distance} 算法本身又怎么知道你传给它的迭代器是否「次序颠倒」呢？在缺少 \texttt{operator-} 的情况下，它唯一能做的，就是不断地对 \texttt{a} 做自增——也许会越过容器末尾、冲到内存深处——痴心妄想地指望最终能到达 \texttt{b}：
+
+\begin{codebox}[cpp]
+    // 下面这行会给出“不正确”的答案！
+    // assert(std::distance(std::end(lst), std::begin(lst)) == 1);
+    // 而这一行会直接段错误！
+    // std::distance(std::end(flst), std::begin(flst));
+\end{codebox}
+
+查阅第 4 章「容器动物园」中 \texttt{std::\allowbreak{}list} 与 \texttt{std::\allowbreak{}forward\_\allowbreak{}list} 的图示，就能理解这段示例代码古怪的行为了。
+
+\texttt{std::\allowbreak{}count(\allowbreak{}a,\allowbreak{}b,\allowbreak{}v)\allowbreak{}} 返回 \texttt{a} 与 \texttt{b} 之间等于 \texttt{v} 的元素个数——也就是使得 \texttt{e == v} 为真的元素 \texttt{e} 的个数。你可以认为这个函数的作用等价于 \texttt{std::\allowbreak{}count\_\allowbreak{}if(\allowbreak{}a,\allowbreak{}b,\allowbreak{}[\&v](\allowbreak{}auto\&\& e)\allowbreak{}\{return e == v;\})}，事实上两个版本理应生成相同的汇编代码。如果 C++ 在 1998 年就有了 lambda 表达式，他们大概根本不会把 \texttt{std::\allowbreak{}count} 算法放进标准库。
+
+注意，\texttt{std::\allowbreak{}count(\allowbreak{}a,\allowbreak{}b,\allowbreak{}v)\allowbreak{}} 必然要遍历 \texttt{a} 与 \texttt{b} 之间的所有元素。它无法利用你可能掌握的、关于范围内数据排列方式的那点额外信息。举例来说，假设我想统计 \texttt{std::\allowbreak{}set<\allowbreak{}int>\allowbreak{}} 中 \texttt{42} 出现的次数？我可以任选下面两种方式之一来写代码：
+
+\begin{codebox}[cpp]
+    std::set<int> s { 1, 2, 3, 10, 42, 99 };
+    bool present;
+    // O(n)：将每个元素与 42 比较
+    present = std::count(s.begin(), s.end(), 42);
+    // O(log n)：让容器自己去查找 42
+    present = s.count(42);
+\end{codebox}
+
+原始的 \texttt{std::\allowbreak{}count} 算法被第二种做法超越了——后者干脆直接去问 \texttt{set} 自身要答案。这就把对整个集合的 $O(n)$ 遍历变成了对数级的 $O(\log n)$ 树查找。类似地，\texttt{std::\allowbreak{}unordered\_\allowbreak{}set} 提供的 \texttt{count} 方法大约是 $O(1)$ 的。
+
+关于这些容器（container）的更多内容，参见第 4 章「容器动物园」；而此刻要记住的要点是：你的数据中有时存在着可被利用的重要结构，只要选对工具就能发挥它。尽管我指出了一些标准算法似乎「神奇地」做对了事情的例子（比如 \texttt{std::\allowbreak{}distance} 委托给 \texttt{(\allowbreak{}b - a)\allowbreak{}}），你也不该幻想这种「魔法」的适用范围比实际更广。标准算法只知道告诉它的那些事，也就是说，它只了解你传给它的迭代器类型的属性。它们绝不会根据底层数据元素彼此之间的关系来改变自己的行为。安排你的代码以利用底层数据中的关系（例如「这份数据是有序的」「这个范围覆盖了整个容器」），是你作为程序员职责的一部分。
+
+下面再介绍几个与 \texttt{std::\allowbreak{}count} 和 \texttt{std::\allowbreak{}count\_\allowbreak{}if} 类似的算法。
+
+\texttt{std::\allowbreak{}find(\allowbreak{}a,\allowbreak{}b,\allowbreak{}v)\allowbreak{}} 与 \texttt{std::\allowbreak{}find\_\allowbreak{}if(\allowbreak{}a,\allowbreak{}b,\allowbreak{}p)\allowbreak{}} 的工作方式分别与 \texttt{std::\allowbreak{}count(\allowbreak{}a,\allowbreak{}b,\allowbreak{}v)\allowbreak{}} 和 \texttt{std::\allowbreak{}count\_\allowbreak{}if(\allowbreak{}a,\allowbreak{}b,\allowbreak{}p)\allowbreak{}} 类似，区别在于：\texttt{find} 系列不会遍历整个范围并返回匹配元素的数量，而是只循环到找到第一个匹配项为止，然后返回一个指向该匹配数据元素的迭代器。
+
+还有一个变体 \texttt{find\_\allowbreak{}if\_\allowbreak{}not}，与 \texttt{find\_\allowbreak{}if} 几乎一样，只是谓词的语义取反了；如果 C++ 历史上更早地有了 lambda，这个变体大概也没必要存在：
+
+\begin{codebox}[cpp]
+    template<class InputIterator, class UnaryPredicate>
+    InputIterator find_if(InputIterator first, InputIterator last,
+      UnaryPredicate p)
+    {
+      for (; first != last; ++first) {
+        if (p(*first)) {
+          return first;
+        }
+      }
+      return last;
+    }
+    template<class It, class U>
+    It find_if_not(It first, It last, U p) {
+      return std::find_if(first, last, [&](auto&& e){ return !p(e); });
+    }
+    template<class It, class T>
+    It find(It first, It last, T value) {
+      return std::find_if(first, last, [&](auto&& e)
+        { return e == value; });
+    }
+\end{codebox}
+
+注意，因为 \texttt{find} 一旦找到第一个匹配就立即返回，所以它的平均表现比 \texttt{count} 算法更快（后者无论如何都要扫描整个范围）。这种「立即返回」的行为通常被称为「短路（short-circuiting）」。
+
+\texttt{std::\allowbreak{}all\_\allowbreak{}of(\allowbreak{}a,\allowbreak{}b,\allowbreak{}p)\allowbreak{}}、\texttt{std::\allowbreak{}any\_\allowbreak{}of(\allowbreak{}a,\allowbreak{}b,\allowbreak{}p)\allowbreak{}} 与 \texttt{std::\allowbreak{}none\_\allowbreak{}of(\allowbreak{}a,\allowbreak{}b,\allowbreak{}p)\allowbreak{}} 返回 \texttt{true} 或 \texttt{false}，取决于所提供的谓词函数 \texttt{p} 对范围内元素的为真频率。它们都可以构建在 \texttt{find} 算法之上，从而顺带获得短路行为：
+
+\begin{codebox}[cpp]
+    template<class It, class UnaryPredicate>
+    bool all_of(It first, It last, UnaryPredicate p)
+    {
+      return std::find_if_not(first, last, p) == last;
+    }
+    template <class It, class U>
+    bool any_of(It first, It last, U p)
+    {
+      return std::find_if(first, last, p) != last;
+    }
+    template <class It, class U>
+    bool none_of(It first, It last, U p)
+    {
+      return std::find_if(first, last, p) == last;
+    }
+\end{codebox}
+
+还有一个与 \texttt{find} 相关的算法值得一提：\texttt{find\_\allowbreak{}first\_\allowbreak{}of}。它实现的操作是「在一个序列中查找任意一组固定目标元素首次出现的位置」——也就是说，就像 C 标准库中的 \texttt{strcspn}，但适用于任意类型而不只是 \texttt{char}。抽象地说，\texttt{find\_\allowbreak{}first\_\allowbreak{}of} 接受两个概念性的参数：要搜索的范围，以及目标元素的集合。既然这是 STL，这两者都是作为范围传入的，也就是迭代器对。因此对这个算法的调用看起来像 \texttt{find\_\allowbreak{}first\_\allowbreak{}of(\allowbreak{}haystack,\allowbreak{} haystack,\allowbreak{} needle,\allowbreak{} needle)\allowbreak{}}：并排的两对迭代器。这容易让人犯晕——当心那些接受多个相似参数的算法！
+
+\begin{codebox}[cpp]
+    template <class It, class FwdIt>
+    It find_first_of(It first, It last, FwdIt targetfirst,
+      FwdIt targetlast)
+    {
+      return std::find_if(first, last, [&](auto&& e) {
+        return std::any_of(targetfirst, targetlast, [&](auto&& t) {
+          return e == t;
+        });
+      });
+    }
+    template <class It, class FwdIt, class BinaryPredicate>
+    It find_first_of(It first, It last, FwdIt targetfirst,
+      FwdIt targetlast, BinaryPredicate p)
+    {
+      return std::find_if(first, last, [&](auto&& e) {
+        return std::any_of(targetfirst, targetlast, [&](auto&& t) {
+          return p(e, t);
+        });
+      });
+    }
+\end{codebox}
+
+注意，「干草堆（haystack）」迭代器可以是任何老旧的输入迭代器（InputIterator）类型，但「针（needle）」迭代器至少得是前向迭代器（ForwardIterator）。回忆一下第 2 章「迭代器与范围」的内容，前向迭代器类型的关键在于它可以被有意义地复制，从而让同一范围被多次遍历。这正是 \texttt{find\_\allowbreak{}first\_\allowbreak{}of} 所需要的！它对「干草堆」中的每个字符都会把「针」范围遍历一遍；所以「针」必须可重复遍历——顺带也必须是有限大小的！反过来说，「干草堆」并没有什么特别要求必须是有限的；它完全可能从一个潜在的无限输入流中抽取元素：
+
+\begin{codebox}[cpp]
+    std::istream_iterator<char> ii(std::cin);
+    std::istream_iterator<char> iend{};
+    std::string s = "hello";
+    // 从 std::cin 中吞掉字符，直到遇到 'h'、'e'、'l' 或 'o' 为止。
+    std::find_first_of(ii, iend, s.begin(), s.end());
+\end{codebox}
+
+说到多个相似参数，我们就用下面这两个算法来结束对简单只读算法的浏览：\texttt{std::\allowbreak{}equal} 与 \texttt{std::\allowbreak{}mismatch}。
+
+\texttt{std::\allowbreak{}equal(\allowbreak{}a,\allowbreak{}b,\allowbreak{}c,\allowbreak{}d)\allowbreak{}} 接受两对迭代器：范围 \texttt{[a,\allowbreak{}b)\allowbreak{}} 与范围 \texttt{[c,\allowbreak{}d)\allowbreak{}}。如果两个范围逐元素相等，它就返回 \texttt{true}，否则返回 \texttt{false}。\texttt{std::\allowbreak{}mismatch(\allowbreak{}a,\allowbreak{}b,\allowbreak{}c,\allowbreak{}d)\allowbreak{}} 有点像 \texttt{find}：它会确切地告诉你，是哪一对元素破坏了相等性：
+
+\begin{codebox}[cpp]
+    template<class T> constexpr bool is_random_access_iterator_v =
+      std::is_base_of_v<std::random_access_iterator_tag, typename
+      std::iterator_traits<T>::iterator_category>;
+    template<class It1, class It2, class B>
+    auto mismatch(It1 first1, It1 last1, It2 first2, It2 last2, B p)
+    {
+      while (first1 != last1 && first2 != last2 && p(*first1, *first2)) {
+        ++first1;
+        ++first2;
+      }
+      return std::make_pair(first1, first2);
+    }
+    template<class It1, class It2>
+    auto mismatch(It1 first1, It1 last1, It2 first2, It2 last2)
+    {
+      return std::mismatch(first1, last1, first2, last2,
+      std::equal_to<>{});
+    }
+    template<class It1, class It2, class B>
+    bool equal(It1 first1, It1 last1, It2 first2, It2 last2, B p)
+    {
+      if constexpr (is_random_access_iterator_v<It1> &&
+        is_random_access_iterator_v<It2>) {
+        // 长度不同的范围绝不可能相等。
+        if ((last2 - first2) != (last1 - first1)) {
+          return false;
+        }
+      }
+      return std::mismatch(first1, last1, first2, last2, p) ==
+        std::make_pair(last1, last2);
+    }
+    template<class It1, class It2>
+    bool equal(It1 first1, It1 last1, It2 first2, It2 last2)
+    {
+      return std::equal(first1, last1, first2, last2, std::equal_to<>{});
+    }
+\end{codebox}
+
+注意这里把 \texttt{std::\allowbreak{}equal\_\allowbreak{}to<>\{\}} 用作谓词对象；本书不会深入讲解这些内建谓词，你只需默认接受：\texttt{std::\allowbreak{}equal\_\allowbreak{}to<>\{\}} 是一个行为类似于 \texttt{[](\allowbreak{}auto a,\allowbreak{} auto b)\allowbreak{}\{ return a == b; \}} 的对象，只不过涉及了更完美的转发。
+
+最后，再次当心！C++17 标准库中的许多双范围算法还拥有一些俗称「一个半范围（one-and-a-half-range）」算法的变体形式。例如，除了 \texttt{std::\allowbreak{}mismatch(\allowbreak{}a,\allowbreak{}b,\allowbreak{}c,\allowbreak{}d)\allowbreak{}}，你还会遇到 \texttt{std::\allowbreak{}mismatch(\allowbreak{}a,\allowbreak{}b,\allowbreak{}c)\allowbreak{}}——第二个范围的「末尾」点被简单地假定为 \texttt{c + std::\allowbreak{}distance(\allowbreak{}a,\allowbreak{} b)\allowbreak{}}。如果 \texttt{c} 实际上指向某个容器，而 \texttt{c + std::\allowbreak{}distance(\allowbreak{}a,\allowbreak{} b)\allowbreak{}} 会「越界」，那就自认倒霉吧！
+
+因为「自认倒霉」从来都不是对技术问题的好答案，所以 C++17 标准为许多在 C++14 中就存在的「一个半范围」算法补充了安全的双范围变体。
+
+\section{用 std::copy 搬运数据}
+
+我们刚刚见识了头几个双范围算法。\texttt{<algorithm>\allowbreak{}} 头文件里满是双范围算法以及它们的兄弟——一个半范围算法。这类算法中最简单的是什么呢？
+
+一个合理的答案是：「把第一个范围里的每个数据元素拷贝进第二个范围。」确实，STL 以 \texttt{std::\allowbreak{}copy} 之名提供了这个算法：
+
+\begin{codebox}[cpp]
+    template<class InIt, class OutIt>
+    OutIt copy(InIt first1, InIt last1, OutIt destination)
+    {
+      while (first1 != last1) {
+        *destination = *first1;
+        ++first1;
+        ++destination;
+      }
+      return destination;
+    }
+\end{codebox}
+
+注意，这是一个一个半范围算法。标准库实际上并没有提供 \texttt{std::\allowbreak{}copy} 的双范围版本；其假设是，如果你真的想写入一个缓冲区，那你一定已经检查过它的大小了，所以在循环里再去检查「我们到缓冲区末尾了吗」既多余又低效。
+
+现在我能几乎听到你在惊呼：「天哪！这跟带给我们 \texttt{strcpy}、\texttt{sprintf} 和 \texttt{gets} 的粗糙逻辑如出一辙！这是在邀请缓冲区溢出！」嗯，如果你真是这么惊呼的，那关于 \texttt{gets} 的糟糕行为你说对了——事实上，\texttt{gets} 函数已经被正式从 C++17 标准库中移除了。关于 \texttt{sprintf} 你也没说错——任何需要那项功能的人，更好的选择是使用带范围检查的版本 \texttt{snprintf}，在本语境下它就类似于一个「双范围算法」。但对于 \texttt{strcpy} 我并不认同。对于 \texttt{gets}，你不可能知道输出缓冲区的正确大小；对于 \texttt{sprintf}，这很难；但对于 \texttt{strcpy}，这轻而易举：你只需量一下输入缓冲区的 \texttt{strlen}，那就是答案。同样地，对于 \texttt{std::\allowbreak{}copy}，「消耗的输入元素」与「产出的输出元素」之间的关系恰好是一一对应的，因此确定输出缓冲区的大小算不上技术难题。
+
+注意，我们称之为 \texttt{destination} 的参数是一个输出迭代器（output iterator）。这意味着我们不但可以用 \texttt{std::\allowbreak{}copy} 在内存里搬动数据，甚至还能把数据喂给任意的「接收器（sink）」函数。例如：
+
+\begin{codebox}[cpp]
+    class putc_iterator : public boost::iterator_facade<
+      putc_iterator, // T（值类型）
+      const putc_iterator, // value_type（值类型）
+      std::output_iterator_tag
+      >
+    {
+      friend class boost::iterator_core_access;
+       auto& dereference() const { return *this; }
+       void increment() {}
+       bool equal(const putc_iterator&) const { return false; }
+       public:
+       // 这个迭代器本身就是自己的代理对象！
+       void operator= (char ch) const { putc(ch, stdout); }
+    };
+    void test()
+    {
+      std::string s = "hello";
+      std::copy(s.begin(), s.end(), putc_iterator{});
+    }
+\end{codebox}
+
+你也许会发现，将我们 \texttt{putc\_\allowbreak{}iterator} 的这个版本与那个版本
+
+这段内容承接第 2 章「迭代器与范围（iterator 与 range）」；本版本使用了第 2 章结尾处介绍过的 \texttt{boost::\allowbreak{}iterator\_\allowbreak{}facade}，还用了一个常见的小技巧：返回 \texttt{*this} 而不是返回一个新的代理（proxy）对象。现在我们可以借助 \texttt{destination} 的灵活性，来消除对缓冲区（buffer）溢出的顾虑了！假设我们不是写入一个固定大小的数组，而是写入一个可动态调整大小的 \texttt{std::\allowbreak{}vector}（参见第 4 章「容器动物园（The Container Zoo）」）。那么「写入一个元素」就对应于在该向量上「把一个元素推入末尾」。于是我们完全可以写一个与 \texttt{putc\_\allowbreak{}iterator} 非常相似的输出迭代器（iterator），用 \texttt{push\_\allowbreak{}back} 取代 \texttt{putc}，这样我们就得到了一个不会溢出的、填充向量的方法。事实上，标准库（standard library）恰好在 \texttt{<iterator>\allowbreak{}} 头文件中提供了这样一个输出迭代器：
+
+\begin{codebox}[cpp]
+    namespace std {
+      template<class Container>
+      class back_insert_iterator {
+        using CtrValueType = typename Container::value_type;
+        Container *c;
+      public:
+        using iterator_category = output_iterator_tag;
+        using difference_type = void;
+        using value_type = void;
+        using pointer = void;
+        using reference = void;
+        explicit back_insert_iterator(Container& ctr) : c(&ctr) {}
+        auto& operator*() { return *this; }
+        auto& operator++() { return *this; }
+        auto& operator++(int) { return *this; }
+        auto& operator= (const CtrValueType& v) {
+            c->push_back(v);
+            return *this;
+        }
+        auto& operator= (CtrValueType&& v) {
+            c->push_back(std::move(v));
+            return *this;
+        }
+      };
+      template<class Container>
+      auto back_inserter(Container& c)
+      {
+         return back_insert_iterator<Container>(c);
+      }
+    }
+    void test()
+    {
+      std::string s = "hello";
+      std::vector<char> dest;
+      std::copy(s.begin(), s.end(), std::back_inserter(dest));
+      assert(dest.size() == 5);
+    }
+\end{codebox}
+
+函数调用 \texttt{std::\allowbreak{}back\_\allowbreak{}inserter(\allowbreak{}dest)\allowbreak{}} 只是返回一个 \texttt{back\_\allowbreak{}insert\_\allowbreak{}iterator} 对象。在 C++17 中，我们可以依靠构造函数的模板类型推导（template type deduction），把该函数的函数体简单地写成 \texttt{return std::\allowbreak{}back\_\allowbreak{}insert\_\allowbreak{}iterator(\allowbreak{}dest)\allowbreak{}}；或者干脆省掉这个函数，直接在代码里写 \texttt{std::\allowbreak{}back\_\allowbreak{}insert\_\allowbreak{}iterator(\allowbreak{}dest)\allowbreak{}}——而在 C++14 代码里，则只能「将就」使用 \texttt{std::\allowbreak{}back\_\allowbreak{}inserter(\allowbreak{}dest)\allowbreak{}}。不过，我们为什么要甘愿多敲那些字呢？\texttt{back\_\allowbreak{}inserter} 这个名字是特意选得易于记忆的，因为正是它才是我们最常被期望使用的那个。虽然 C++17 允许我们写 \texttt{std::\allowbreak{}pair} 来取代 \texttt{std::\allowbreak{}make\_\allowbreak{}pair}，写 \texttt{std::\allowbreak{}tuple} 来取代 \texttt{std::\allowbreak{}make\_\allowbreak{}tuple}，但若要写笨重的 \texttt{std::\allowbreak{}back\_\allowbreak{}insert\_\allowbreak{}iterator} 来取代 \texttt{std::\allowbreak{}back\_\allowbreak{}inserter}，那就太傻了。即使在 C++17 中，你也应当优先使用 \texttt{std::\allowbreak{}back\_\allowbreak{}inserter(\allowbreak{}dest)\allowbreak{}}。
+
+\section{主题的各种变奏——std::move 与 std::move\_\allowbreak{}iterator}
+
+正如你可能从名字猜到的，或者你可能在前面那个实现里已经注意到的那样，\texttt{std::\allowbreak{}copy} 算法（algorithm）的工作方式，是把元素从输入范围（range）拷贝（copy）到输出。从 C++11 起，你也许会想：如果我们不拷贝这些元素，而是用移动（move）语义把它们从输入移动到输出，会怎样？STL 针对这个问题提供了两种不同的思路。第一种最为直截了当：有一个 \texttt{std::\allowbreak{}move} 算法（定义在 \texttt{<algorithm>\allowbreak{}} 头文件中），其定义如下：
+
+\begin{codebox}[cpp]
+    template<class InIt, class OutIt>
+    OutIt move(InIt first1, InIt last1, OutIt destination)
+    {
+      while (first1 != last1) {
+        *destination = std::move(*first1);
+        ++first1;
+        ++destination;
+      }
+      return destination;
+    }
+\end{codebox}
+
+它和 \texttt{std::\allowbreak{}copy} 算法完全一样，只是对输入元素多加了一个 \texttt{std::\allowbreak{}move}（要小心——这个内层的、只带一个实参的 \texttt{std::\allowbreak{}move} 定义在 \texttt{<utility>\allowbreak{}} 头文件中，它和外层的、带三个实参的、定义在 \texttt{<algorithm>\allowbreak{}} 中的 \texttt{std::\allowbreak{}move} 完全是两码事！二者共用一个名字，实在有些不幸。具有讽刺意味的是，少数其他也陷入类似窘境的 STL 函数之一是 \texttt{std::\allowbreak{}remove}；参见「从已排序数组中删除」一节，以及第 12 章「文件系统（Filesystem）」）。
+
+另一种思路，是我们在前面见过、与 \texttt{back\_\allowbreak{}inserter} 相关的那种做法的一个变体。我们不必换掉核心算法，而是继续用 \texttt{std::\allowbreak{}copy}，只是换一种方式来给它传参。假设我们传入一种新型迭代器，它（像 \texttt{back\_\allowbreak{}inserter} 那样）包裹在原始对象之外，并改变了其行为？具体而言，我们需要一个输入迭代器，其 \texttt{operator*} 返回一个右值（rvalue）。这我们可以做到！
+
+\begin{codebox}[cpp]
+    template<class It>
+    class move_iterator {
+      using OriginalRefType = typename std::iterator_traits<It>::reference;
+      It iter;
+      public:
+       using iterator_category = typename
+         std::iterator_traits<It>::iterator_category;
+       using difference_type = typename
+         std::iterator_traits<It>::difference_type;
+       using value_type = typename std::iterator_traits<It>::value_type;
+       using pointer = It;
+       using reference = std::conditional_t<
+         std::is_reference_v<OriginalRefType>,
+         std::remove_reference_t<OriginalRefType>&&,
+         OriginalRefType
+         >;
+       move_iterator() = default;
+       explicit move_iterator(It it) : iter(std::move(it)) {}
+       // 允许从任意种类的 move_iterator 构造或赋值。
+       // 这些模板同时也充当本类型的拷贝构造函数
+       // 以及赋值运算符。
+       template<class U>
+       move_iterator(const move_iterator<U>& m) : iter(m.base()) {}
+       template<class U>
+       auto& operator=(const move_iterator<U>& m)
+         { iter = m.base(); return *this; }
+       It base() const { return iter; }
+       reference operator*() { return static_cast<reference>(*iter); }
+       It operator->() { return iter; }
+       decltype(auto) operator[](difference_type n) const
+         { return *std::move(iter[n]); }
+      auto& operator++() { ++iter; return *this; }
+      auto& operator++(int)
+        { auto result = *this; ++*this; return result; }
+      auto& operator--() { --iter; return *this; }
+      auto& operator--(int)
+        { auto result = *this; --*this; return result; }
+      auto& operator+=(difference_type n) const
+        { iter += n; return *this; }
+      auto& operator-=(difference_type n) const
+        { iter -= n; return *this; }
+    };
+    // 我省略了非成员运算符的定义
+    // == != < <= > >= + - ；你能把它们补全吗？
+    template<class InputIterator>
+    auto make_move_iterator(InputIterator& c)
+    {
+      return move_iterator(c);
+    }
+\end{codebox}
+
+抱歉这段代码密度有点高；请相信我，你可以放心地跳过其中的细节。对于喜欢这类内容的人，你也许会注意到：我们提供了一个从 \texttt{move\_\allowbreak{}iterator<\allowbreak{}U>\allowbreak{}} 构造的模板化构造函数，它恰好同时也充当了我们的拷贝构造函数（当 \texttt{U} 与 \texttt{It} 类型相同时）；并且我们还提供了大量成员函数（例如 \texttt{operator[]} 和 \texttt{operator-\/\allowbreak{}-}），它们的函数体对于 \texttt{It} 的许多可能类型都会报错（例如，当 \texttt{It} 是一个前向迭代器（forward iterator）时——参见第 2 章「迭代器与范围」），但这并无妨，因为除非用户真的在编译期尝试调用这些函数，否则它们的函数体不会被实例化（如果用户真的试图对一个 \texttt{move\_\allowbreak{}iterator<\allowbreak{}list\_\allowbreak{}of\_\allowbreak{}ints::\allowbreak{}iterator>\allowbreak{}} 做 \texttt{-\/\allowbreak{}-}，那当然会产生一个编译期错误）。
+
+就像 \texttt{back\_\allowbreak{}inserter} 那样，请注意 STL 还提供一个辅助函数 \texttt{make\_\allowbreak{}move\_\allowbreak{}iterator}，这是为了照顾那些不支持构造函数模板类型推导的 C++17 之前的编译器。在这种情况里，和 \texttt{make\_\allowbreak{}pair}、\texttt{make\_\allowbreak{}tuple} 一样，「辅助」名字比真正的类名更难看，因此我倾向于建议你在代码中使用 C++17 的特性；既然没必要，又何必多敲五个字符、再实例化一个额外的函数模板呢？
+
+现在我们拥有了把数据从一个容器（container）或范围移动到另一个的两种不同方法：\texttt{std::\allowbreak{}move} 算法和 \texttt{std::\allowbreak{}move\_\allowbreak{}iterator} 适配器（adaptor）类。下面是这两种惯用法（idiom）的示例：
+
+\begin{codebox}[cpp]
+    std::vector<std::string> input = {"hello", "world"};
+    std::vector<std::string> output(2);
+    // 第一种做法：使用 std::move 算法
+    std::move(input.begin(), input.end(), output.begin());
+    // 第二种做法：使用 move_iterator
+    std::copy(
+      std::move_iterator(input.begin()),
+      std::move_iterator(input.end()),
+      output.begin()
+    );
+\end{codebox}
+
+如果你做的全部工作就是移动数据，那么第一种做法（使用 \texttt{std::\allowbreak{}move}）显然要清爽得多。那么，标准库为何还要费心提供这种用 \texttt{move\_\allowbreak{}iterator} 的「更繁琐」的做法呢？要回答这个问题，我们还得去探究另一个与 \texttt{std::\allowbreak{}copy} 有着根本关联性的算法。
+
+\section{用 std::transform 进行复杂拷贝}
+
+你可能早就注意到了，在我们给出 \texttt{std::\allowbreak{}copy} 的实现时，那两个迭代器类型参数的 \texttt{value\_\allowbreak{}type} 并没有被约束成相同类型。这其实是特性（feature），不是缺陷（bug）！这意味着我们可以写出依赖隐式转换（implicit conversion）的代码，而它会自动「做正确的事（Do The Right Thing）」：
+
+\begin{codebox}[cpp]
+    std::vector<const char *> input = {"hello", "world"};
+    std::vector<std::string> output(2);
+    std::copy(input.begin(), input.end(), output.begin());
+    assert(output[0] == "hello");
+    assert(output[1] == "world");
+\end{codebox}
+
+看起来微不足道，对吧？仔细看！在我们的 \texttt{std::\allowbreak{}copy} 实例化的深处，藏着一次对隐式构造函数的调用，它把 \texttt{const char *}（即 \texttt{*input.\allowbreak{}begin(\allowbreak{})\allowbreak{}} 的类型）转换为 \texttt{std::\allowbreak{}string}（即 \texttt{*output.\allowbreak{}begin(\allowbreak{})\allowbreak{}} 的类型）。所以，这又是第无数次，我们看到了这样一个泛型（generic）代码的例子：它仅仅是被赋予了某些特定的迭代器类型，就完成了出人意料地复杂的操作。
+
+但有时，你希望在拷贝操作期间应用一个复杂的变换（transformation）函数——复杂到隐式转换无法应对。标准库已经为你准备好了！
+
+\begin{codebox}[cpp]
+    template<class InIt, class OutIt, class Unary>
+    OutIt transform(InIt first1, InIt last1, OutIt destination, Unary op)
+    {
+      while (first1 != last1) {
+        *destination = op(*first1);
+        ++first1;
+        ++destination;
+      }
+      return destination;
+    }
+    void test()
+    {
+      std::vector<std::string> input = {"hello", "world"};
+      std::vector<std::string> output(2);
+      std::transform(
+        input.begin(),
+        input.end(),
+        output.begin(),
+        [](std::string s) {
+          // 它同样适用于原地变换！
+          std::transform(s.begin(), s.end(), s.begin(), ::toupper);
+          return s;
+        }
+      );
+      assert(input[0] == "hello");
+      assert(output[0] == "HELLO");
+    }
+\end{codebox}
+
+有时你甚至需要用到一个带两个实参的函数来做变换。标准库同样为你准备好了：
+
+\begin{codebox}[cpp]
+    template<class InIt1, class InIt2, class OutIt, class Binary>
+    OutIt transform(InIt1 first1, InIt1 last1, InIt2 first2, OutIt
+destination,
+      Binary op)
+    {
+      while (first1 != last1) {
+        *destination = op(*first1, *first2);
+        ++first1;
+        ++first2;
+        ++destination;
+      }
+      return destination;
+    }
+\end{codebox}
+
+这个版本的 \texttt{std::\allowbreak{}transform} 也许可以被戏称为「一个半加两个半范围」算法！（那三个实参的函数呢？四个实参的呢？遗憾的是，并没有完全可变参数（variadic）版本的 \texttt{std::\allowbreak{}transform}；可变参数模板（variadic template）直到 C++11 才被引入 C++。你可以试着实现一个可变参数版本，看看会遇到哪些问题——这些问题是可以克服的，但肯定不算简单。）
+
+\texttt{std::\allowbreak{}transform} 的存在，又给了我们第三种把数据元素从一处移动到另一处的方法：
+
+\begin{codebox}[cpp]
+    std::vector<std::string> input = {"hello", "world"};
+    std::vector<std::string> output(2);
+    // 第三种做法：使用 std::transform
+    std::transform(
+      input.begin(),
+      input.end(),
+      output.begin(),
+      std::move<std::string&>
+    );
+\end{codebox}
+
+不过，我当然不推荐这种做法！它最醒目、最刺眼的「红旗」在于：它包含了对 \texttt{std::\allowbreak{}move} 模板的显式特化（explicit specialization）。每当你看到显式特化——就是模板名后面那对尖括号——那几乎就是一个确定无疑的信号，表明这段代码极其微妙且脆弱。进阶读者也许会乐于弄清：编译器是如何推导出我指的到底是那两个 \texttt{std::\allowbreak{}move} 中的哪一个的；请记住，一个在 \texttt{<utility>\allowbreak{}} 里，另一个在 \texttt{<algorithm>\allowbreak{}} 里。
+
+\section{只写不读的范围算法}
+
+我们在本章开头考察了像 \texttt{std::\allowbreak{}find} 这样的算法（algorithm）：它们遍历一个范围（range），按顺序读取其中的元素而不加修改。你也许会惊讶地发现，其逆向操作同样是有意义的：有一族标准算法，它们遍历一个范围，逐个修改每个元素却不去读取它！\texttt{std::\allowbreak{}fill(\allowbreak{}a,\allowbreak{}b,\allowbreak{}v)\allowbreak{}} 正如其名：用所提供的那个值 \texttt{v} 的副本，去填充给定范围 \texttt{[a,\allowbreak{}b)\allowbreak{}} 中的每一个元素。
+
+\texttt{std::\allowbreak{}iota(\allowbreak{}a,\allowbreak{}b,\allowbreak{}v)\allowbreak{}} 则更有意思一点：它用 \texttt{++v} 的副本去填充给定范围里的元素。也就是说，\texttt{std::\allowbreak{}iota(\allowbreak{}a,\allowbreak{}b,\allowbreak{}42)\allowbreak{}} 会把 \texttt{a[0]} 设为 42、\texttt{a[1]} 设为 43、\texttt{a[2]} 设为 44，依此类推一直填到 \texttt{b}。这个算法古怪的名字源自 APL 编程语言，在 APL 中有一个名为 ι（就是希腊字母 iota）的函数执行的就是这个操作。这个算法的另一个古怪之处是：不知为何，它的定义不在 \texttt{<algorithm>\allowbreak{}} 头文件里，而是在标准的 \texttt{<numeric>\allowbreak{}} 头文件中。它在这方面就是个怪胎。
+
+\texttt{std::\allowbreak{}generate(\allowbreak{}a,\allowbreak{}b,\allowbreak{}g)\allowbreak{}} 更有意思：它用 \texttt{g(\allowbreak{})\allowbreak{}} 的连续调用结果去填充给定范围里的元素，而不管 \texttt{g} 究竟是什么：
+
+\begin{codebox}[cpp]
+    template<class FwdIt, class T>
+    void fill(FwdIt first, FwdIt last, T value) {
+      while (first != last) {
+        *first = value;
+         ++first;
+      }
+    }
+    template<class FwdIt, class T>
+    void iota(FwdIt first, FwdIt last, T value) {
+      while (first != last) {
+        *first = value;
+        ++value;
+        ++first;
+      }
+    }
+    template<class FwdIt, class G>
+    void generate(FwdIt first, FwdIt last, G generator) {
+      while (first != last) {
+        *first = generator();
+        ++first;
+      }
+    }
+\end{codebox}
+
+下面这个例子，分别使用了上述每个标准算法，把不同内容填入一个 \texttt{std::\allowbreak{}string} 向量。检验一下你的理解：你明白每次调用为什么会得到它所产生的那个输出吗？我为 \texttt{std::\allowbreak{}iota} 选的这个例子尤其有趣（不过在真实世界的代码里大概没什么用）：
+
+\begin{codebox}[cpp]
+    std::vector<std::string> v(4);
+    std::fill(v.begin(), v.end(), "hello");
+    assert(v[0] == "hello");
+    assert(v[1] == "hello");
+    assert(v[2] == "hello");
+    assert(v[3] == "hello");
+    std::iota(v.begin(), v.end(), "hello");
+    assert(v[0] == "hello");
+    assert(v[1] == "ello");
+    assert(v[2] == "llo");
+    assert(v[3] == "lo");
+    std::generate(v.begin(), v.end(), [i=0]() mutable {
+      return ++i % 2 ? "hello" : "world";
+    });
+    assert(v[0] == "hello");
+    assert(v[1] == "world");
+    assert(v[2] == "hello");
+    assert(v[3] == "world");
+\end{codebox}
+
+\section{影响对象生命周期的算法}
+
+\texttt{<memory>\allowbreak{}} 头文件提供了一族相当冷门的算法（algorithm），名字诸如 \texttt{std::\allowbreak{}uninitialized\_\allowbreak{}copy}、\texttt{std::\allowbreak{}uninitialized\_\allowbreak{}default\_\allowbreak{}construct} 以及 \texttt{std::\allowbreak{}destroy}（完整列表可以查阅 \texttt{cppreference.\allowbreak{}com} 之类的在线参考）。
+
+考虑下面这个算法，它使用显式的析构函数（destructor）调用来销毁一个范围里的元素：
+
+\begin{codebox}[cpp]
+    template<class T>
+    void destroy_at(T *p)
+    {
+      p->~T();
+    }
+    template<class FwdIt>
+    void destroy(FwdIt first, FwdIt last)
+    {
+      for ( ; first != last; ++first) {
+        std::destroy_at(std::addressof(*first));
+      }
+    }
+\end{codebox}
+
+注意，\texttt{std::\allowbreak{}addressof(\allowbreak{}x)\allowbreak{}} 是一个便捷的小辅助函数，它返回其参数的地址；它和 \texttt{\&x} 完全是一回事，除非在极少见的场景下，\texttt{x} 属于某个病态地重载了自身 \texttt{operator\&} 的类类型。
+
+再考虑下面这个算法，它使用显式的 placement-new 语法，把元素「拷贝构造（copy-construct）到」一个范围里的元素上（请注意，如果在拷贝过程中抛出了异常，它是如何利落地自行清理的）。这个算法显然不应该用在任何其元素已然存在的范围上；所以下面这个例子看上去非常刻意：
+
+\begin{codebox}[cpp]
+    template<class It, class FwdIt>
+    FwdIt uninitialized_copy(It first, It last, FwdIt out)
+    {
+      using T = typename std::iterator_traits<FwdIt>::value_type;
+      FwdIt old_out = out;
+      try {
+        while (first != last) {
+          ::new (static_cast<void*>(std::addressof(*out))) T(*first);
+          ++first;
+          ++out;
+        }
+        return out;
+      } catch (...) {
+        std::destroy(old_out, out);
+        throw;
+      }
+    }
+    void test()
+    {
+      alignas(std::string) char b[5 * sizeof (std::string)];
+      std::string *sb = reinterpret_cast<std::string *>(b);
+      std::vector<const char *> vec = {"quick", "brown", "fox"};
+      // 构造三个 std::string。
+      auto end = std::uninitialized_copy(vec.begin(), vec.end(), sb);
+      assert(end == sb + 3);
+      // 销毁三个 std::string。
+      std::destroy(sb, end);
+    }
+\end{codebox}
+
+我们将在第 4 章「容器（The Container）」中，看到更多关于这些算法应当如何被使用的内容
+
+容器动物园，当我们讨论 \texttt{std::\allowbreak{}vector} 时。
+
+\section{我们的第一个重排算法：std::sort}
+
+到目前为止，我们介绍过的所有算法都只是按顺序、线性地遍历给定的范围（range），从一个元素走到下一个元素。我们接下来要讲的一类算法行为并非如此。它们会取给定范围内元素的值并将它们打乱，使得相同的值仍然出现，但顺序不同。这个操作的数学名称叫作排列（permutation）。
+
+最容易描述的重排算法（permutative algorithm）是 \texttt{std::\allowbreak{}sort(\allowbreak{}a,\allowbreak{}b)\allowbreak{}}。它名副其实：把给定范围排序，使最小的元素出现在最前面，最大的元素出现在最后面。要判断哪些元素“最小”，\texttt{std::\allowbreak{}sort(\allowbreak{}a,\allowbreak{}b)\allowbreak{}} 使用的是 \texttt{operator<}。
+
+如果你想要不同的顺序，可以试着重载（overload） \texttt{operator<}，让它在不同条件下返回 \texttt{true}——但更恰当的做法，是使用这个算法的三参数版本 \texttt{std::\allowbreak{}sort(\allowbreak{}a,\allowbreak{}b,\allowbreak{}cmp)\allowbreak{}}。第三个实参应当是一个比较器（comparator）；也就是说，是一个函数、函数对象（functor）或 lambda（表达式），每当它的第一个实参“小于”第二个实参时就返回 \texttt{true}。例如：
+
+\begin{codebox}[cpp]
+     std::vector<int> v = {3, 1, 4, 1, 5, 9};
+     std::sort(v.begin(), v.end(), [](auto&& a, auto&& b) {
+       return a % 7 < b % 7;
+     });
+     assert((v == std::vector{1, 1, 9, 3, 4, 5}));
+\end{codebox}
+
+注意，我在本例中精心选择了 lambda，使得它对数组的排序是确定性的。如果我改用函数 \texttt{(\allowbreak{}a \% 6 < b \% 6)\allowbreak{}}，那么就会有两种可能的输出：\texttt{\{1,\allowbreak{} 1,\allowbreak{} 3,\allowbreak{} 9,\allowbreak{} 4,\allowbreak{} 5\}} 或 \texttt{\{1,\allowbreak{} 1,\allowbreak{} 9,\allowbreak{} 3,\allowbreak{} 4,\allowbreak{} 5\}}。标准的 \texttt{sort} 算法并不保证那些在给定比较函数下恰好相等的元素之间的相对位置！
+
+要修正这个问题（如果它确实是个问题），你应该把对 \texttt{std::\allowbreak{}sort} 的使用替换为 \texttt{std::\allowbreak{}stable\_\allowbreak{}sort}。后者可能稍慢一些，但它能保证：在元素相等的情况下保持原有的顺序——也就是说，在本例中我们会得到 \texttt{\{1,\allowbreak{} 1,\allowbreak{} 3,\allowbreak{} 9,\allowbreak{} 4,\allowbreak{} 5\}}，因为在原始的（未排序）向量（vector）中，元素 \texttt{3} 位于元素 \texttt{9} 之前。
+
+还有比这更糟的情况会发生在 \texttt{sort} 和 \texttt{stable\_\allowbreak{}sort} 上——如果我选择的比较函数是 \texttt{(\allowbreak{}a \% 6 < b)\allowbreak{}} 呢？那样我就会得到某些元素对 \texttt{x,\allowbreak{} y}，使得 \texttt{x < y} 且同时 \texttt{y < x}！（原始向量中有这样一对元素，就是 \texttt{5} 和 \texttt{9}。）在这种情况下，我们无能为力；我们传入的“比较函数”根本就不是一个比较函数！这违反了 \texttt{std::\allowbreak{}sort} 的前置条件（precondition），就如同我们传入了一个空指针一样。在对数组排序时，务必确保你所依据的进行比较的函数是合理的！
+
+\section{交换、反转与划分}
+
+除了 \texttt{std::\allowbreak{}sort} 之外，STL 还包含了数量多得惊人的重排算法（permutative algorithm）。其中许多算法可以看作“积木”，它们只实现了整体排序算法的一小部分。
+
+\texttt{std::\allowbreak{}swap(\allowbreak{}a,\allowbreak{}b)\allowbreak{}} 是最基本的积木；它只是取两个实参并把它们“交换”——也就是说，它交换两者的值。这是借助给定类型的移动（move）构造函数和移动赋值运算符实现的。\texttt{swap} 在标准算法中其实有点特殊，因为它是一个如此原始的运算，而且因为几乎总有一种比执行 \texttt{temp = a; a = b; b = temp;} 等价操作更快地交换两个任意对象的方法。对于标准库类型（如 \texttt{std::\allowbreak{}vector}），通常的习惯用法是让类型自己实现一个 \texttt{swap} 成员函数（如 \texttt{a.\allowbreak{}swap(\allowbreak{}b)\allowbreak{}}），然后在与该类型相同的命名空间（namespace）中添加一个 \texttt{swap} 的函数重载——也就是说，如果我们正在实现 \texttt{my::\allowbreak{}obj}，我们就在命名空间 \texttt{my} 中添加这个重载——从而让该特定类型的 \texttt{swap(\allowbreak{}a,\allowbreak{}b)\allowbreak{}} 调用 \texttt{a.\allowbreak{}swap(\allowbreak{}b)\allowbreak{}}，而不是执行那三次移动操作。下面是一个例子：
+
+\begin{codebox}[cpp]
+     namespace my {
+       class obj {
+         int v;
+       public:
+         obj(int value) : v(value) {}
+         void swap(obj& other) {
+           using std::swap;
+           swap(this->v, other.v);
+         }
+       };
+       void swap(obj& a, obj& b) {
+         a.swap(b);
+       }
+     } // namespace my
+     void test()
+     {
+       int i1 = 1, i2 = 2;
+       std::vector<int> v1 = {1}, v2 = {2};
+       my::obj m1 = 1, m2 = 2;
+       using std::swap;
+       swap(i1, i2); // 调用 std::swap<int>(int&, int&)
+       swap(v1, v2); // 调用 std::swap(vector&, vector&)
+       swap(m1, m2); // 调用 my::swap(obj&, obj&)
+     }
+\end{codebox}
+
+既然我们已经有了 \texttt{swap} 和双向迭代器（bidirectional iterator），我们就可以构建 \texttt{std::\allowbreak{}reverse(\allowbreak{}a,\allowbreak{}b)\allowbreak{}}，这是一个重排算法，它只是通过把第一个元素与最后一个元素交换、第二个元素与倒数第二个元素交换，依此类推，来反转一段元素范围的顺序。\texttt{std::\allowbreak{}reverse} 的一个常见应用，是反转字符串中较大片段的顺序——例如，反转一个句子中单词的顺序：
+
+\begin{codebox}[cpp]
+     void reverse_words_in_place(std::string& s)
+     {
+       // 首先，反转整个字符串。
+       std::reverse(s.begin(), s.end());
+       // 接着，把每个单词再反转回来。
+       for (auto it = s.begin(); true; ++it) {
+         auto next = std::find(it, s.end(), ' ');
+         // 反转这个单词中字母的顺序。
+         std::reverse(it, next);
+         if (next == s.end()) {
+           break;
+         }
+         it = next;
+       }
+     }
+     void test()
+     {
+       std::string s = "the quick brown fox jumps over the lazy dog";
+       reverse_words_in_place(s);
+       assert(s == "dog lazy the over jumps fox brown quick the");
+     }
+\end{codebox}
+
+对 \texttt{std::\allowbreak{}reverse} 的实现做一点小小的改动，就得到了 \texttt{sort} 的另一个积木，即 \texttt{std::\allowbreak{}partition}。\texttt{std::\allowbreak{}reverse} 从两端遍历范围并无条件地交换每一对元素，而 \texttt{std::\allowbreak{}partition} 只在它们相对于某个谓词（predicate）函数“失序”时才交换。在下面的例子中，我们把所有偶数元素划分到范围的前部，把所有奇数元素划分到后部。如果我们用 \texttt{std::\allowbreak{}partition} 来构建快速排序（Quicksort）例程，我们会把小于主元（pivot）元素的元素划分到范围前部，把大于主元元素的元素划分到后部：
+
+\begin{codebox}[cpp]
+     template<class BidirIt>
+     void reverse(BidirIt first, BidirIt last)
+     {
+       while (first != last) {
+         --last;
+         if (first == last) break;
+         using std::swap;
+         swap(*first, *last);
+         ++first;
+       }
+     }
+     template<class BidirIt, class Unary>
+     auto partition(BidirIt first, BidirIt last, Unary p)
+     {
+       while (first != last && p(*first)) {
+         ++first;
+       }
+       while (first != last) {
+         do {
+           --last;
+         } while (last != first && !p(*last));
+         if (first == last) break;
+         using std::swap;
+         swap(*first, *last);
+         do {
+           ++first;
+         } while (first != last && p(*first));
+       }
+       return first;
+     }
+     void test()
+     {
+       std::vector<int> v = {3, 1, 4, 1, 5, 9, 2, 6, 5};
+       auto it = std::partition(v.begin(), v.end(), [](int x) {
+         return x % 2 == 0;
+       });
+       assert(it == v.begin() + 3);
+       assert((v == std::vector{6, 2, 4, 1, 5, 9, 1, 3, 5}));
+     }
+\end{codebox}
+
+你或许会注意到前面这段代码的某些有趣之处：\texttt{reverse} 的代码和 \texttt{partition} 的代码几乎一模一样！唯一的区别是，\texttt{partition} 包含了一个别扭的 do-while 循环，而 \texttt{reverse} 那里只是一个简单的自增或自减。
+
+你或许还注意到，\texttt{partition} 中的第一个 do-while 循环等价于我们已经见过的一个标准算法，即 \texttt{std::\allowbreak{}find\_\allowbreak{}if\_\allowbreak{}not}。而第二个 do-while 循环在某种程度上等价于 \texttt{std::\allowbreak{}find\_\allowbreak{}if}……只不过它需要向后而非向前运行！对我们来说遗憾的是，并不存在 \texttt{std::\allowbreak{}rfind\_\allowbreak{}if} 这样的算法。但是——正如你现在可能已经猜到的——标准库不会让我们束手无措。我们需要某种东西，它针对 \texttt{std::\allowbreak{}find\_\allowbreak{}if} 的用途表现得就像一个迭代器（iterator），但却是“向后”迭代的。标准库以 \texttt{std::\allowbreak{}reverse\_\allowbreak{}iterator} 适配器（adaptor）的形式提供了恰好这样的东西。我们不会展示它的代码；如果你需要回顾它可能是如何实现的，请重读第 2 章“迭代器与范围”。简而言之，一个 \texttt{std::\allowbreak{}reverse\_\allowbreak{}iterator<\allowbreak{}Fwd\allowbreak{}It>\allowbreak{}} 对象包裹并表现得就像一个 \texttt{Fwd\allowbreak{}It} 对象，唯一的区别是：当你让包裹对象自增时，它让被包裹的对象自减，反之亦然。因此，我们可以用 \texttt{reverse\_\allowbreak{}iterator} 把 \texttt{partition} 写成下面这样：
+
+\begin{codebox}[cpp]
+     // "反转"与"解除反转"的简写。
+     template<class It>
+     auto rev(It it) {
+       return std::reverse_iterator(it);
+     };
+     template<class InnerIt>
+     auto unrev(std::reverse_iterator<InnerIt> it) {
+       return it.base();
+     }
+     template<class BidirIt, class Unary>
+     auto partition(BidirIt first, BidirIt last, Unary p)
+     {
+       first = std::find_if_not(first, last, p);
+       while (first != last) {
+         last = unrev(std::find_if(rev(last), rev(first), p));
+         if (first == last) break;
+         using std::swap;
+         swap(*first++, *--last);
+         first = std::find_if_not(first, last, p);
+       }
+       return first;
+     }
+\end{codebox}
+
+当然，有时我们需要在不改变两个分区中元素各自相对顺序的前提下划分一个范围。为此，可以使用 \texttt{std::\allowbreak{}stable\_\allowbreak{}partition(\allowbreak{}a,\allowbreak{}b,\allowbreak{}p)\allowbreak{}}（不过请参阅“合并与归并排序”一节，了解关于 \texttt{stable\_\allowbreak{}partition} 的一个注意事项：它可能会使用 \texttt{operator new} 分配内存）。
+
+还有几个非重排算法也处理分区：
+
+\texttt{std::\allowbreak{}is\_\allowbreak{}partitioned(\allowbreak{}a,\allowbreak{}b,\allowbreak{}p)\allowbreak{}} 在给定范围已经被谓词 \texttt{p} 划分好时（即所有满足 \texttt{p} 的元素都在前部，所有不满足 \texttt{p} 的元素都在后部）返回 \texttt{true}。
+
+\texttt{std::\allowbreak{}partition\_\allowbreak{}point(\allowbreak{}a,\allowbreak{}b,\allowbreak{}p)\allowbreak{}} 使用二分查找（binary search）来寻找一个已划分范围中第一个不满足 \texttt{p} 的元素。
+
+\texttt{std::\allowbreak{}partition\_\allowbreak{}copy(\allowbreak{}a,\allowbreak{}b,\allowbreak{}ot,\allowbreak{}of,\allowbreak{}p)\allowbreak{}} 把范围 \texttt{[a,\allowbreak{}b)\allowbreak{}} 中的每个元素拷贝到两个输出迭代器之一：对于 \texttt{p(\allowbreak{}e)\allowbreak{}} 为 \texttt{true} 的元素，执行 \texttt{*ot++ = e}；对于 \texttt{p(\allowbreak{}e)\allowbreak{}} 为 \texttt{false} 的元素，执行 \texttt{*of++ = e}。
+
+顺便说一句，如果你只想要其中一个或另一个输出序列，那么可以分别使用 \texttt{std::\allowbreak{}copy\_\allowbreak{}if(\allowbreak{}a,\allowbreak{}b,\allowbreak{}ot,\allowbreak{}p)\allowbreak{}} 或 \texttt{std::\allowbreak{}remove\_\allowbreak{}copy\_\allowbreak{}if(\allowbreak{}a,\allowbreak{}b,\allowbreak{}of,\allowbreak{}p)\allowbreak{}}。
+
+\section{旋转与排列}
+
+还记得我们在“交换、反转与划分”一节中反转句子里单词顺序的代码吗？当这个“句子”只包含两个单词时，还有另一种看待这种反转的方式：你可以把它看作底层范围中元素的循环旋转。\texttt{std::\allowbreak{}rotate(\allowbreak{}a,\allowbreak{}mid,\allowbreak{}b)\allowbreak{}} 旋转范围 \texttt{[a,\allowbreak{}b)\allowbreak{}} 中的元素，使得原先由 \texttt{mid} 所指向的元素现在位于 \texttt{a} 处（并返回一个迭代器（iterator），指向原先值位于 \texttt{a} 处的那个元素）：
+
+\begin{codebox}[cpp]
+     template<class FwdIt>
+     FwdIt rotate(FwdIt a, FwdIt mid, FwdIt b)
+     {
+       auto result = a + (b - mid);
+       // 首先，反转整个范围。
+       std::reverse(a, b);
+       // 接着，把每一段再反转回来。
+       std::reverse(a, result);
+       std::reverse(result, b);
+       return result;
+     }
+     void test()
+     {
+       std::vector<int> v = {1, 2, 3, 4, 5, 6};
+       auto five = std::find(v.begin(), v.end(), 5);
+       auto one = std::rotate(v.begin(), five, v.end());
+       assert((v == std::vector{5, 6, 1, 2, 3, 4}));
+       assert(*one == 1);
+     }
+\end{codebox}
+
+另一个五花八门但有时有用的重排算法是 \texttt{std::\allowbreak{}next\_\allowbreak{}permutation(\allowbreak{}a,\allowbreak{}b)\allowbreak{}}。在循环中调用这个函数，会遍历 n 个元素的全部可能排列，如果你试图用暴力搜索（brute-force）求解一个（小型）旅行商问题（Traveling Salesman Problem）实例，这会很有用：
+
+\begin{codebox}[cpp]
+     std::vector<int> p = {10, 20, 30};
+     std::vector<std::vector<int>> results;
+     // 收集这三个元素的排列。
+     for (int i=0; i < 6; ++i) {
+       results.push_back(p);
+       std::next_permutation(p.begin(), p.end());
+     }
+     assert((results == std::vector<std::vector<int>>{
+       {10, 20, 30},
+       {10, 30, 20},
+       {20, 10, 30},
+       {20, 30, 10},
+       {30, 10, 20},
+       {30, 20, 10},
+     }));
+\end{codebox}
+
+注意，\texttt{next\_\allowbreak{}permutation} 利用“小于关系”的思想来判断一个排列在字典序（lexicographically）上“小于”另一个排列；例如，\texttt{\{20,\allowbreak{} 10,\allowbreak{} 30\}} “小于” \texttt{\{20,\allowbreak{} 30,\allowbreak{} 10\}}，因为 10 小于 30。因此，\texttt{next\_\allowbreak{}permutation} 还有一个基于比较器的版本：\texttt{std::\allowbreak{}next\_\allowbreak{}permutation(\allowbreak{}a,\allowbreak{}b,\allowbreak{}cmp)\allowbreak{}}。此外还有 \texttt{std::\allowbreak{}prev\_\allowbreak{}permutation(\allowbreak{}a,\allowbreak{}b)\allowbreak{}} 和 \texttt{std::\allowbreak{}prev\_\allowbreak{}permutation(\allowbreak{}a,\allowbreak{}b,\allowbreak{}cmp)\allowbreak{}}，它们按字典序“向下”而非“向上”计数。
+
+顺便说一句，要以这种方式按字典序比较两个序列，你可以使用“只读范围算法”一节中的 \texttt{std::\allowbreak{}mismatch}，也可以直接使用标准提供的 \texttt{std::\allowbreak{}lexicographical\_\allowbreak{}compare(\allowbreak{}a,\allowbreak{}b,\allowbreak{}c,\allowbreak{}d)\allowbreak{}}。
+
+\section{堆与堆排序}
+
+\texttt{std::\allowbreak{}make\_\allowbreak{}heap(\allowbreak{}a,\allowbreak{}b)\allowbreak{}}（或其基于比较器的版本 \texttt{std::\allowbreak{}make\_\allowbreak{}heap(\allowbreak{}a,\allowbreak{}b,\allowbreak{}cmp)\allowbreak{}}）取一段未排序的元素范围，并把它们重排成满足最大堆（max-heap）性质的一种顺序：在一个具备最大堆性质的数组中，范围中索引为 i 的每个元素，都至少不小于索引为 2i+1 和 2i+2 处的两个元素中的任何一个。这意味着所有元素中最大的那个会位于索引 0 处。
+
+\texttt{std::\allowbreak{}push\_\allowbreak{}heap(\allowbreak{}a,\allowbreak{}b)\allowbreak{}}（或其基于比较器的版本）假定范围 \texttt{[a,\allowbreak{}b-1)\allowbreak{}} 已经是一个最大堆。它取当前位于 \texttt{b[-1]} 处的元素，并通过与它在堆中的父节点交换来“向上冒泡”，直到整个范围 \texttt{[a,\allowbreak{}b)\allowbreak{}} 的最大堆性质恢复。注意，\texttt{make\_\allowbreak{}heap} 可以简单地实现为一个反复调用 \texttt{std::\allowbreak{}push\_\allowbreak{}heap(\allowbreak{}a,\allowbreak{}++b)\allowbreak{}} 的循环。
+
+\texttt{std::\allowbreak{}pop\_\allowbreak{}heap(\allowbreak{}a,\allowbreak{}b)\allowbreak{}}（或其基于比较器的版本）假定范围 \texttt{[a,\allowbreak{}b)\allowbreak{}} 已经是一个最大堆。它把 \texttt{a[0]} 与 \texttt{b[-1]} 交换，使得最大的元素现在位于范围的后部而非前部；然后它把 \texttt{a[0]} 与它在堆中的某个子节点交换，依此类推，“向下冒泡”，直到最大堆性质恢复。在调用 \texttt{pop\_\allowbreak{}heap(\allowbreak{}a,\allowbreak{}b)\allowbreak{}} 之后，最大的元素会位于 \texttt{b[-1]} 处，而范围 \texttt{[a,\allowbreak{} b-1)\allowbreak{}} 会具备最大堆性质。
+
+\texttt{std::\allowbreak{}sort\_\allowbreak{}heap(\allowbreak{}a,\allowbreak{}b)\allowbreak{}}（或其基于比较器的版本）取一个具备最大堆性质的范围，并通过反复调用 \texttt{std::\allowbreak{}pop\_\allowbreak{}heap(\allowbreak{}a,\allowbreak{} b--)\allowbreak{}} 把它重排成有序的顺序。
+
+利用这些积木，我们就能实现经典的堆排序（heapsort）算法。标准库的 \texttt{std::\allowbreak{}sort} 函数大可以这样实现（但在实践中，它通常被实现为一种混合算法，例如内省排序（introsort））：
+
+\begin{codebox}[cpp]
+     template<class RandomIt>
+     void push_heap(RandomIt a, RandomIt b)
+     {
+       auto child = ((b-1) - a);
+       while (child != 0) {
+         auto parent = (child - 1) / 2;
+         if (a[child] < a[parent]) {
+           return; // 最大堆性质已恢复
+         }
+         std::iter_swap(a+child, a+parent);
+         child = parent;
+       }
+     }
+     template<class RandomIt>
+     void pop_heap(RandomIt a, RandomIt b)
+     {
+       using DistanceT = decltype(b - a);
+       std::iter_swap(a, b-1);
+       DistanceT parent = 0;
+       DistanceT new_heap_size = ((b-1) - a);
+       while (true) {
+         auto leftchild = 2 * parent + 1;
+         auto rightchild = 2 * parent + 2;
+         if (leftchild >= new_heap_size) {
+           return;
+         }
+         auto biggerchild = leftchild;
+         if (rightchild < new_heap_size && a[leftchild] < a[rightchild]) {
+           biggerchild = rightchild;
+         }
+         if (a[biggerchild] < a[parent]) {
+           return; // 最大堆性质已恢复
+         }
+         std::iter_swap(a+parent, a+biggerchild);
+         parent = biggerchild;
+       }
+     }
+     template<class RandomIt>
+     void make_heap(RandomIt a, RandomIt b)
+     {
+       for (auto it = a; it != b; ) {
+         push_heap(a, ++it);
+       }
+     }
+     template<class RandomIt>
+     void sort_heap(RandomIt a, RandomIt b)
+     {
+       for (auto it = b; it != a; --it) {
+         pop_heap(a, it);
+       }
+     }
+     template<class RandomIt>
+     void sort(RandomIt a, RandomIt b)
+     {
+       make_heap(a, b);
+       sort_heap(a, b);
+     }
+\end{codebox}
+
+我们将在第 4 章“容器动物园”中讨论 \texttt{std::\allowbreak{}priority\_\allowbreak{}queue} 时，看到 \texttt{push\_\allowbreak{}heap} 和 \texttt{pop\_\allowbreak{}heap} 的另一种应用。
+
+\section{合并与归并排序}
+
+既然我们在讨论排序算法这个话题，不妨换一种方式来实现 \texttt{sort}！\texttt{std::\allowbreak{}inplace\_\allowbreak{}merge(\allowbreak{}a,\allowbreak{}mid,\allowbreak{}b)\allowbreak{}} 取一个单独的范围 \texttt{[a,\allowbreak{}b)\allowbreak{}}，它已经分别用相当于 \texttt{std::\allowbreak{}sort(\allowbreak{}a,\allowbreak{}mid)\allowbreak{}} 和 \texttt{std::\allowbreak{}sort(\allowbreak{}mid,\allowbreak{}b)\allowbreak{}} 的方式排好序，然后把这两个子范围合并成一个有序的范围。我们可以用这个积木来实现经典的归并排序（mergesort）算法：
+
+\begin{codebox}[cpp]
+     template<class RandomIt>
+     void sort(RandomIt a, RandomIt b)
+     {
+       auto n = std::distance(a, b);
+       if (n >= 2) {
+         auto mid = a + n/2;
+         std::sort(a, mid);
+         std::sort(mid, b);
+         std::inplace_merge(a, mid, b);
+       }
+     }
+\end{codebox}
+
+不过，当心！\texttt{inplace\_\allowbreak{}merge} 这个名字似乎暗示合并是
+
+这种事是「原地（in-place）」发生的，不需要任何额外的缓冲区；但事实并非如此。实际上，\texttt{inplace\_\allowbreak{}merge} 函数会为自己分配一块缓冲区，通常是通过调用 \texttt{operator new}。如果你所处的编程环境中堆（heap）分配是个问题，那就应该像躲避瘟疫一样避开 \texttt{inplace\_\allowbreak{}merge}。其他可能从堆上分配临时缓冲区的标准算法还有 \texttt{std::\allowbreak{}stable\_\allowbreak{}sort} 和 \texttt{std::\allowbreak{}stable\_\allowbreak{}partition}。\texttt{std::\allowbreak{}merge(\allowbreak{}a,\allowbreak{}b,\allowbreak{}c,\allowbreak{}d,\allowbreak{}o)\allowbreak{}} 是不进行分配的合并（merge）算法；它接受两个迭代器对（iterator-pair），分别代表范围 \texttt{[a,\allowbreak{}b)\allowbreak{}} 和 \texttt{[c,\allowbreak{}d)\allowbreak{}}，并把它们合并到由 \texttt{o} 定义的输出范围中。
+
+\section{在已排序数组中用 \texttt{std::\allowbreak{}lower\_\allowbreak{}bound} 搜索与插入}
+
+一旦一批数据排好序，就可以在其中使用二分查找（binary search），而不必使用较慢的线性查找。实现二分查找的标准算法叫作 \texttt{std::\allowbreak{}lower\_\allowbreak{}bound(\allowbreak{}a,\allowbreak{}b,\allowbreak{}v)\allowbreak{}}：
+
+\begin{codebox}[cpp]
+    template<class FwdIt, class T, class C>
+    FwdIt lower_bound(FwdIt first, FwdIt last, const T& value, C lessthan)
+    {
+      using DiffT = typename std::iterator_traits<FwdIt>::difference_type;
+      FwdIt it;
+      DiffT count = std::distance(first, last);
+      while (count > 0) {
+        DiffT step = count / 2;
+        it = first;
+        std::advance(it, step);
+        if (lessthan(*it, value)) {
+          ++it;
+          first = it;
+          count -= step + 1;
+        } else {
+          count = step;
+        }
+      }
+      return first;
+    }
+    template<class FwdIt, class T>
+    FwdIt lower_bound(FwdIt first, FwdIt last, const T& value)
+    {
+      return std::lower_bound(first, last, value, std::less<>{});
+    }
+\end{codebox}
+
+这个函数返回一个迭代器（iterator），指向范围中第一个不小于给定值 \texttt{v} 的元素。如果范围中已经存在值为 \texttt{v} 的元素，那么返回的迭代器会指向它（实际上会指向范围中第一个这样的值）。如果范围中还没有这个值，那么返回的迭代器会指向 \texttt{v} 本应所在的位置。
+
+我们可以把 \texttt{lower\_\allowbreak{}bound} 的返回值作为 \texttt{vector::\allowbreak{}insert} 的输入，从而把 \texttt{v} 插入到已排序向量（vector）中正确的位置，同时保持其有序性：
+
+\begin{codebox}[cpp]
+    std::vector<int> vec = {3, 7};
+    for (int value : {1, 5, 9}) {
+      // 找到合适的插入点……
+      auto it = std::lower_bound(vec.begin(), vec.end(), value);
+      // ……并在那里插入我们的值。
+      vec.insert(it, value);
+    }
+    // 向量保持有序。
+    assert((vec == std::vector{1, 3, 5, 7, 9}));
+\end{codebox}
+
+类似的函数 \texttt{std::\allowbreak{}upper\_\allowbreak{}bound(\allowbreak{}a,\allowbreak{}b,\allowbreak{}v)\allowbreak{}} 返回一个迭代器，指向范围中第一个大于给定值 \texttt{v} 的元素。如果 \texttt{v} 不在给定范围内，那么 \texttt{std::\allowbreak{}lower\_\allowbreak{}bound} 和 \texttt{std::\allowbreak{}upper\_\allowbreak{}bound} 的返回值相同。但如果 \texttt{v} 确实在范围内，那么 \texttt{lower\_\allowbreak{}bound} 会返回一个指向范围中第一个 \texttt{v} 的迭代器，而 \texttt{upper\_\allowbreak{}bound} 会返回一个指向范围中最后一个 \texttt{v}「之后一个位置（one past）」的迭代器。换句话说，把这两个函数配合使用，就能得到一个半开区间（half-open range）\texttt{[lower,\allowbreak{} upper)\allowbreak{}}，其中只包含值为 \texttt{v} 的元素：
+
+\begin{codebox}[cpp]
+    std::vector<int> vec = {2, 3, 3, 3, 4};
+    auto lower = std::lower_bound(vec.begin(), vec.end(), 3);
+    // 第一种方法：
+    // upper_bound 的接口与 lower_bound 的完全相同。
+    auto upper = std::upper_bound(vec.begin(), vec.end(), 3);
+    // 第二种方法：
+    // 第二次就不需要对整个数组做二分查找了。
+    auto upper2 = std::upper_bound(lower, vec.end(), 3);
+    assert(upper2 == upper);
+    // 第三种方法：
+    // 从下界开始线性扫描，如果总范围非常大，
+    // 可能比二分查找更快。
+    auto upper3 = std::find_if(lower, vec.end(), [](int v) {
+      return v != 3;
+    });
+    assert(upper3 == upper);
+    // 无论采用哪种方法，最终得到的都是这个结果。
+    assert(*lower >= 3);
+    assert(*upper > 3);
+    assert(std::all_of(lower, upper, [](int v) { return v == 3; }));
+\end{codebox}
+
+这就解决了在已排序数组中搜索与插入值的问题。但删除又该如何呢？
+
+\section{在已排序数组中用 \texttt{std::\allowbreak{}remove\_\allowbreak{}if} 删除}
+
+在我们到目前为止对标准泛型（generic）算法的所有讨论中，还没有涉及如何从范围中移除元素的问题。这是因为「范围（range）」这个概念从根本上说是只读的：我们可以改变某个给定范围中元素的值，但永远无法用标准算法去缩短或拉长范围本身。在「用 \texttt{std::\allowbreak{}copy} 搬运数据」一节中，我们用 \texttt{std::\allowbreak{}copy} 来向一个名为 \texttt{dest} 的向量「插入」元素，当时真正执行插入操作的并不是 \texttt{std::\allowbreak{}copy} 算法本身，而是 \texttt{std::\allowbreak{}back\_\allowbreak{}insert\_\allowbreak{}iterator} 这个对象，它持有对底层容器（container）的引用，因而能够向容器插入元素。\texttt{std::\allowbreak{}copy} 并没有把 \texttt{dest.\allowbreak{}begin(\allowbreak{})\allowbreak{}} 和 \texttt{dest.\allowbreak{}end(\allowbreak{})\allowbreak{}} 当作参数，而是接受了一个特殊对象 \texttt{std::\allowbreak{}back\_\allowbreak{}inserter(\allowbreak{}dest)\allowbreak{}}。
+
+那么，我们该如何从范围中擦除（erase）元素呢？答案是做不到。我们所能做的只是从容器中擦除元素；而 STL 的算法并不处理容器。因此，我们真正应该寻找的是这样一种办法：重新排布一个范围中的值，使得那些「被移除」的元素最终落到某个可预期的位置，这样我们就能迅速地把它们从底层容器中一并擦除（使用 STL 算法之外的某种手段）。
+
+我们已经见过一种可能的做法：
+
+\begin{codebox}[cpp]
+    std::vector<int> vec = {1, 3, 3, 4, 6, 8};
+    // 对向量做划分（partition），使得所有非 3 的元素都在前
+    // 而所有 3 都在末尾。
+    auto first_3 = std::stable_partition(
+      vec.begin(), vec.end(), [](int v){ return v != 3; }
+    );
+    assert((vec == std::vector{1, 4, 6, 8, 3, 3}));
+    // 现在擦除向量的「尾部」。
+    vec.erase(first_3, vec.end());
+    assert((vec == std::vector{1, 4, 6, 8}));
+\end{codebox}
+
+但这样做比必要的要浪费得多（请注意，\texttt{stable\_\allowbreak{}partition} 是少数几个会在堆上分配临时缓冲区的 STL 算法之一！）。我们真正想要的算法其实要简单得多：
+
+\begin{codebox}[cpp]
+    template<class FwdIt, class T>
+    FwdIt remove(FwdIt first, FwdIt last, const T& value)
+    {
+      auto out = std::find(first, last, value);
+      if (out != last) {
+        auto in = out;
+        while (++in != last) {
+          if (*in == value) {
+             // 不用管这个元素
+          } else {
+             *out++ = std::move(*in);
+          }
+        }
+      }
+      return out;
+    }
+    void test()
+    {
+      std::vector<int> vec = {1, 3, 3, 4, 6, 8};
+      // 对向量做划分，使所有非 3 的元素都在前。
+      auto new_end = std::remove(
+        vec.begin(), vec.end(), 3
+      );
+      // std::remove_if 不会保留那些「被移除」的元素。
+      assert((vec == std::vector{1, 4, 6, 8, 6, 8}));
+      // 现在擦除向量的「尾部」。
+      vec.erase(new_end, vec.end());
+      assert((vec == std::vector{1, 4, 6, 8}));
+      // 或者，把两步合并成一行。
+      // 这就是所谓的「erase-remove 惯用法」：
+      vec.erase(
+        std::remove(vec.begin(), vec.end(), 3),
+        vec.end()
+      );
+      // 但如果数组很长，而且我们知道它是有序的，
+      // 那么或许用二分查找来定位
+      // 待擦除的元素会更好。
+      // 这里的「下移（shifting-down）」仍然在发生，只不过
+      // 它发生在 vector::erase 内部，而非 std::remove 内部。
+      auto first = std::lower_bound(vec.begin(), vec.end(), 3);
+      auto last = std::upper_bound(first, vec.end(), 3);
+      vec.erase(first, last);
+    }
+\end{codebox}
+
+\texttt{std::\allowbreak{}remove(\allowbreak{}a,\allowbreak{}b,\allowbreak{}v)\allowbreak{}} 会从范围 \texttt{[a,\allowbreak{}b)\allowbreak{}} 中移除所有等于 \texttt{v} 的值。注意这个范围不必是有序的——但 \texttt{remove} 会通过把未被移除的元素「下移」来填补范围中的空缺，从而保留原有的顺序。如果 \texttt{remove} 从范围中移除了 k 个元素，那么当 \texttt{remove} 函数返回时，范围末尾会有 k 个值处于被移出（moved-from）状态的元素，而 \texttt{remove} 的返回值将是一个指向第一个这样的被移出元素的迭代器。
+
+\texttt{std::\allowbreak{}remove\_\allowbreak{}if(\allowbreak{}a,\allowbreak{}b,\allowbreak{}p)\allowbreak{}} 会移除所有满足给定谓词（predicate）的元素；也就是说，它会移除所有使 \texttt{p(\allowbreak{}e)\allowbreak{}} 为真的元素 \texttt{e}。和 \texttt{remove} 一样，\texttt{remove\_\allowbreak{}if} 会把元素下移以填补范围，并返回一个指向第一个「被移出」元素的迭代器。
+
+从序列容器（sequence container）中移除元素时，常用的惯用法就是所谓的「erase-remove 惯用法」，因为它要把那个返回值直接传给容器自身的 \texttt{.erase(\allowbreak{})\allowbreak{}} 成员函数。
+
+另一个能与 erase-remove 惯用法配合使用的标准库算法是 \texttt{std::\allowbreak{}unique(\allowbreak{}a,\allowbreak{}b)\allowbreak{}}，它接受一个范围，并对每一组连续相等的元素只保留第一个、移除其余的。和 \texttt{std::\allowbreak{}remove} 一样，输入范围不必有序；该算法会保留最初的排序：
+
+\begin{codebox}[cpp]
+    std::vector<int> vec = {1, 2, 2, 3, 3, 3, 1, 3, 3};
+    vec.erase(
+      std::unique(vec.begin(), vec.end()),
+      vec.end()
+    );
+    assert((vec == std::vector{1, 2, 3, 1, 3}));
+\end{codebox}
+
+最后请注意，通常我们往往能有比 \texttt{std::\allowbreak{}remove} 更好的做法：要么使用底层容器的 \texttt{erase} 成员函数（例如，我们将在下一章看到，在 \texttt{std::\allowbreak{}list} 上，\texttt{std::\allowbreak{}list::\allowbreak{}erase} 可以比 erase-remove 惯用法快得多）——即便我们要从一个顺序恰好无关紧要的向量中移除元素，通常也最好采用类似下面这个泛型算法 \texttt{unstable\_\allowbreak{}remove} 的做法，它已被提议纳入未来的标准化，但（在撰写本书时）尚未被 STL 采纳：
+
+\begin{codebox}[cpp]
+    namespace my {
+      template<class BidirIt, class T>
+      BidirIt unstable_remove(BidirIt first, BidirIt last, const T& value)
+      {
+        while (true) {
+          // 找到第一个「value」……
+          first = std::find(first, last, value);
+          // ……以及最后一个「非 value」……
+          do {
+            if (first == last) {
+              return last;
+            }
+            --last;
+          } while (*last == value);
+          // ……并把后者移动到前者的位置上。
+          *first = std::move(*last);
+          // 如此反复。
+          ++first;
+        }
+      }
+    } // namespace my
+    void test()
+    {
+      std::vector<int> vec = {4, 1, 3, 6, 3, 8};
+      vec.erase(
+        my::unstable_remove(vec.begin(), vec.end(), 3),
+        vec.end()
+      );
+      assert((vec == std::vector{4, 1, 8, 6}));
+    }
+\end{codebox}
+
+在下一章，我们会来看看容器（container）——对于「这些元素到底都存放在哪里？」这个问题，STL 给出的答案。
+
+\section{小结}
+
+标准库（STL）几乎为每一种需求都准备了一个泛型算法。如果你正在做一些与算法相关的事情，请先查查 STL！
+
+STL 的算法处理的是由迭代器对定义的半开区间。在处理任何「一个半范围（one-and-a-half-range）」算法时要多加小心。
+
+涉及比较与排序的 STL 算法默认会使用 \texttt{operator<}，但你随时可以传入一个双参数的「比较器（comparator）」来取代它。如果你想对整个范围的数据执行某种非平凡的操作，请记住，STL 可能直接支持它（\texttt{std::\allowbreak{}move}、\texttt{std::\allowbreak{}transform}），也可能通过某种特殊的迭代器类型间接支持（\texttt{std::\allowbreak{}back\_\allowbreak{}inserter}、\texttt{std::\allowbreak{}istream\_\allowbreak{}iterator}）。
+
+你应该了解什么是「排列（permutation）」，以及标准的重排（permutative）算法（\texttt{swap}、\texttt{reverse}、\texttt{rotate}、\texttt{partition}、\texttt{sort}）是如何相互基于彼此实现的。只有三个 STL 算法（\texttt{stable\_\allowbreak{}sort}、\texttt{stable\_\allowbreak{}partition}、\texttt{inplace\_\allowbreak{}merge}）可能会悄悄地从堆上分配内存；如果你无法承受堆分配，那就像躲避瘟疫一样避开这三个算法。
+
+使用 erase-remove 惯用法，即使在从序列容器中删除元素时也能维持其有序性。如果你不在乎顺序，就用类似 \texttt{my::\allowbreak{}unstable\_\allowbreak{}remove} 这样的做法。对于支持该操作的容器，则使用 \texttt{.erase(\allowbreak{})\allowbreak{}}。

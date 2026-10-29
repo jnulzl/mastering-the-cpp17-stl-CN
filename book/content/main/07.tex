@@ -1,0 +1,1175 @@
+在上一章中，我们讨论了 \texttt{std::\allowbreak{}shared\_\allowbreak{}ptr<\allowbreak{}T>\allowbreak{}} 如何实现引用计数（reference-counting）式的内存管理，从而使对象的生命周期可以由彼此可能互不知情的利益相关方协同控制——例如，这些利益相关方可能生活在不同的线程（thread）中。在 C++11 之前的 C++ 里，这马上就会成为一个绊脚石：如果一个利益相关方在递减引用计数，与此同时另一个线程（thread）中的利益相关方也正在递减引用计数，那我们不就遭遇了数据竞争（data race），从而陷入未定义行为（UB）吗？在 C++11 之前，答案通常是“会”。（事实上，C++11 之前的 C++ 并没有“线程（thread）”的标准概念，所以另一个合理的答案或许是：这个问题本身根本无从谈起。）不过，从 2011 年的 C++ 开始，我们有了一套标准的（线程）内存模型，它把“多线程（threading）”和“线程安全（thread-safety）”这样的概念纳入了考量，因此这个问题变得有意义，而答案则断然是“不会！”对 \texttt{std::\allowbreak{}shared\_\allowbreak{}ptr} 引用计数的访问保证彼此之间不会竞争；在本章中，我们将向你展示如何使用标准库提供的工具，实现类似的线程安全（thread-safe）构造。本章将涵盖以下主题：\texttt{volatile}（易变变量）\texttt{T} 与 \texttt{std::\allowbreak{}atomic<\allowbreak{}T>\allowbreak{}}（原子类型）之间的区别
+
+\begin{codebox}[cpp]
+std::mutex, std::lock_guard<M>, and std::unique_lock<M>
+std::recursive_mutex and std::shared_mutex
+std::condition_variable and std::condition_variable_any
+std::promise<T> and std::future<T>
+\end{codebox}
+
+\texttt{std::\allowbreak{}thread} 与 \texttt{std::\allowbreak{}async}
+
+\texttt{std::\allowbreak{}async} 的风险，以及如何构建一个线程池（thread pool）来取代它。
+
+\section{volatile 的问题}
+
+如果你在过去十年里一直与世隔绝——或者你来自老式 C 语言背景——你可能会问：“\texttt{volatile} 关键字有什么问题？当我想确保某次访问真正落在内存上时，我只要让它以 \texttt{volatile} 的方式进行就行。”
+
+\texttt{volatile} 的官方语义是：对 volatile 的访问严格按照抽象机（abstract machine）的规则来求值，这大致意味着编译器不允许对它们重排序（reorder），也不允许把多次访问合并为一次。例如，编译器不能假定 \texttt{x} 在这两次加载（load）之间保持不变；它必须生成执行两次加载的机器码，一次位于对 \texttt{y} 的存储（store）之前，一次位于其后：
+
+\begin{codebox}[cpp]
+    volatile int& x = memory_mapped_register_x();
+    volatile bool& y = memory_mapped_register_y();
+    int stack;
+    stack = x; // 加载
+    y = true; // 存储
+    stack += x; // 加载
+\end{codebox}
+
+如果 \texttt{x} 不是 volatile 的，那么编译器完全有权以如下方式对代码重排序：
+
+\begin{codebox}[cpp]
+    stack = 2*x; // 加载
+    y = true; // 存储
+\end{codebox}
+
+编译器之所以能这样做（如果 \texttt{x} 不是 volatile 的话），是因为对 \texttt{bool} 变量 \texttt{y} 的写入不可能影响 \texttt{int} 变量 \texttt{x} 的值。然而，由于 \texttt{x} 是 volatile 的，这种重排序优化是不被允许的。
+
+你之所以会使用 \texttt{volatile} 关键字，最常见的原因从我为那个例子所选的名字就能看出来：它的使用场景是你直接与硬件打交道的时候，比如内存映射（memory-mapped）寄存器，在源代码层面看起来像一次加载或存储的操作，实际上映射到更复杂的硬件操作。在前面的例子中，也许 \texttt{x} 是某个硬件缓冲区的视图，而对内存位置 \texttt{y} 的存储，就是通知硬件把下四个字节的数据载入 \texttt{x} 寄存器的信号。
+
+把这种情况看作运算符重载（operator overloading）或许有助于理解，只不过它发生在硬件层面。
+
+而如果“运算符重载，只不过是发生在硬件里”这种说法让你觉得荒谬，那你大概就完全没有理由在自己的程序里使用 \texttt{volatile} 了！
+
+以上就是 \texttt{volatile} 的作用。但为什么我们不能用 \texttt{volatile} 来让自己的程序线程安全（thread-safe）呢？归根结底，\texttt{volatile} 的问题在于它太古老了。
+
+自从 C++ 从 C 分化出来，这个关键字就一直在 C++ 中；而在 C 里，它从 1989 年的第一版标准起就存在了。那时人们对多线程（multithreading）几乎毫无顾虑，编译器也更简单，这意味着一些潜在有问题的优化尚未被设想出来。到了 1990 年代末、2000 年代初，当 C++ 缺乏线程感知（thread-aware）内存模型这一点开始成为一个切实的隐忧时，要让 \texttt{volatile} 承担起线程安全内存访问所需的全部职责已经为时过晚，因为每个厂商都已经实现了 \texttt{volatile}，并精确记录了它的行为。在那个时间点改变规则，会破坏许多人的代码——而且会被破坏的代码恰恰是最底层的硬件接口代码，是你最不希望出现 bug 的那一类代码。
+
+下面举几个例子，说明为了获得线程安全的内存访问，我们需要什么样的保证：
+
+\begin{codebox}[cpp]
+    // 全局变量：
+    int64_t x = 0;
+    bool y = false;
+    void thread_A() {
+      x = 0x42'00000042;
+      y = true;
+    }
+    void thread_B() {
+      if (x) {
+        assert(x == 0x42'00000042);
+      }
+    }
+    void thread_C() {
+      if (y) {
+        assert(x == 0x42'00000042);
+      }
+    }
+\end{codebox}
+
+假设 \texttt{thread\_\allowbreak{}A}、\texttt{thread\_\allowbreak{}B} 和 \texttt{thread\_\allowbreak{}C} 都在不同的线程（thread）中并发（concurrency）地运行。这段代码可能出什么错呢？嗯，\texttt{thread\_\allowbreak{}B} 在检查 \texttt{x} 的值是否始终恰好为零或 \texttt{0x42'00000042}。然而在 32 位计算机上，这一保证可能无法成立；编译器可能不得不把 \texttt{thread\_\allowbreak{}A} 中的赋值实现为一对赋值操作——“把 \texttt{x} 的上半部分设为 42；把 \texttt{x} 的下半部分设为 42”。如果 \texttt{thread\_\allowbreak{}B} 中的测试恰好在正确的（错误的）时机运行，它最终看到的 \texttt{x} 可能是 \texttt{0x42'00000000}。把 \texttt{x} 设为 volatile 对此无济于事；事实上，什么办法都没用，因为我们的 32 位硬件根本不支持这一操作！如果编译器能察觉我们想做一次原子（atomic）的 64 位赋值，并在它知道目标无法实现时给我们一个编译期错误，那就好了。换句话说，volatile 的访问并不保证是原子的（atomic）。在实践中，它们往往是原子的——非 volatile 的访问往往也是——但它们都不保证是原子的，有时你不得不深入到机器码层面，才能弄清自己拿到的究竟是不是预期的代码。我们希望有一种方法，能保证某次访问是原子的（如果不可能，则希望得到编译器报错）。
+
+现在来考虑 \texttt{thread\_\allowbreak{}C}。它在检查：如果 \texttt{y} 的值可见为真，那么 \texttt{x} 的值必然已经被设为最终值。换句话说，它在检查对 \texttt{x} 的写入“先于（happened before）”对 \texttt{y} 的写入发生。从 \texttt{thread\_\allowbreak{}A} 的角度看，这绝对成立——至少当 \texttt{x} 和 \texttt{y} 都是 volatile 时如此——因为我们已经看到，编译器不允许对 volatile 的访问重排序。然而，从 \texttt{thread\_\allowbreak{}C} 的角度看，情形未必如此！如果 \texttt{thread\_\allowbreak{}C} 运行在不同的物理 CPU 上，拥有自己的数据缓存，那么它察觉到 \texttt{x} 和 \texttt{y} 更新值的时间可能不同，这取决于它何时刷新各自的缓存行（cache line）。我们希望有一种方式可以表明：当编译器从 \texttt{y} 加载时，它还必须确保自己的整个缓存都是最新的——即它绝不会读到 \texttt{x} 的“陈旧（stale）”值。然而，在某些处理器架构上，这需要特殊的指令，或额外的内存屏障（memory-barrier）逻辑。编译器不会为“老式”的 volatile 访问生成这些指令，因为 volatile 被发明时，多线程（threading）还不在考量之中；而编译器也没法被强制为 volatile 访问生成这些指令，因为那会不必要地拖慢、甚至有可能破坏所有现有的底层代码——这些代码正是出于老式语义而使用老式 volatile 的。于是我们面临这样一个问题：尽管从自身线程的角度来看，volatile 的访问是按顺序发生的，但从另一个线程的角度看，它们很可能以不同的顺序出现。换句话说，volatile 的访问并不保证是顺序一致（sequentially consistent）的。我们希望有一种方式，能保证某次访问相对于其他访问是顺序一致的。
+
+对我们这两个问题的解决方案，是在 2011 年被加入 C++ 的。这个方案就是 \texttt{std::\allowbreak{}atomic}（原子类型）。
+
+\section{使用 std::atomic<T> 实现线程安全的访问}
+
+在 C++11 及之后的版本中，\texttt{<atomic>\allowbreak{}} 头文件包含了类模板 \texttt{std::\allowbreak{}atomic<\allowbreak{}T>\allowbreak{}} 的定义。看待 \texttt{std::\allowbreak{}atomic} 有两种不同的思路：你可以把它看作一个和 \texttt{std::\allowbreak{}vector} 一样的类模板，只不过它重载的运算符恰好实现了线程安全的操作；或者你也可以把它看作一组神奇的、内建的类型家族，其名字恰好带有尖括号。后一种思路其实相当有用，因为它正确地暗示了：\texttt{std::\allowbreak{}atomic} 有一部分内建在编译器里，因此编译器通常会为原子操作生成最优的代码。后一种思路还暗示了 \texttt{atomic} 不同于 \texttt{vector} 的一点：对于 \texttt{std::\allowbreak{}vector<\allowbreak{}T>\allowbreak{}}，\texttt{T} 几乎可以是你喜欢的任何类型；而对于 \texttt{std::\allowbreak{}atomic<\allowbreak{}T>\allowbreak{}}，\texttt{T} 原则上也可以是任何类型，但在实践中，使用任何不属于那一小组“原子友好（atomic-friendly）”类型的 \texttt{T} 都是个糟糕的主意。稍后我们会详谈这个话题。
+
+\begin{codebox}[cpp]
+    // 全局变量：
+    std::atomic<int64_t> x = 0;
+    std::atomic<bool> y = false;
+    void thread_A() {
+      x = 0x42'00000042; // 原子操作！
+      y = true; // 原子操作！
+    }
+    void thread_B() {
+      if (x) {
+        // 对 x 的赋值是原子地发生的。
+        assert(x == 0x42'00000042);
+      }
+    }
+    void thread_C() {
+      if (y) {
+        // 对 x 的赋值“先于”对 y 的赋值发生，
+        // 即便从另一个线程的角度看也是如此。
+        assert(x == 0x42'00000042);
+      }
+    }
+\end{codebox}
+
+\texttt{std::\allowbreak{}atomic<\allowbreak{}T>\allowbreak{}} 重载了它的赋值运算符，以执行原子的、线程安全的赋值；同样地，它也重载了 \texttt{++}、\texttt{--}、\texttt{+=} 和 \texttt{-=} 运算符；对于整型，还重载了 \texttt{\&=}、\texttt{|=} 和 \texttt{\string^=} 运算符。
+
+有一点很重要，必须牢记：类型为 \texttt{std::\allowbreak{}atomic<\allowbreak{}T>\allowbreak{}} 的对象（在概念上“存在于”内存之中）与类型为 \texttt{T} 的短生命周期的值（在概念上“就近”存在于手边，例如在 CPU 寄存器中）之间是有区别的。例如，\texttt{std::\allowbreak{}atomic<\allowbreak{}int>\allowbreak{}} 并没有拷贝赋值运算符：
+
+\begin{codebox}[cpp]
+    std::atomic<int> a, b;
+    a = b; // 无法编译！
+\end{codebox}
+
+没有拷贝赋值运算符（也没有移动赋值运算符），是因为它不会有明确的意义：程序员的意思是让计算机把 \texttt{b} 的值加载到寄存器，再把该寄存器的值存储到 \texttt{a} 吗？那听起来像是两次不同的原子操作，而不是一次！或者，程序员的意思可能是让计算机在一次原子操作中把值从 \texttt{b} 拷贝到 \texttt{a}；但这涉及在一次原子操作中触及两个不同的内存位置，而这超出了大多数计算机硬件的能力。因此，C++ 要求你显式地写出自己的意图：先从对象 \texttt{b} 做一次原子加载到寄存器（在 C++ 中用一个非原子的栈变量表示），再做一次原子存储到对象 \texttt{a}：
+
+\begin{codebox}[cpp]
+    int shortlived = b; // 原子加载
+    a = shortlived; // 原子存储
+\end{codebox}
+
+\texttt{std::\allowbreak{}atomic<\allowbreak{}T>\allowbreak{}} 提供了成员函数 \texttt{.load(\allowbreak{})\allowbreak{}} 和 \texttt{.store(\allowbreak{}v)\allowbreak{}}，以照顾那些喜欢在每一步都看清自己在做什么的程序员。使用它们是可选的：
+
+\begin{codebox}[cpp]
+    int shortlived = b.load(); // 原子加载
+    a.store(shortlived); // 原子存储
+\end{codebox}
+
+事实上，借助这些成员函数，你可以把这次赋值写成一行代码：\texttt{b.\allowbreak{}store(\allowbreak{}a.\allowbreak{}load(\allowbreak{})\allowbreak{})\allowbreak{}}；但我强烈建议不要这么做。把两个函数调用写在同一行代码里，并不意味着它们在时间上会“更靠近”地发生，当然也不意味着它们会“原子地”发生（正如我们刚刚看到的，这在大多数硬件上是不可能的），但把两个函数调用写在同一行里，很可能会让你误以为这两个调用是“一起”发生的。
+
+在每次只做一件事的时候，处理多线程（threaded）代码就已经够难了。如果你开始耍小聪明，在同一行代码里同时做几件事，出 bug 的可能性就会飙升。坚持每行源代码只做单一的原子操作吧；你会发现，这能让你的思路更清晰，顺带也让代码更易读。
+
+\subsection{以原子方式执行复杂操作}
+
+你可能已经注意到，\texttt{*=}、\texttt{/\allowbreak{}=}、\texttt{\%=}、\texttt{<<=} 和 \texttt{>>=} 这些运算符被排除在了上一节所列的重载运算符之外。这些运算符被 \texttt{std::\allowbreak{}atomic<\allowbreak{}int>\allowbreak{}} 以及所有其他整型原子类型删除了，因为它们被认为在任何真实硬件上都难以高效地提供。然而，即便在 \texttt{std::\allowbreak{}atomic<\allowbreak{}int>\allowbreak{}} 所包含的操作之中，大多数也需要一点代价略高的实现技巧。
+
+假设我们的硬件没有“原子乘法”指令，但我们仍然想实现 \texttt{operator*=}。该怎么做呢？诀窍是使用一种被称为“比较并交换（compare and swap）”的原始原子操作，在 C++ 里则叫“比较-交换（compare-exchange）”。
+
+\begin{codebox}[cpp]
+    std::atomic<int> a = 6;
+    a *= 9; // 这是不允许的。
+    // 但这样可以：
+    int expected, desired;
+    do {
+      expected = a.load();
+      desired = expected * 9;
+    } while (!a.compare_exchange_weak(expected, desired));
+    // 循环结束时，a 的值将
+    // 已经被“原子地”乘以了 9。
+\end{codebox}
+
+\texttt{a.\allowbreak{}compare\_\allowbreak{}exchange\_\allowbreak{}weak(\allowbreak{}expected,\allowbreak{} desired)\allowbreak{}} 的含义是：处理器应当查看 \texttt{a}；如果它当前的值等于 \texttt{expected}，就把它设为 \texttt{desired}；否则就不动。如果 \texttt{a} 被设成了 \texttt{desired}，该调用返回 \texttt{true}，否则返回 \texttt{false}。
+
+但它还做了另一件事。请注意，每次经过前面的循环，我们都会把 \texttt{a} 的值加载到 \texttt{expected} 里；而比较-交换函数本身也在加载 \texttt{a} 的值，以便与 \texttt{expected} 比较。第二次进入循环时，我们宁愿不再第二次加载 \texttt{a}；我们更希望直接把 \texttt{expected} 设为比较-交换函数所看到的值。所幸，\texttt{a.\allowbreak{}compare\_\allowbreak{}exchange\_\allowbreak{}weak(\allowbreak{}expected,\allowbreak{} desired)\allowbreak{}} 预料到了我们的这个愿望，并且——如果它将返回 \texttt{false}——会预先把 \texttt{expected} 更新为它看到的值。也就是说，每当我们使用 \texttt{compare\_\allowbreak{}exchange\_\allowbreak{}weak} 时，都必须为 \texttt{expected} 提供一个可修改的值，因为该函数是以引用的方式接收它的。
+
+因此，我们应该把例子改写成这样：
+
+\begin{codebox}[cpp]
+    int expected = a.load();
+    while (!a.compare_exchange_weak(expected, expected * 9)) {
+      // 继续循环
+    }
+\end{codebox}
+
+\texttt{desired} 变量其实并非必需，除非它有助于让代码更清晰。
+
+\texttt{std::\allowbreak{}atomic} 的一个不大不小的秘密是：大多数复合赋值操作，正是像这样以比较-交换循环来实现的。在 RISC 处理器上，这几乎总是如此。在 x86 处理器上，只有当你想使用运算符的返回值时才会这样，例如 \texttt{x = (\allowbreak{}a += b)\allowbreak{}}。
+
+当原子变量 \texttt{a} 没有被其他线程频繁修改时，做比较-交换循环并无坏处。但当 \texttt{a} 被频繁修改——即高度竞争（highly contended）时——我们可能会看到循环在成功之前要执行多次。在绝对病态（pathological）的情形下，我们甚至可能看到循环线程发生饥饿（starvation）；它可能就这么一直循环下去，直到竞争平息。然而请注意，每当我们比较-交换返回 \texttt{false} 而再次循环时，那是因为内存中 \texttt{a} 的值已经改变；这意味着一定有某个其他线程取得了一点进展。比较-交换循环本身绝不会导致程序进入一种“无人取得进展”的状态（这种状态在术语上被称为“活锁（livelock）”）。
+
+上一段听起来可能比实际情形更吓人。通常没什么必要担心这种病态行为，因为它只在竞争真的非常高时才会出现，而且即便出现也不会真的造成什么严重问题。你从本节真正应该记住的要点是：如何利用比较-交换循环，在 \texttt{atomic<\allowbreak{}T>\allowbreak{}} 对象上实现复杂的、非内建的“原子”操作。只要记住 \texttt{a.\allowbreak{}compare\_\allowbreak{}exchange\_\allowbreak{}weak(\allowbreak{}expected,\allowbreak{} desired)\allowbreak{}} 的参数顺序——想想它对 \texttt{a} 做了什么：“如果 \texttt{a} 具有期望值，就赋予它期望的目标值。”
+
+\subsection{大型原子类型}
+
+当 \texttt{T} 是整型（包括 \texttt{bool}），或者 \texttt{T} 是指针类型（例如 \texttt{void *}）时，编译器会识别 \texttt{std::\allowbreak{}atomic<\allowbreak{}T>\allowbreak{}} 并为它生成最优的代码。但如果 \texttt{T} 是一个更大的类型，比如 \texttt{int[100]} 呢？在这种情况下，编译器通常会调用 C++ 运行时库中的某个例程，该例程会在一个互斥量（mutex）的保护下执行赋值。（我们稍后会讨论互斥量。）由于赋值是在库内部执行的，而库并不知道如何拷贝任意用户自定义类型，C++17 标准将 \texttt{std::\allowbreak{}atomic<\allowbreak{}T>\allowbreak{}} 限制为只能用于可平凡拷贝（trivially copyable）的类型，也就是说，它们可以
+
+可以安全地使用 \texttt{memcpy} 进行拷贝。所以，如果你想要 \texttt{std::\allowbreak{}atomic<\allowbreak{}std::\allowbreak{}string>\allowbreak{}}，那只能自认倒霉——这个得你自己写。
+
+使用大尺寸（可平凡拷贝）类型与 \texttt{std::\allowbreak{}atomic} 配合时的另一个麻烦在于，相关的 C++ 运行时例程往往位于 C++ 标准库其余部分之外的另一处。在某些平台上，你必须在链接器命令行加上 \texttt{-latomic}。但这只有在你真的用大尺寸类型配合 \texttt{std::\allowbreak{}atomic} 时才会成为问题，而既然你本就不该这么做，通常也就没有担心的必要。
+
+现在让我们看看，你会如何编写那个原子字符串类！
+
+\section{用 std::mutex 轮流访问}
+
+假设我们想写一个类类型，其行为基本就像 \texttt{std::\allowbreak{}atomic<\allowbreak{}std::\allowbreak{}string>\allowbreak{}} 在存在时那样。也就是说，我们希望它支持原子的、线程安全的读取与写入，使得当两个线程（thread）并发（concurrency）访问这个 \texttt{std::\allowbreak{}string} 时，任何一端都不会观察到它处于“半赋值”状态——就像我们在上一节「volatile 的问题」的代码样例中所观察到的那个“半赋值”的 \texttt{int64\_\allowbreak{}t} 一样。
+
+编写这个类的最佳方式是使用一个名为 \texttt{std::\allowbreak{}mutex}（互斥量）的标准库类型。“mutex” 这个名称在技术圈如此常见，如今它基本就代表自身，但原本它源自 “mutual exclusion”（互斥）。这是因为互斥量（mutex）充当了一种机制，确保任意时刻只有一个线程被允许进入某段特定的代码（或若干段代码）——也就是说，确保“线程 A 正在执行这段代码”与“线程 B 正在执行这段代码”这两种可能性是互斥的。
+
+在这样一个临界区（critical section）的开头，为了表明我们不希望被任何其他线程打扰，我们会针对关联的互斥量获取一个锁。当我们离开临界区时，就释放这个锁。标准库负责确保任意两个线程都无法同时持有同一个互斥量上的锁。具体而言，这意味着如果线程 A 已经持有了锁，而线程 B 进来，那么线程 B 必须等待，直到线程 A 离开临界区并释放锁。只要线程 A 持有锁，线程 B 的推进就会被阻塞；因此这种现象既可称为等待（waiting），也可称为阻塞（blocking），两者可互换使用。
+
+“对互斥量获取锁” 常被简称为“锁定互斥量”，而“释放锁” 则被简称为“解锁互斥量”。
+
+有时（尽管很少见）测试一个互斥量当前是否已被锁定会很有用。为此，\texttt{std::\allowbreak{}mutex} 不仅暴露了成员函数 \texttt{.lock(\allowbreak{})\allowbreak{}} 和 \texttt{.unlock(\allowbreak{})\allowbreak{}}，还暴露了成员函数 \texttt{.try\_\allowbreak{}lock(\allowbreak{})\allowbreak{}}，它若能够获取互斥量上的锁（此时互斥量将被锁定）就返回 \texttt{true}，若互斥量已被某个线程锁定则返回 \texttt{false}。
+
+在某些语言（例如 Java）中，每个对象都自带一个互斥量；Java 正是以此来实作它的 \texttt{synchronized} 块的。而在 C++ 中，互斥量本身就是一种对象类型；当你想用互斥量来控制某段代码时，你需要考虑互斥量对象自身的生命周期语义。你该把互斥量放在哪里，才能让所有需要使用它的人都能看到同一个互斥量对象？有时，如果只有一个需要保护的临界区，你可以把互斥量放进一个函数作用域的静态变量：
+
+\begin{codebox}[cpp]
+    void log(const char *message)
+    {
+      static std::mutex m;
+      m.lock(); // 避免 stdout 上的消息交错
+      puts(message);
+      m.unlock();
+    }
+\end{codebox}
+
+这里的 \texttt{static} 关键字非常重要！如果我们省略了它，那么 \texttt{m} 就会是一个普通的栈变量，而每个进入 \texttt{log} 的线程都会得到属于自己的、互不相同的一份 \texttt{m} 副本。这无助于我们达成目标，因为标准库仅仅保证任意两个线程不会同时持有同一个互斥量对象上的锁。如果每个线程锁定和释放的都是各自不同的互斥量对象，那么标准库就无事可做；这些互斥量之间没有任何竞争。
+
+如果我们想确保两个不同的函数彼此互斥，使得任意时刻只有一个线程能够进入 \texttt{log1} 或 \texttt{log2} 之一，我们就必须把互斥量对象放在两个临界区都能看到的地方：
+
+\begin{codebox}[cpp]
+    static std::mutex m;
+    void log1(const char *message) {
+      m.lock();
+      printf("LOG1: %s\n", message);
+      m.unlock();
+    }
+    void log2(const char *message) {
+      m.lock();
+      printf("LOG2: %s\n", message);
+      m.unlock();
+    }
+\end{codebox}
+
+一般来说，如果你发现需要做这种事，就应该尝试通过创建一个类类型、把互斥量对象作为该类的成员变量来消除那个全局变量，如下所示：
+
+\begin{codebox}[cpp]
+    struct Logger {
+      std::mutex m_mtx;
+      void log1(const char *message) {
+        m_mtx.lock();
+        printf("LOG1: %s\n", message);
+        m_mtx.unlock();
+      }
+      void log2(const char *message) {
+        m_mtx.lock();
+        printf("LOG2: %s\n", message);
+        m_mtx.unlock();
+      }
+    };
+\end{codebox}
+
+现在，一个 \texttt{Logger} 打印的消息可能会与另一个 \texttt{Logger} 打印的消息交错，但对同一个 \texttt{Logger} 对象的并发访问会针对同一个 \texttt{m\_\allowbreak{}mtx} 获取锁，这意味着它们会彼此阻塞，并优雅地轮流进入 \texttt{log1} 与 \texttt{log2} 这两个临界函数，一次一个。
+
+\subsection{以正确的方式“获取锁”}
+
+回想第 6 章「智能指针」的内容，用 C 和“老式” C++ 编写的程序所面临的主要问题之一，就是存在指针缺陷——内存泄漏、重复释放（double-free）以及堆损坏——而我们消除“新式” C++ 程序中这些缺陷的途径，是使用 \texttt{std::\allowbreak{}unique\_\allowbreak{}ptr<\allowbreak{}T>\allowbreak{}} 之类的 RAII 类型。使用原始互斥量进行多线程编程，其失败模式与用原始指针进行堆编程的失败模式类似：
+
+锁泄漏（lock leak）：你可能对某个互斥量获取了锁，却不小心忘了写释放它的代码。
+
+锁泄漏（lock leak）：你可能写了那段代码，但因为提前返回或抛出异常，那段代码从未运行，于是互斥量始终处于锁定状态！
+
+锁外使用（use-outside-of-lock）：因为原始互斥量只是一个普通变量，它在物理上与它“保护”的那些变量分离。你可能会在没有先获取锁的情况下，不小心访问了其中某个变量。
+
+死锁（deadlock）：假设线程 A 获取了互斥量 1 上的锁，而线程 B 获取了互斥量 2 上的锁。接着，线程 A 试图获取互斥量 2 上的锁（于是被阻塞）；而在线程 A 仍处于阻塞状态时，线程 B 又试图获取互斥量 1 上的锁（也被阻塞）。现在两个线程都被阻塞，再也无法有任何进展。
+
+这并非并发陷阱的完整清单；例如，我们已经在 \texttt{std::\allowbreak{}atomic<\allowbreak{}T>\allowbreak{}} 的语境下简要提及过“活锁（livelock）”。若想全面了解并发缺陷及其规避方法，请参阅一本关于多线程或并发编程的书。
+
+C++ 标准库提供了一些工具，帮助我们消除多线程程序中的这些缺陷。与内存管理的情况不同，标准库在此处的解决方案并不能百分之百保证解决你的问题——多线程编程比单线程编程困难得多，事实上一条很好的经验法则是：能不做就不做。但如果你必须进行并发编程，标准库还是能提供一些帮助。
+
+正如第 6 章「智能指针」那样，我们可以通过审慎地使用 RAII 来消除与“锁泄漏”相关的缺陷。你可能已经注意到，我一直使用“对互斥量获取锁”（take a lock on the mutex）而非“锁定互斥量”（lock the mutex）这个说法；现在我们来看看原因。在 “lock the mutex” 中，“lock” 是个动词；这种说法恰好对应于 C++ 代码 \texttt{mtx.\allowbreak{}lock(\allowbreak{})\allowbreak{}}。但在 “take a lock on the mutex” 中，“lock” 是个名词。我们来发明一个把“锁” 这个想法具体化的类型；也就是说，把它从一个动词（非 RAII 类上的一个方法）变成一个名词（一个 RAII 类）：
+
+\begin{codebox}[cpp]
+    template<typename M>
+    class unique_lock {
+      M *m_mtx = nullptr;
+      bool m_locked = false;
+    public:
+      constexpr unique_lock() noexcept = default;
+      constexpr unique_lock(M *p) noexcept : m_mtx(p) {}
+      M *mutex() const noexcept { return m_mtx; }
+      bool owns_lock() const noexcept { return m_locked; }
+      void lock() { m_mtx->lock(); m_locked = true; }
+      void unlock() { m_mtx->unlock(); m_locked = false; }
+      unique_lock(unique_lock&& rhs) noexcept {
+        m_mtx = std::exchange(rhs.m_mtx, nullptr);
+        m_locked = std::exchange(rhs.m_locked, false);
+      }
+      unique_lock& operator=(unique_lock&& rhs) {
+        if (m_locked) {
+            unlock();
+        }
+        m_mtx = std::exchange(rhs.m_mtx, nullptr);
+        m_locked = std::exchange(rhs.m_locked, false);
+        return *this;
+      }
+      ~unique_lock() {
+        if (m_locked) {
+            unlock();
+        }
+      }
+    };
+\end{codebox}
+
+顾名思义，\texttt{std::\allowbreak{}unique\_\allowbreak{}lock<\allowbreak{}M>\allowbreak{}} 是一个“独占所有权” 的 RAII 类，其精神与 \texttt{std::\allowbreak{}unique\_\allowbreak{}ptr<\allowbreak{}T>\allowbreak{}} 相似。如果你坚持使用名词 \texttt{unique\_\allowbreak{}ptr} 而非动词 \texttt{new} 和 \texttt{delete}，就永远不会忘记释放指针；而如果你坚持使用名词 \texttt{unique\_\allowbreak{}lock} 而非动词 \texttt{lock} 和 \texttt{unlock}，就永远不会忘记释放互斥量的锁。
+
+\texttt{std::\allowbreak{}unique\_\allowbreak{}lock<\allowbreak{}M>\allowbreak{}} 确实暴露了成员函数 \texttt{.lock(\allowbreak{})\allowbreak{}} 和 \texttt{.unlock(\allowbreak{})\allowbreak{}}，但通常你并不需要用到它们。如果你需要在代码块中间、远离 \texttt{unique\_\allowbreak{}lock} 对象自然销毁点的地方获取或释放锁，它们会派上用场。在下一节我们还会看到一个函数，它以一个已锁定的 \texttt{unique\_\allowbreak{}lock} 作为参数，并在其功能中先解锁再重新锁定它。
+
+注意，因为 \texttt{unique\_\allowbreak{}lock} 是可移动的，它必须拥有一个“空” 或“空置” 状态，就像 \texttt{unique\_\allowbreak{}ptr} 一样。在大多数情况下，你不需要到处移动你的锁；你只会在某个作用域开头无条件地获取锁，并在作用域末尾无条件地释放它。针对这种用法，有 \texttt{std::\allowbreak{}lock\_\allowbreak{}guard<\allowbreak{}M>\allowbreak{}}。\texttt{lock\_\allowbreak{}guard} 与 \texttt{unique\_\allowbreak{}lock} 非常相似，但它不可移动，也没有 \texttt{.lock(\allowbreak{})\allowbreak{}} 和 \texttt{.unlock(\allowbreak{})\allowbreak{}} 成员函数。因此，它不需要携带一个 \texttt{m\_\allowbreak{}locked} 成员，它的析构函数可以无条件解锁该对象一直保护的互斥量，而无需任何额外的判断。
+
+在这两种情况下（\texttt{unique\_\allowbreak{}lock} 与 \texttt{lock\_\allowbreak{}guard}），类模板都以被锁定的互斥量种类为参数。（我们稍后会看到另外几种互斥量，但几乎毫无例外，你都会想用 \texttt{std::\allowbreak{}mutex}。）C++17 有一项名为类模板实参推导（class template argument deduction）的新语言特性，在大多数情况下它允许你省略模板实参：例如，直接写 \texttt{std::\allowbreak{}unique\_\allowbreak{}lock} 而非 \texttt{std::\allowbreak{}unique\_\allowbreak{}lock<\allowbreak{}std::\allowbreak{}mutex>\allowbreak{}}。这是我个人会建议依赖类模板实参推导的极少数情况之一，因为把实参类型 \texttt{std::\allowbreak{}mutex} 写出来，对你的读者而言实在提供不了多少信息。
+
+我们来看一些 \texttt{std::\allowbreak{}lock\_\allowbreak{}guard} 的例子，包含使用与不使用类模板实参推导两种情况：
+
+\begin{codebox}[cpp]
+    struct Lockbox {
+      std::mutex m_mtx;
+      int m_value = 0;
+      void locked_increment() {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        m_value += 1;
+      }
+      void locked_decrement() {
+        std::lock_guard lk(m_mtx); // 仅 C++17
+        m_value -= 1;
+      }
+    };
+\end{codebox}
+
+在我们看到同样实用的 \texttt{std::\allowbreak{}unique\_\allowbreak{}lock} 例子之前，必须先讲清楚一开始就使用 \texttt{std::\allowbreak{}unique\_\allowbreak{}lock} 的一个好理由。
+
+\section{始终将互斥量与其受控数据关联起来}
+
+考虑下面这个线程安全的 \texttt{Streaming\allowbreak{}Average} 类的大致框架。这里有一个缺陷；你能找出来吗？
+
+\begin{codebox}[cpp]
+    class StreamingAverage {
+      double m_sum = 0;
+      int m_count = 0;
+      double m_last_average = 0;
+      std::mutex m_mtx;
+    public:
+      // 由唯一的 producer 线程调用
+      void add_value(double x) {
+        std::lock_guard lk(m_mtx);
+        m_sum += x;
+        m_count += 1; // A
+      }
+      // 由唯一的 consumer 线程调用
+      double get_current_average() {
+        std::lock_guard lk(m_mtx);
+        m_last_average = m_sum / m_count; // B
+        return m_last_average;
+      }
+      // 由唯一的 consumer 线程调用
+      double get_last_average() const {
+        return m_last_average; // C
+      }
+      // 由唯一的 consumer 线程调用
+      double get_current_count() const {
+        return m_count; // D
+      }
+    };
+\end{codebox}
+
+缺陷在于 \texttt{A} 行，它在 producer 线程中写入 \texttt{this->m\_\allowbreak{}count}，与在 consumer 线程中读取 \texttt{this->m\_\allowbreak{}count} 的 \texttt{D} 行发生竞态（race condition）。\texttt{A} 行在写入前正确地对 \texttt{this->m\_\allowbreak{}mtx} 获取了锁，但 \texttt{D} 行没有去获取类似的锁，这意味着它会径自闯入，即便 \texttt{A} 行正在写入 \texttt{m\_\allowbreak{}count} 时也试图去读取它。
+
+\texttt{B} 行和 \texttt{C} 行表面看起来相似，这大概就是缺陷最初混入的原因。\texttt{C} 行不需要获取锁；那凭什么 \texttt{D} 行就得获取锁呢？嗯，\texttt{C} 行只从 consumer 线程调用，而该线程正是在 \texttt{B} 行写入 \texttt{m\_\allowbreak{}last\_\allowbreak{}average} 的那个线程。既然 \texttt{B} 行和 \texttt{C} 行只由唯一的 consumer 线程执行，它们就不可能被同时执行——至少只要程序其余部分符合那些注释就行！（我们姑且假设代码注释是正确的。实践中这往往可悲地并不属实，但为了本例我们暂且这样假设。）
+
+这里我们有了一处制造混乱的温床：触碰 \texttt{m\_\allowbreak{}sum} 或 \texttt{m\_\allowbreak{}count} 时需要锁定 \texttt{m\_\allowbreak{}mtx}，但触碰 \texttt{m\_\allowbreak{}last\_\allowbreak{}average} 时却不需要。如果这个类变得更复杂，甚至可能涉及多个互斥量（尽管到了那种地步，它显然就违反了单一职责原则（Single Responsibility Principle），并且很可能需要通过重构拆分成更小的组件而获益）。因此，在处理互斥量时一个很好的做法，是把互斥量放在与它“保护” 的变量尽可能紧密的关系中。一种做法就是简单地通过谨慎的命名：
+
+\begin{codebox}[cpp]
+    class StreamingAverage {
+      double m_sum = 0;
+      int m_count = 0;
+      double m_last_average = 0;
+      std::mutex m_sum_count_mtx;
+      // ...
+    };
+\end{codebox}
+
+更好的办法是通过一个嵌套的结构体定义：
+
+\begin{codebox}[cpp]
+    class StreamingAverage {
+      struct {
+        double sum = 0;
+        int count = 0;
+        std::mutex mtx;
+      } m_guarded_sc;
+      double m_last_average = 0;
+      // ...
+    };
+\end{codebox}
+
+上述做法的期望是，当程序员被迫写下 \texttt{this->m\_\allowbreak{}guarded\_\allowbreak{}sc.\allowbreak{}sum} 时，这会提醒他确认自己已经获取了 \texttt{this->m\_\allowbreak{}guarded\_\allowbreak{}sc.\allowbreak{}mtx} 上的锁。我们可以借助 GNU 的“匿名结构体成员” 扩展来避免在代码中到处重复键入 \texttt{m\_\allowbreak{}guarded\_\allowbreak{}sc}；但那样就背离了这种做法的初衷，即确保数据被访问的每一处都必须使用“guarded” 这个词，从而提醒程序员去获取 \texttt{this->m\_\allowbreak{}guarded\_\allowbreak{}sc.\allowbreak{}mtx} 上的锁。
+
+一种更“防弹” 但略显僵化的办法，是把互斥量放进一个类中，该类仅当互斥量被锁定时才允许访问其私有成员，做法是返回一个 RAII 句柄（handle）。这个返回句柄的类大致长这样：
+
+\begin{codebox}[cpp]
+    template<class Data>
+    class Guarded {
+      std::mutex m_mtx;
+      Data m_data;
+      class Handle {
+        std::unique_lock<std::mutex> m_lk;
+        Data *m_ptr;
+      public:
+        Handle(std::unique_lock<std::mutex> lk, Data *p) :
+          m_lk(std::move(lk)), m_ptr(p) {}
+        auto operator->() const { return m_ptr; }
+      };
+    public:
+      Handle lock() {
+        std::unique_lock lk(m_mtx);
+        return Handle{std::move(lk), &m_data};
+      }
+    };
+\end{codebox}
+
+而我们的 \texttt{Streaming\allowbreak{}Average} 类可以这样使用它：
+
+\begin{codebox}[cpp]
+    class StreamingAverage {
+      struct Guts {
+        double m_sum = 0;
+        int m_count = 0;
+      };
+      Guarded<Guts> m_sc;
+      double m_last_average = 0;
+      // ...
+      double get_current_average() {
+        auto h = m_sc.lock();
+        m_last_average = h->m_sum / h->m_count;
+        return m_last_average;
+      }
+    };
+\end{codebox}
+
+注意，在前面的代码片段中，\texttt{Streaming\allowbreak{}Average} 的任何成员函数都不可能在未持有 \texttt{m\_\allowbreak{}mtx} 上锁的情况下访问 \texttt{m\_\allowbreak{}sum}；对受保护（guarded）的 \texttt{m\_\allowbreak{}sum} 的访问，只能经由 RAII 的 \texttt{Handle} 类型进行。
+
+这个模式被包含在 Facebook 的 Folly 库中，名为 \texttt{folly::\allowbreak{}Synchronized<\allowbreak{}T>\allowbreak{}}，而 Ansel Sermersheim 与 Barbara Geller 的 “libGuarded” 模板库中也有它的许多变体。
+
+注意 \texttt{Handle} 类中对 \texttt{std::\allowbreak{}unique\_\allowbreak{}lock<\allowbreak{}std::\allowbreak{}mutex>\allowbreak{}} 的使用！我们在这里用的是 \texttt{unique\_\allowbreak{}lock} 而非 \texttt{lock\_\allowbreak{}guard}，因为我们希望有能力把这个锁传来传去、从函数返回等等——所以它必须是可移动的。这就是你会从工具箱里取出 \texttt{unique\_\allowbreak{}lock} 的主要原因。
+
+务必注意，这个模式并不能解决所有与锁相关的缺陷——它只解决了最简单的“忘记锁定互斥量” 这一类情况——而且它还可能助长导致其他类型并发缺陷的编程模式。例如，考虑下面这个对
+
+\texttt{Streaming\allowbreak{}Average::\allowbreak{}get\_\allowbreak{}current\_\allowbreak{}average}：
+
+\begin{codebox}[cpp]
+    double get_sum() {
+      return m_sc.lock()->m_sum;
+    }
+    int get_count() {
+      return m_sc.lock()->m_count;
+    }
+    double get_current_average() {
+      return get_sum() / get_count();
+    }
+\end{codebox}
+
+由于两次调用 \texttt{m\_\allowbreak{}sc.\allowbreak{}lock(\allowbreak{})\allowbreak{}}，在读取 \texttt{m\_\allowbreak{}sum} 与读取 \texttt{m\_\allowbreak{}count} 之间会存在一个间隙。如果生产者线程在此期间调用了 \texttt{add\_\allowbreak{}value}，我们就会算出一个错误的平均值（偏低了 \texttt{1 /\allowbreak{} m\_\allowbreak{}count} 倍）。而如果我们试图通过在整个计算过程外加一把锁来"修复"这个缺陷，就会陷入死锁（deadlock）：
+
+\begin{codebox}[cpp]
+    double get_sum() {
+      return m_sc.lock()->m_sum; // LOCK 2
+    }
+    int get_count() {
+      return m_sc.lock()->m_count;
+    }
+    double get_current_average() {
+      auto h = m_sc.lock(); // LOCK 1
+      return get_sum() / get_count();
+    }
+\end{codebox}
+
+标记为 \texttt{LOCK 1} 的那一行会使互斥量（mutex）被锁定；接着，在标记为 \texttt{LOCK 2} 的那一行，我们又试图再次锁定同一个互斥量。互斥量的一般规则是：如果你试图锁定一个互斥量，而它已经被锁住，那么你必须阻塞并等待它解锁。于是，我们的线程便阻塞并等待该互斥量解锁——而这永远不会发生，因为这把锁正是由我们自己的线程持有的！
+
+这个问题（自己与自己死锁）通常应当通过谨慎的编程来避免——也就是说，应当尽量避免去获取自己已经持有的锁！但如果以这种方式获取锁实在是你设计中不可避免的一部分，那么标准库（standard library）自有办法，接下来我们就来看看 \texttt{recursive\_\allowbreak{}mutex}。
+
+\section{专用互斥量类型}
+
+回顾一下，\texttt{std::\allowbreak{}lock\_\allowbreak{}guard<\allowbreak{}M>\allowbreak{}} 与 \texttt{std::\allowbreak{}unique\_\allowbreak{}lock<\allowbreak{}M>\allowbreak{}} 都是以互斥量类型作为模板参数的。到目前为止，我们只见过 \texttt{std::\allowbreak{}mutex}。不过，标准库中确实还包含另外几种互斥量类型，它们在特定场景下会很有用。
+
+\texttt{std::\allowbreak{}recursive\_\allowbreak{}mutex} 与 \texttt{std::\allowbreak{}mutex} 类似，但会记住是哪个线程锁定了它。如果那个特定的线程试图再次锁定它，递归互斥量（recursive mutex）只会把内部的一个引用计数（"我被锁定了多少次"）自增一。而如果另有某个线程试图锁定这个递归互斥量，该线程就会阻塞，直到原来的线程按照恰当的次数将其解锁。
+
+\texttt{std::\allowbreak{}timed\_\allowbreak{}mutex} 与 \texttt{std::\allowbreak{}mutex} 类似，但它能感知时间的流逝。它所拥有的成员函数不仅有常用的 \texttt{.try\_\allowbreak{}lock(\allowbreak{})\allowbreak{}}，还有 \texttt{.try\_\allowbreak{}lock\_\allowbreak{}for(\allowbreak{})\allowbreak{}} 与 \texttt{.try\_\allowbreak{}lock\_\allowbreak{}until(\allowbreak{})\allowbreak{}}，二者都会与标准的 \texttt{<chrono>\allowbreak{}} 库协作。下面是一个 \texttt{try\_\allowbreak{}lock\_\allowbreak{}for} 的例子：
+
+\begin{codebox}[cpp]
+    std::timed_mutex m;
+    std::atomic<bool> ready = false;
+    std::thread thread_b([&]() {
+      std::lock_guard lk(m);
+      puts("Thread B got the lock.");
+      ready = true;
+      std::this_thread::sleep_for(100ms);
+    });
+    while (!ready) {
+      puts("Thread A is waiting for thread B to launch.");
+      std::this_thread::sleep_for(10ms);
+    }
+    while (!m.try_lock_for(10ms)) {
+      puts("Thread A spent 10ms trying to get the lock and failed.");
+    }
+    puts("Thread A finally got the lock!");
+    m.unlock();
+\end{codebox}
+
+下面是一个 \texttt{try\_\allowbreak{}lock\_\allowbreak{}until} 的例子：
+
+\begin{codebox}[cpp]
+    std::timed_mutex m1, m2;
+    std::atomic<bool> ready = false;
+    std::thread thread_b([&]() {
+      std::unique_lock lk1(m1);
+      std::unique_lock lk2(m2);
+      puts("Thread B got the locks.");
+      ready = true;
+      std::this_thread::sleep_for(50ms);
+      lk1.unlock();
+      std::this_thread::sleep_for(50ms);
+    });
+    while (!ready) {
+      std::this_thread::sleep_for(10ms);
+    }
+    auto start_time = std::chrono::system_clock::now();
+    auto deadline = start_time + 100ms;
+    bool got_m1 = m1.try_lock_until(deadline);
+    auto elapsed_m1 = std::chrono::system_clock::now() - start_time;
+    bool got_m2 = m2.try_lock_until(deadline);
+    auto elapsed_m2 = std::chrono::system_clock::now() - start_time;
+    if (got_m1) {
+      printf("Thread A got the first lock after %dms.\n",
+      count_ms(elapsed_m1));
+      m1.unlock();
+    }
+    if (got_m2) {
+      printf("Thread A got the second lock after %dms.\n",
+      count_ms(elapsed_m2));
+      m2.unlock();
+    }
+\end{codebox}
+
+顺带一提，这里用到的 \texttt{count\_\allowbreak{}ms} 函数只是一个小小的 lambda，它把 \texttt{<chrono>\allowbreak{}} 中那些常见的样板代码抽取了出来：
+
+\begin{codebox}[cpp]
+    auto count_ms = [](auto&& d) -> int {
+      using namespace std::chrono;
+      return duration_cast<milliseconds>(d).count();
+    };
+\end{codebox}
+
+在前面两个例子中，请注意我们使用 \texttt{std::\allowbreak{}atomic<\allowbreak{}bool>\allowbreak{}} 来同步线程 \texttt{A} 与 \texttt{B}。我们只是把这个原子变量初始化为 \texttt{false}，然后循环直到它变为 \texttt{true}。轮询（polling）循环体里调用了 \texttt{std::\allowbreak{}this\_\allowbreak{}thread::\allowbreak{}sleep\_\allowbreak{}for}，这足以向编译器暗示：这个原子变量的值可能会发生变化。务必不要写出不含休眠（sleep）的轮询循环，因为在那种情况下，编译器完全有权把对 \texttt{ready} 的所有连续读取合并成单次读取，从而形成一个（必然无限）的循环。
+
+\texttt{std::\allowbreak{}recursive\_\allowbreak{}timed\_\allowbreak{}mutex} 就像你把 \texttt{recursive\_\allowbreak{}mutex} 与 \texttt{timed\_\allowbreak{}mutex} 揉在一起；它提供了 \texttt{recursive\_\allowbreak{}mutex} 的"计数"语义，外加 \texttt{timed\_\allowbreak{}mutex} 的 \texttt{try\_\allowbreak{}lock\_\allowbreak{}for} 与 \texttt{try\_\allowbreak{}lock\_\allowbreak{}until} 方法。
+
+\texttt{std::\allowbreak{}shared\_\allowbreak{}mutex} 这个名字或许起得不太好。它实现的行为，在大多数并发（concurrency）教材里被称为读写锁（read-write lock，也叫 rwlock 或 readers-writer lock）。读写锁（或者说 \texttt{shared\_\allowbreak{}mutex}）的定义性特征在于，它可以以两种不同的方式被"锁定"。你可以调用 \texttt{sm.\allowbreak{}lock(\allowbreak{})\allowbreak{}} 来取一把普通的排他（"写"）锁，也可以调用 \texttt{sm.\allowbreak{}lock\_\allowbreak{}shared(\allowbreak{})\allowbreak{}} 来取一把非排他（"读"）锁。许多不同的线程被允许同时持有读锁；但如果有任何一方正在读取，就没有人能够写入；而如果有任何一方正在写入，就没有人能做其他任何事（既不能再读，也不能再写）。这恰好与 C++ 内存模型（memory model）中定义"竞态条件（race condition）"的规则在根本上是一致的：两个线程同时读取同一个对象是没问题的，只要没有线程同时向它写入。\texttt{std::\allowbreak{}shared\_\allowbreak{}mutex} 在此之上所增加的是安全性：它确保，如果有人确实想要写入（至少，如果他们规规矩矩地先对 \texttt{std::\allowbreak{}shared\_\allowbreak{}mutex} 取一把写锁的话），他们就会被阻塞，直到所有读者都退出、并且写入已经安全为止。
+
+\texttt{std::\allowbreak{}unique\_\allowbreak{}lock<\allowbreak{}std::\allowbreak{}shared\_\allowbreak{}mutex>\allowbreak{}} 对应的是对 \texttt{std::\allowbreak{}shared\_\allowbreak{}mutex} 的一把排他（"写"）锁这一名词。正如你所料，标准库还提供了 \texttt{std::\allowbreak{}shared\_\allowbreak{}lock<\allowbreak{}std::\allowbreak{}shared\_\allowbreak{}mutex>\allowbreak{}}，用来把对 \texttt{std::\allowbreak{}shared\_\allowbreak{}mutex} 的一把非排他（"读"）锁这个概念具体化为一个对象。
+
+\subsection{升级读写锁}
+
+假设你在某个 \texttt{shared\_\allowbreak{}mutex} 上持有一把读锁（也就是说，你手里有一个 \texttt{std::\allowbreak{}shared\_\allowbreak{}lock<\allowbreak{}std::\allowbreak{}shared\_\allowbreak{}mutex>\allowbreak{} lk}，且 \texttt{lk.\allowbreak{}owns\_\allowbreak{}lock(\allowbreak{})\allowbreak{}} 为真），而你想要获取一把写锁。你能"升级"你的锁吗？
+
+不行，你不能。设想一下，如果线程 \texttt{A} 与 \texttt{B} 都持有读锁，并且都在没有先释放各自读锁的情况下，同时试图升级为写锁，会发生什么。它们俩谁都无法获取到写锁，于是就会彼此死锁。
+
+有一些第三方库试图解决这个问题，例如 \texttt{boost::\allowbreak{}thread::\allowbreak{}upgrade\_\allowbreak{}lock}，它与 \texttt{boost::\allowbreak{}thread::\allowbreak{}shared\_\allowbreak{}mutex} 配合使用；但它们超出了本书的范围。标准的解法是：如果你持有读锁并想要写锁，就必须先释放读锁，然后和大家一起排队去等一把写锁：
+
+\begin{codebox}[cpp]
+    template<class M>
+    std::unique_lock<M> upgrade(std::shared_lock<M> lk)
+    {
+      lk.unlock();
+      // Some other writer might sneak in here.
+      return std::unique_lock<M>(*lk.mutex());
+    }
+\end{codebox}
+
+\subsection{降级读写锁}
+
+假设你在一个 \texttt{shared\_\allowbreak{}mutex} 上持有一把排他的写锁，而你想要获取一把读锁。你能"降级"你的锁吗？
+
+原则上答案是肯定的，把写锁降级为读锁应当是可行的；但在标准 C++17 中，答案是否定的，你无法直接做到。和升级的情况一样，你可以使用 \texttt{boost::\allowbreak{}thread::\allowbreak{}shared\_\allowbreak{}mutex}。标准的解法是：如果你持有写锁并想要读锁，就必须先释放写锁，然后和大家一起排队去等一把读锁：
+
+\begin{codebox}[cpp]
+    template<class M>
+    std::shared_lock<M> downgrade(std::unique_lock<M> lk)
+    {
+      lk.unlock();
+      // Some other writer might sneak in here.
+      return std::shared_lock<M>(*lk.mutex());
+    }
+\end{codebox}
+
+从这些例子可以看出，C++17 的 \texttt{std::\allowbreak{}shared\_\allowbreak{}mutex} 目前还有点半成品的味道。如果你的架构设计需要一个读写锁，我强烈建议用类似 \texttt{boost::\allowbreak{}thread::\allowbreak{}shared\_\allowbreak{}mutex} 这样的实现，它可是"开箱即用"的。你可能已经注意到，由于在持有读锁期间新的读者可以不断进入，而新的写者却不行，因此一个正在等待的写者线程很有可能会被源源不断的新读者所"饿死（starvation）"，除非该实现刻意提供了一个强有力的"无饥饿（no starvation）"保证。\texttt{boost::\allowbreak{}thread::\allowbreak{}shared\_\allowbreak{}mutex} 就提供了这样的保证（至少，只要底层操作系统的调度器不饿死线程，它就不会饿死）。标准对 \texttt{std::\allowbreak{}shared\_\allowbreak{}mutex} 的措辞并没有提供这样的保证，尽管在实践中任何允许发生饥饿的实现都会被视作相当糟糕的实现。在实践中你会发现，你的标准库（standard library）供应商对 \texttt{shared\_\allowbreak{}mutex} 的实现与 Boost 的版本相当接近，只是缺少了升级 / 降级功能。
+
+\section{等待某个条件}
+
+在标题为"专用互斥量类型"的那一节里，我们在一个独立的线程中启动了一个任务，然后需要等待某段初始化完成才能继续。当时我们用了一个围绕 \texttt{std::\allowbreak{}atomic<\allowbreak{}bool>\allowbreak{}} 的轮询（polling）循环。不过，还有更好的等待方式！
+
+我们那个 50 毫秒的轮询循环的问题在于，它永远无法把睡眠时间精确控制在合适的时长上。有时我们的线程会醒来，但它所等待的条件尚未满足，于是它又回去睡觉——这意味着我们第一次睡得不够久。有时我们的线程会醒来，发现它所等待的条件在过去的某 50 毫秒里的某个时刻已经满足了，但我们并不知道那是多久之前——这意味着我们平均多睡了大约 25 毫秒。无论发生什么，我们恰好睡了"刚好合适"的时长的可能性都微乎其微。
+
+所以，如果我们不想浪费时间，正确的做法就是避免使用轮询循环。标准库提供了一种能够恰好等待合适时长的方式；它叫做 \texttt{std::\allowbreak{}condition\_\allowbreak{}variable}，也就是条件变量（condition variable）。
+
+给定一个类型为 \texttt{std::\allowbreak{}condition\_\allowbreak{}variable} 的变量 \texttt{cv}，我们的线程可以调用 \texttt{cv.\allowbreak{}wait(\allowbreak{}lk)\allowbreak{}} 来"等待" \texttt{cv}；这会让我们的线程进入睡眠。调用 \texttt{cv.\allowbreak{}notify\_\allowbreak{}one(\allowbreak{})\allowbreak{}} 或 \texttt{cv.\allowbreak{}notify\_\allowbreak{}all(\allowbreak{})\allowbreak{}} 会唤醒当前正在等待 \texttt{cv} 的线程中的一个，或全部。然而，这些线程被唤醒的方式并不止这一种！有可能来自外部的中断（例如一个 POSIX 信号）会不经过任何人的 \texttt{notify\_\allowbreak{}one} 调用，就把你的线程惊醒。这种现象叫做虚假唤醒（spurious wakeup）。防范虚假唤醒的通常做法，是在你醒来时检查一下你的条件。例如，如果你正在等待某些输入到达缓冲区（buffer）\texttt{b}，那么你醒来时就应当检查 \texttt{b.\allowbreak{}empty(\allowbreak{})\allowbreak{}}，如果它为空，就回去继续等待。根据定义，必然有另一个线程会把那些数据放进 \texttt{b}；所以当你读取 \texttt{b.\allowbreak{}empty(\allowbreak{})\allowbreak{}} 时，最好是在某种互斥量的保护之下进行。这意味着，你醒来时要做的第一件事，就是去获取那把互斥量的锁；而你回去睡觉前做的最后一件事，则是释放你在这把互斥量上的锁。（事实上，你需要在"进入睡眠"这一操作的同时原子地释放那把互斥量上的锁，这样才不会有任何人能够趁虚而入，在你还没来得及睡去之前就修改 \texttt{b}、并调用 \texttt{cv.\allowbreak{}notify\_\allowbreak{}one(\allowbreak{})\allowbreak{}}。）这一连串的逻辑，把我们引向了 \texttt{cv.\allowbreak{}wait(\allowbreak{}lk)\allowbreak{}} 之所以要接收那个参数 \texttt{lk} 的原因——它是一个 \texttt{std::\allowbreak{}unique\_\allowbreak{}lock<\allowbreak{}std::\allowbreak{}mutex>\allowbreak{}}，会在进入睡眠时被释放，并在醒来时被重新获取！
+
+下面是一个等待某个条件被满足的例子。首先是那个简单却浪费的、基于 \texttt{std::\allowbreak{}atomic} 变量的轮询循环：
+
+\begin{codebox}[cpp]
+    std::atomic<bool> ready = false;
+    std::thread thread_b([&]() {
+      prep_work();
+      ready = true;
+      main_work();
+    });
+    // Wait for thread B to be ready.
+    while (!ready) {
+      std::this_thread::sleep_for(10ms);
+    }
+    // Now thread B has completed its prep work.
+\end{codebox}
+
+再来看更可取、也更高效的 \texttt{condition\_\allowbreak{}variable} 实现：
+
+\begin{codebox}[cpp]
+    bool ready = false; // not atomic!
+    std::mutex ready_mutex;
+    std::condition_variable cv;
+    std::thread thread_b([&]() {
+      prep_work();
+      {
+        std::lock_guard lk(ready_mutex);
+        ready = true;
+      }
+      cv.notify_one();
+      main_work();
+    });
+    // Wait for thread B to be ready.
+    {
+      std::unique_lock lk(ready_mutex);
+      while (!ready) {
+        cv.wait(lk);
+      }
+    }
+    // Now thread B has completed its prep work.
+\end{codebox}
+
+如果我们要等待读取的是一个受读写锁（即 \texttt{std::\allowbreak{}shared\_\allowbreak{}mutex}）保护的结构，那么我们就不想传入一个 \texttt{std::\allowbreak{}unique\_\allowbreak{}lock<\allowbreak{}std::\allowbreak{}mutex>\allowbreak{}}，而想传入一个 \texttt{std::\allowbreak{}shared\_\allowbreak{}lock<\allowbreak{}std::\allowbreak{}shared\_\allowbreak{}mutex>\allowbreak{}}。要做到这一点，前提（而且遗憾的是，仅有这一前提）是我们事先做好了规划，把条件变量定义为 \texttt{std::\allowbreak{}condition\_\allowbreak{}variable\_\allowbreak{}any} 类型，而非 \texttt{std::\allowbreak{}condition\_\allowbreak{}variable}。在实践中，\texttt{std::\allowbreak{}condition\_\allowbreak{}variable\_\allowbreak{}any} 与 \texttt{std::\allowbreak{}condition\_\allowbreak{}variable} 之间不太可能存在任何性能差异，这意味着你应当根据程序的需要来在二者之间做选择；或者，如果两者都能满足需求，那就根据最终代码的清晰度来选择。通常这意味着省下四个字符、使用 \texttt{std::\allowbreak{}condition\_\allowbreak{}variable}。不过请注意，由于 \texttt{std::\allowbreak{}shared\_\allowbreak{}lock} 所提供的那一层隔离性抽象，在读写锁之下等待 \texttt{cv} 的实际代码，与在一把老式普通互斥量之下等待 \texttt{cv} 的代码几乎如出一辙。下面是读写锁的版本：
+
+\begin{codebox}[cpp]
+    bool ready = false;
+    std::shared_mutex ready_rwlock;
+    std::condition_variable_any cv;
+    std::thread thread_b([&]() {
+      prep_work();
+      {
+        std::lock_guard lk(ready_rwlock);
+        ready = true;
+      }
+      cv.notify_one();
+      main_work();
+    });
+    // Wait for thread B to be ready.
+    {
+      std::shared_lock lk(ready_rwlock);
+      while (!ready) {
+        cv.wait(lk);
+      }
+    }
+    // Now thread B has completed its prep work.
+\end{codebox}
+
+这是完全正确的代码，并且已经做到了尽可能地高效。然而，手动摆弄互斥量锁和条件变量，对"健康"的危害几乎不亚于摆弄裸互斥量（raw mutex）或裸指针（raw pointer）。我们可以做得更好！更好的解法，正是我们下一节的主题。
+
+\section{承诺与未来值}
+
+如果你此前没有接触过并发（concurrency）编程相关的话题，那么前几节的内容大概会让你觉得越来越有挑战性。互斥量（mutex）相当容易理解，因为它们建模的是日常生活中一个熟悉的概念：通过挂上一把锁，来获取对某份资源的排他访问权。读写锁（\texttt{shared\_\allowbreak{}mutex}）理解起来也并不困难多少。然而，接下来我们就在晦涩程度上来了一次明显的跃升——条件变量（condition variable）之所以难以把握，部分原因就在于它们看上去建模的并非一个名词（比如"挂锁"），而是一种类似介词性的动词短语："睡到……为止，但同时，醒来。"它们那含义不明的名字也无济于事。
+
+现在，我们继续深入并发编程的旅程，来看一个话题：即便你修过本科阶段的并发编程课程，它也可能令你感到陌生，但绝对值得一学——承诺（promise）与未来值（future）。
+
+在 C++11 中，类型 \texttt{std::\allowbreak{}promise<\allowbreak{}T>\allowbreak{}} 与 \texttt{std::\allowbreak{}future<\allowbreak{}T>\allowbreak{}} 总是成对出现。一个来自 Go 语言的程序员，可能会把"承诺—未来值"对看作某种通道（channel）：如果某个线程把一个值（类型为 \texttt{T}）塞进这对的"承诺"端，那么这个值最终就会从"未来值"端冒出来（而到那时，这端通常已经在另一个线程里了）。然而，"承诺—未来值"对也像是不稳定的虫洞（wormhole）：你一旦把单个值塞过虫洞，它就会坍缩。我们不妨说，一个"承诺—未来值"对就像是一个有方向的、可移植的、一次性的虫洞。说它"有方向"，是因为你只能把数据塞进"承诺"端，并且只能经由"未来值"端取回数据。说它"可移植"，是因为如果你拥有虫洞的一端，你就可以移动这一端，甚至可以在线程之间移动它；而两端之间的隧道并不会因此断裂。说它"一次性"，是因为一旦你把一块数据塞进了"承诺"端，你就不能再塞更多了。
+
+这对类型的名字还暗示了另一种比喻：\texttt{std::\allowbreak{}future<\allowbreak{}T>\allowbreak{}} 实际上并不是一个类型为 \texttt{T} 的值，但在某种意义上它是一个未来值——在未来的某个时刻，它会让你得以访问一个 \texttt{T}，只是"现在还不行"。（就此而言，它也有点像一个线程安全的 \texttt{optional<\allowbreak{}T>\allowbreak{}}。）与此同时，一个 \texttt{std::\allowbreak{}promise<\allowbreak{}T>\allowbreak{}} 对象就像是一个尚未兑现的承诺，或者说一张欠条（I-O-U）。这个承诺对象的持有者承诺，会在某个
+
+他必须在某个时刻放入一个值；如果他始终没有放入一个值，那他就是“违背了承诺”。
+
+一般来说，使用“承诺—未来值（promise-future）”对的方法是：先创建一个 \texttt{std::\allowbreak{}promise<\allowbreak{}T>\allowbreak{}}，其中 \texttt{T} 是你打算通过它传递的数据类型；然后调用 \texttt{p.\allowbreak{}get\_\allowbreak{}future(\allowbreak{})\allowbreak{}} 创建这个“虫洞（wormhole）”的“未来值”一端。当你准备兑现承诺时，调用 \texttt{p.\allowbreak{}set\_\allowbreak{}value(\allowbreak{}v)\allowbreak{}}。与此同时，在另一个线程中，当你准备取出这个值时，调用 \texttt{f.\allowbreak{}get(\allowbreak{})\allowbreak{}}。如果某个线程在承诺被兑现之前就调用了 \texttt{f.\allowbreak{}get(\allowbreak{})\allowbreak{}}，该线程会阻塞，直到承诺被兑现、值可以取回为止。另一方面，当持有承诺的线程调用 \texttt{p.\allowbreak{}set\_\allowbreak{}value(\allowbreak{}v)\allowbreak{}} 时，如果没有人在等待，那也没关系；\texttt{set\_\allowbreak{}value} 只会把值 \texttt{v} 记录到内存中，这样无论何时有人通过 \texttt{f.\allowbreak{}get(\allowbreak{})\allowbreak{}} 来索取，它都已准备就绪、随时可取。让我们来看看 \texttt{promise} 和 \texttt{future} 的实际运用！
+
+\begin{codebox}[cpp]
+    std::promise<int> p1, p2;
+    std::future<int> f1 = p1.get_future();
+    std::future<int> f2 = p2.get_future();
+      // 如果承诺先被兑现，
+      // 那么 f.get() 将不会阻塞。
+    p1.set_value(42);
+    assert(f1.get() == 42);
+      // 如果先调用了 f.get()，那么它会
+      // 阻塞，直到 set_value() 被调用
+      // （由其他某个线程调用）。
+    std::thread t([&](){
+      std::this_thread::sleep_for(100ms);
+      p2.set_value(43);
+    });
+    auto start_time = std::chrono::system_clock::now();
+    assert(f2.get() == 43);
+    auto elapsed = std::chrono::system_clock::now() - start_time;
+    printf("f2.get() took %dms.\n", count_ms(elapsed));
+    t.join();
+\end{codebox}
+
+（关于 \texttt{count\_\allowbreak{}ms} 的定义，请参见上一节“专用互斥量类型（Special-purpose mutex types）”。）
+
+标准库的 \texttt{std::\allowbreak{}promise} 有一个不错的细节：它对 \texttt{void} 做了特化。\texttt{std::\allowbreak{}future<\allowbreak{}void>\allowbreak{}} 的想法乍看之下可能有点傻——如果虫洞里唯一能塞过去的数据类型是一个没有值的类型，那这个虫洞还有什么用？但事实上，\texttt{future<\allowbreak{}void>\allowbreak{}} 极其有用，只要我们关心的不是收到的值，而是“确实收到了某个信号”这件事本身。例如，我们可以用 \texttt{std::\allowbreak{}future<\allowbreak{}void>\allowbreak{}} 来实现我们的“等待线程 B 启动”代码的第三个版本：
+
+\begin{codebox}[cpp]
+    std::promise<void> ready_p;
+    std::future<void> ready_f = ready_p.get_future();
+    std::thread thread_b([&]() {
+      prep_work();
+      ready_p.set_value();
+      main_work();
+    });
+      // 等待线程 B 准备就绪。
+    ready_f.wait();
+      // 现在线程 B 已完成准备工作。
+\end{codebox}
+
+把这个版本与“等待某个条件（Waiting for a condition）”一节中的代码示例比较一下。这个版本清爽多了！几乎没有多余的东西，一点样板代码都没有。“通知 B 已就绪”和“等待 B 就绪”这两个操作都只用一行代码。因此，单就语法的整洁程度而言，这绝对是在一对线程之间发送信号时首选的方式。关于从一个线程向一组线程发送信号的第四种方式，请参见本章的小节“识别各个线程与当前线程（Identifying individual threads and the current thread）”。
+
+不过，使用 \texttt{std::\allowbreak{}future} 是要付出代价的。代价就是动态内存分配。你看，\texttt{promise} 和 \texttt{future} 都需要访问一块共享的存储位置，这样当你在承诺这一端存入 \texttt{42} 时，才能在未来值这一端把它取出来。（那块共享存储位置还持有线程间同步所需的互斥量（mutex）和条件变量（condition variable）。互斥量和条件变量并没有从我们的代码中消失，它们只是下沉了一层抽象，让我们可以不必操心。）因此，\texttt{promise} 和 \texttt{future} 都充当着这个共享状态的某种“句柄”；但它们都是可移动（movable）类型，所以都不能真正把共享状态作为成员持有。它们需要在堆上分配共享状态，并持有指向它的指针；而由于共享状态在这两个句柄都被销毁之前都不应当被释放，这里谈的实际上就是通过类似 \texttt{shared\_\allowbreak{}ptr} 的方式实现共享所有权（参见第 6 章“智能指针（Smart Pointers）”）。示意如下，\texttt{promise} 和 \texttt{future} 的结构大致是这样：
+
+\myGraphic{0.9}{images/fig_p206_1.png}{（promise 与 future 的共享状态示意）}
+
+除非你使用一种特殊的“感知分配器（allocator-aware）”版本的 \texttt{std::\allowbreak{}promise} 构造函数，否则图中的这块共享状态会用 \texttt{operator new} 分配。要让 \texttt{std::\allowbreak{}promise} 和 \texttt{std::\allowbreak{}future} 使用你自选的分配器，可以这样写：
+
+\begin{codebox}[cpp]
+    MyAllocator myalloc{};
+    std::promise<int> p(std::allocator_arg, myalloc);
+    std::future<int> f = p.get_future();
+\end{codebox}
+
+\texttt{std::\allowbreak{}allocator\_\allowbreak{}arg} 定义于 \texttt{<memory>\allowbreak{}} 头文件。关于 \texttt{My\allowbreak{}Allocator} 的细节，请参见第 8 章“分配器（Allocators）”。
+
+\section{打包任务以备后用}
+
+前面那张图还有一点值得注意：共享状态里装的并非仅仅是 \texttt{optional<\allowbreak{}T>\allowbreak{}}，实际上它装的是 \texttt{variant<\allowbreak{}T,\allowbreak{} exception\_\allowbreak{}ptr>\allowbreak{}}（\texttt{variant} 和 \texttt{optional} 详见第 5 章“词汇类型（Vocabulary Types）”）。这意味着，你不仅能把类型为 \texttt{T} 的数据塞过虫洞，还能把异常塞过去。这一点特别方便且对称，因为它让 \texttt{std::\allowbreak{}future<\allowbreak{}T>\allowbreak{}} 能够表示调用签名为 \texttt{T(\allowbreak{})\allowbreak{}} 的函数所有可能的结果：也许它返回一个 \texttt{T}；也许它抛出一个异常；当然，也可能它根本永不返回。类似地，对 \texttt{f.\allowbreak{}get(\allowbreak{})\allowbreak{}} 的一次调用可能返回一个 \texttt{T}，也可能抛出一个异常，或者（如果持有承诺的线程永远循环下去）可能永远都不返回。要把一个异常塞过虫洞，你会用到方法 \texttt{p.\allowbreak{}set\_\allowbreak{}exception(\allowbreak{}ex)\allowbreak{}}，其中 \texttt{ex} 是一个 \texttt{std::\allowbreak{}exception\_\allowbreak{}ptr} 类型的对象，比如可以在 \texttt{catch} 处理块内部由 \texttt{std::\allowbreak{}current\_\allowbreak{}exception(\allowbreak{})\allowbreak{}} 返回。
+
+\begin{codebox}[cpp]
+    template<class T>
+    class simple_packaged_task {
+      std::function<T()> m_func;
+      std::promise<T> m_promise;
+    public:
+      template<class F>
+      simple_packaged_task(const F& f) : m_func(f) {}
+      auto get_future() { return m_promise.get_future(); }
+      void operator()() {
+        try {
+          T result = m_func();
+          m_promise.set_value(result);
+        } catch (...) {
+          m_promise.set_exception(std::current_exception());
+        }
+      }
+    };
+\end{codebox}
+
+这个类表面上类似于标准库类型 \texttt{std::\allowbreak{}packaged\_\allowbreak{}task<\allowbreak{}R(\allowbreak{}A...)\allowbreak{}>}；区别在于标准库类型接受参数，并多用了一次间接层，以确保它连只可移动（move-only）的函数对象类型也能持有。回到第 5 章“词汇类型（Vocabulary Types）”，我们曾向你展示过一些变通办法，因为 \texttt{std::\allowbreak{}function} 无法持有只可移动的函数类型；所幸在处理 \texttt{std::\allowbreak{}packaged\_\allowbreak{}task} 时并不需要那些变通办法。另一方面，你这辈子大概都未必会真正用到 \texttt{std::\allowbreak{}packaged\_\allowbreak{}task}。它之所以有趣，主要是作为一个例子，展示了如何把承诺、未来值和函数组合成对外接口极为简单的用户友好型类类型。且想一想：上面的 \texttt{simple\_\allowbreak{}packaged\_\allowbreak{}task} 类在 \texttt{std::\allowbreak{}function} 中使用了类型擦除（type-erasure），接着又持有一个 \texttt{std::\allowbreak{}promise} 成员，而后者是基于做引用计数（reference counting）的 \texttt{std::\allowbreak{}shared\_\allowbreak{}ptr} 实现的；那个引用计数指针所指向的共享状态里，又持有互斥量和条件变量。如此多的思想和技巧，竟被压缩进了如此小的篇幅！然而 \texttt{simple\_\allowbreak{}packaged\_\allowbreak{}task} 的接口确实简单：用一个某种形式的函数或 lambda 构造它，然后调用 \texttt{pt.\allowbreak{}get\_\allowbreak{}future(\allowbreak{})\allowbreak{}} 得到一个你可以 \texttt{f.\allowbreak{}get(\allowbreak{})\allowbreak{}} 的未来值；与此同时（很可能从另一个线程）调用 \texttt{pt(\allowbreak{})\allowbreak{}} 来真正执行所存储的函数，并把结果塞过虫洞、送进 \texttt{f.\allowbreak{}get(\allowbreak{})\allowbreak{}}。
+
+如果所存储的函数抛出了异常，那么 \texttt{packaged\_\allowbreak{}task} 会捕获这个异常（在持有承诺的线程中），并把它塞进虫洞。然后，无论另一个线程何时调用 \texttt{f.\allowbreak{}get(\allowbreak{})\allowbreak{}}（或者它早已调用过、此刻正阻塞在 \texttt{f.\allowbreak{}get(\allowbreak{})\allowbreak{}} 内部），\texttt{f.\allowbreak{}get(\allowbreak{})\allowbreak{}} 都会把这个异常抛向持有未来值的那个线程。换句话说，借助承诺和未来值，我们居然可以“瞬间传送”异常，跨越线程。这种传送的确切机制 \texttt{std::\allowbreak{}exception\_\allowbreak{}ptr}，很遗憾超出了本书的范围。如果你在一个大量使用异常的代码库里做库编程，那么熟悉 \texttt{std::\allowbreak{}exception\_\allowbreak{}ptr} 绝对是值得的。
+
+\section{未来值的未来}
+
+和 \texttt{std::\allowbreak{}shared\_\allowbreak{}mutex} 的情况一样，标准库自带的 \texttt{std::\allowbreak{}future} 版本只是半成品。一个更完整、更实用的未来值版本正在到来，也许会在 C++20 中出现，而且有大量第三方库已经吸纳了即将到来的这个版本的最佳特性。这些库中最好的包括 \texttt{boost::\allowbreak{}future} 和 Facebook 的 \texttt{folly::\allowbreak{}Future}。
+
+\texttt{std::\allowbreak{}future} 的主要问题在于，对于一个可能包含多个步骤的计算，它在每一步之后都需要“在某个线程中落地（touching down）”。考虑下面这种病态使用 \texttt{std::\allowbreak{}future} 的方式：
+
+\begin{codebox}[cpp]
+    template<class T>
+    auto pf() {
+      std::promise<T> p;
+      std::future<T> f = p.get_future();
+      return std::make_pair(std::move(p), std::move(f));
+    }
+    void test() {
+      auto [p1, f1] = pf<Connection>();
+      auto [p2, f2] = pf<Data>();
+      auto [p3, f3] = pf<Data>();
+      auto t1 = std::thread([p1 = std::move(p1)]() mutable {
+        Connection conn = slowly_open_connection();
+        p1.set_value(conn);
+        // 危险：如果 slowly_open_connection 抛出了异常怎么办？
+      });
+      auto t2 = std::thread([p2 = std::move(p2)]() mutable {
+        Data data = slowly_get_data_from_disk();
+        p2.set_value(data);
+      });
+      auto t3 = std::thread(
+      [p3 = std::move(p3), f1 = std::move(f1)]() mutable {
+        Data data = slowly_get_data_from_connection(f1.get());
+        p3.set_value(data);
+      });
+      bool success = (f2.get() == f3.get());
+      assert(success);
+    }
+\end{codebox}
+
+注意标着 \texttt{DANGER} 的那一行：三个线程体都有同样的 bug，那就是在异常被抛出时没有捕获并调用 \texttt{.set\_\allowbreak{}exception(\allowbreak{})\allowbreak{}}。解决办法是一个 \texttt{try...catch} 块，就像我们在上一节的 \texttt{simple\_\allowbreak{}packaged\_\allowbreak{}task} 中所做的那样；但既然每次都这样写会让人不胜其烦，标准库便提供了一个简洁的包装函数 \texttt{std::\allowbreak{}async(\allowbreak{})\allowbreak{}}，它负责创建承诺—未来值对并派生一个新线程。使用 \texttt{std::\allowbreak{}async(\allowbreak{})\allowbreak{}}，我们就得到了下面这段看起来干净得多的代码：
+
+\begin{codebox}[cpp]
+    void test() {
+      auto f1 = std::async(slowly_open_connection);
+      auto f2 = std::async(slowly_get_data_from_disk);
+      auto f3 = std::async([f1 = std::move(f1)]() mutable {
+        return slowly_get_data_from_connection(f1.get());
+        // 不再有危险了。
+      });
+      bool success = (f2.get() == f3.get());
+      assert(success);
+    }
+\end{codebox}
+
+然而，这段代码仅仅在观感上更干净；它对你的代码库在性能和健壮性上的损害同样可怕。这是一段糟糕的代码！
+
+每当你在那段代码里看到一次 \texttt{.get(\allowbreak{})\allowbreak{}}，你都该想：“这可浪费了一次上下文切换！”而每当你看到一个线程被派生（无论是显式地还是经由 \texttt{async}），你都该想：“这可让操作系统耗尽内核线程、让我的程序开始从 \texttt{std::\allowbreak{}thread} 的构造函数抛出意外异常的风险大增！”比起前面两种写法，我们更希望写成类似下面这样——这种风格对 JavaScript 程序员来说可能不陌生：
+
+\begin{codebox}[cpp]
+    void test() {
+      auto f1 = my::async(slowly_open_connection);
+      auto f2 = my::async(slowly_get_data_from_disk);
+      auto f3 = f1.then([](Connection conn) {
+        return slowly_get_data_from_connection(conn);
+      });
+      bool success = f2.get() == f3.get();
+      assert(success);
+    }
+\end{codebox}
+
+这里，除了在最末尾、当我们无事可做只能等待最终答案时，没有任何 \texttt{.get(\allowbreak{})\allowbreak{}} 调用；而且派生的线程也少了一个。取而代之的是，在 \texttt{f1} 完成任务之前，我们为它挂接了一个“延续（continuation）”，这样当 \texttt{f1} 确实完成时，持有承诺的线程可以立刻顺势转入执行这个延续任务（如果 \texttt{f1} 的原始任务抛出了异常，我们就根本不会进入这个延续。库应当提供一个对称的方法 \texttt{f1.on\_\allowbreak{}error(\allowbreak{}continuation)\allowbreak{}} 来处理异常代码路径）。
+
+类似的东西在 Boost 中已经可用；而 Facebook 的 Folly 库则包含了一个特别健壮、特性完备、比 Boost 更好的实现。在等待 C++20 改善局面期间，我的建议是：如果你能承受把它集成进自己构建系统所带来的认知开销，就用 Folly。\texttt{std::\allowbreak{}future} 唯一的优点就是它是标准的；你几乎可以在任何平台上使用它，而不必操心下载、包含路径或许可条款。
+
+\section{说到线程……}
+
+在整章里，我们一直在使用“线程（thread）”这个词，却从未准确定义我们所说的它究竟指什么；你大概也注意到了，我们的许多多线程代码示例都使用了 \texttt{std::\allowbreak{}thread} 类类型和 \texttt{std::\allowbreak{}this\_\allowbreak{}thread} 命名空间，却没有太多解释。我们一直在关注如何在不同的执行线程之间同步行为，却至今对“到底是谁在执行”一笔带过！
+
+换句话说：当执行到达表达式 \texttt{mtx.\allowbreak{}lock(\allowbreak{})\allowbreak{}} 时，其中 \texttt{mtx} 是一个已被锁定的互斥量（mutex），\texttt{std::\allowbreak{}mutex} 的语义规定当前执行线程应当阻塞并等待。在那个线程被阻塞期间，发生了什么？我们的 C++ 程序仍然“掌控”着正在发生的事，但显然这段特定的 C++ 代码已经不再执行；那么是谁在执行？答案是：另一个线程。我们通过使用定义于 \texttt{<thread>\allowbreak{}} 头文件的标准库类 \texttt{std::\allowbreak{}thread}，来指明其他线程的存在，以及我们希望它们执行的代码。
+
+要派生一个新的执行线程，只需构造一个 \texttt{std::\allowbreak{}thread} 类型的对象，并向构造函数传入一个参数：一个 lambda 或函数，它告诉线程你希望在新线程中运行什么代码。（严格来说，你可以传入多个参数；第一个参数之后的所有参数都会作为函数参数传递给第一个参数，在此之前会经历第 5 章“词汇类型（Vocabulary Types）”所描述的 \texttt{reference\_\allowbreak{}wrapper} 退化（decay）。自 C++11 起，lambda 已经让 \texttt{thread} 构造函数的多余参数变得既没必要、又容易出错；我建议避免使用它们。）
+
+新线程会立刻开始运行；如果你希望它“启动即暂停”，那就得用“等待某个条件（Waiting for a condition）”一节中展示的某种同步技巧，或者“识别各个线程与当前线程（Identifying individual threads and the current thread）”中展示的另一种技巧，自己把这种功能搭建出来。
+
+新线程会一路执行完交给它的代码，当它抵达你提供的 lambda 或函数的末尾时，就会“变得可连接（joinable）”。这个想法非常类似于 \texttt{std::\allowbreak{}future}“变得就绪（ready）”时发生的事：线程已经完成了它的计算，并准备好把该计算的结果交付给你。正如 \texttt{std::\allowbreak{}future<\allowbreak{}void>\allowbreak{}} 那样，该计算的结果是“无值的”；但计算已经完成的这一事实本身依然很有价值——这可不是在玩文字游戏！
+
+不过，与 \texttt{std::\allowbreak{}future<\allowbreak{}void>\allowbreak{}} 不同的是，不允许在不取回那个无值结果的情况下销毁一个 \texttt{std::\allowbreak{}thread} 对象。默认情况下，如果你销毁了任何一个新线程却没有处理它的结果，析构函数就会调用 \texttt{std::\allowbreak{}terminate}，也就是说，它会干脆利落地杀掉你的程序。避免这种下场的办法是，通过调用成员函数 \texttt{t.\allowbreak{}join(\allowbreak{})\allowbreak{}}，向线程表明你已看到并确认它的完成——“干得好，线程，干得漂亮！”。另一种情况是，如果你不期望这个线程结束（例如它是一个运行着无限循环的后台线程），或不关心它的结果（例如它代表某个短命的“发射后不管（fire and forget）”任务），你可以通过 \texttt{t.\allowbreak{}detach(\allowbreak{})\allowbreak{}} 把它打发到后台——“走开吧，线程，我不想再听到你的消息！”。
+
+下面是一些使用 \texttt{std::\allowbreak{}thread} 的完整示例：
+
+\begin{codebox}[cpp]
+    using namespace std::literals; // 用于 "ms"（毫秒字面量后缀）
+    std::thread a([](){
+      puts("Thread A says hello ~0ms");
+      std::this_thread::sleep_for(10ms);
+      puts("Thread A says goodbye ~10ms");
+    });
+    std::thread b([](){
+      puts("Thread B says hello ~0ms");
+      std::this_thread::sleep_for(20ms);
+      puts("Thread B says goodbye ~20ms");
+    });
+    puts("The main thread says hello ~0ms");
+    a.join(); // 等待线程 A
+    b.detach(); // 不等待线程 B
+    puts("The main thread says goodbye ~10ms");
+\end{codebox}
+
+\subsection{识别各个线程与当前线程}
+
+与本章描述的其他所有类型一样，\texttt{std::\allowbreak{}thread} 类型的对象不支持 \texttt{operator==}。你无法直接问“这两个线程对象是同一个吗？”这也意味着，你不能把 \texttt{std::\allowbreak{}thread} 对象用作关联容器（如 \texttt{std::\allowbreak{}map} 或 \texttt{std::\allowbreak{}unordered\_\allowbreak{}map}）的键。不过，你可以通过一个名为“线程 id（thread-ids）”的特性，间接地询问相等性。成员函数 \texttt{t.\allowbreak{}get\_\allowbreak{}id(\allowbreak{})\allowbreak{}} 返回一个类型为 \texttt{std::\allowbreak{}thread::\allowbreak{}id} 的唯一标识符，
+
+尽管从技术上讲它是一个类类型，但它的行为非常像整数类型。你可以使用 \texttt{<} 和 \texttt{==} 运算符来比较线程 id，也可以把线程 id 用作关联容器的键值。线程 id 对象的另一个宝贵特性是它可以被拷贝，这与 \texttt{std::\allowbreak{}thread} 对象本身不同——后者只能移动（move-only）。要记住，每个 \texttt{std::\allowbreak{}thread} 对象都代表一个实际的执行线程；如果你能拷贝 \texttt{std::\allowbreak{}thread} 对象，那无异于在“拷贝”执行线程，这没什么道理——而且还肯定会引发一些有趣的 bug！
+
+\texttt{std::\allowbreak{}thread::\allowbreak{}id} 的第三个宝贵特性是：我们可以获取当前线程、甚至是主线程的线程 id。在线程内部，我们没法说“请把管理这个线程的 \texttt{std::\allowbreak{}thread} 对象交给我。”（这类似于 \texttt{std::\allowbreak{}enable\_\allowbreak{}shared\_\allowbreak{}from\_\allowbreak{}this<\allowbreak{}T>\allowbreak{}}，也就是第 6 章「智能指针（Smart Pointers）」里介绍的那类技巧；但正如我们所见，这种技巧需要由创建受管资源的库组件提供支持——在这里，也就是 \texttt{std::\allowbreak{}thread} 的构造函数。）而主线程（即 \texttt{main} 开始执行时所处的那个线程）根本就没有一个对应的 \texttt{std::\allowbreak{}thread} 对象。但它依然拥有自己的线程 id！
+
+最后，线程 id 还能以某种由实现定义的方式转换为字符串表示，并且保证该表示是唯一的——也就是说，当且仅当 \texttt{id1 == id2} 时，\texttt{to\_\allowbreak{}string(\allowbreak{}id1)\allowbreak{} == to\_\allowbreak{}string(\allowbreak{}id2)\allowbreak{}} 才成立。遗憾的是，这种字符串表示只能通过流运算符暴露出来（参见第 9 章「I/O 流（Iostreams）」）；如果你希望使用 \texttt{to\_\allowbreak{}string(\allowbreak{}id1)\allowbreak{}} 这种语法，就需要自己写一个简单包装函数：
+
+\begin{codebox}[cpp]
+    std::string to_string(std::thread::id id)
+    {
+      std::ostringstream o;
+      o << id;
+      return o.str();
+    }
+\end{codebox}
+
+你可以通过调用自由函数 \texttt{std::\allowbreak{}this\_\allowbreak{}thread::\allowbreak{}get\_\allowbreak{}id(\allowbreak{})\allowbreak{}} 来获取当前线程（如果你的当前线程恰好就是主线程，也包括主线程）的线程 id。请仔细看清这个语法！\texttt{std::\allowbreak{}thread} 是一个类的名字，而 \texttt{std::\allowbreak{}this\_\allowbreak{}thread} 是一个命名空间的名字。这个命名空间里放着我们用来操作当前线程的一些自由函数（不与任何 C++ 类实例相关联）。\texttt{get\_\allowbreak{}id(\allowbreak{})\allowbreak{}} 就是其中之一。它的名字刻意取得像 \texttt{std::\allowbreak{}thread::\allowbreak{}get\_\allowbreak{}id(\allowbreak{})\allowbreak{}}，但实际上它是完全不同的函数：\texttt{thread::\allowbreak{}get\_\allowbreak{}id(\allowbreak{})\allowbreak{}} 是成员函数，而 \texttt{this\_\allowbreak{}thread::\allowbreak{}get\_\allowbreak{}id(\allowbreak{})\allowbreak{}} 是自由函数。
+
+利用两个线程 id，你可以查明——例如——现有线程列表中的哪一个代表着你的当前线程：
+
+\begin{codebox}[cpp]
+    std::mutex ready;
+    std::unique_lock lk(ready);
+    std::vector<std::thread> threads;
+    auto task = [&](){
+        // 在此阻塞，直到主线程准备就绪。
+      (void)std::lock_guard(ready);
+        // 开始执行。在向量中找到我的线程 id。
+      auto my_id = std::this_thread::get_id();
+      auto iter = std::find_if(
+        threads.begin(), threads.end(),
+        [=](const std::thread& t) {
+          return t.get_id() == my_id;
+         }
+      );
+      printf("Thread %s %s in the list.\n",
+        to_string(my_id).c_str(),
+        iter != threads.end() ? "is" : "is not");
+    };
+    std::vector<std::thread> others;
+    for (int i = 0; i < 10; ++i) {
+      std::thread t(task);
+      if (i % 2) {
+        threads.push_back(std::move(t));
+      } else {
+        others.push_back(std::move(t));
+      }
+    }
+      // 让所有线程运行。
+    ready.unlock();
+      // 合并所有线程。
+    for (std::thread& t : threads) t.join();
+    for (std::thread& t : others) t.join();
+\end{codebox}
+
+你永远无法做到的是反方向操作：你无法根据给定的 \texttt{std::\allowbreak{}thread::\allowbreak{}id} 重建出对应的 \texttt{std::\allowbreak{}thread} 对象。因为假如能做到，你的程序中就会出现两个不同的对象，都代表同一个执行线程：一个是原本就在某处的 \texttt{std::\allowbreak{}thread}，另一个是你刚刚从线程 id 重建出来的。而同一个线程永远不可能由两个 \texttt{std::\allowbreak{}thread} 对象同时控制。\texttt{std::\allowbreak{}this\_\allowbreak{}thread} 命名空间里另外两个自由函数是 \texttt{std::\allowbreak{}this\_\allowbreak{}thread::\allowbreak{}sleep\_\allowbreak{}for(\allowbreak{}duration)\allowbreak{}}（本章里你已经看我大量使用过）和 \texttt{std::\allowbreak{}this\_\allowbreak{}thread::\allowbreak{}yield(\allowbreak{})\allowbreak{}}，后者基本上等同于 \texttt{sleep\_\allowbreak{}for(\allowbreak{}0ms)\allowbreak{}}：它告诉运行时，现在切换到另一个线程是个好主意，但并不意味着当前线程会有任何特定的时延。
+
+\section{线程耗尽与 std::async}
+
+在本章「future 的未来（The future of futures）」一节中，我们介绍了 \texttt{std::\allowbreak{}async}，它本质上是对线程构造函数的一个简单封装，并把结果捕获到一个 \texttt{std::\allowbreak{}future} 里。它的实现大致像下面这样：
+
+\begin{codebox}[cpp]
+    template<class F>
+    auto async(F&& func) {
+      using ResultType = std::invoke_result_t<std::decay_t<F>>;
+      using PromiseType = std::promise<ResultType>;
+      using FutureType = std::future<ResultType>;
+      PromiseType promise;
+      FutureType future = promise.get_future();
+      auto t = std::thread([
+        func = std::forward<F>(func),
+        promise = std::move(promise)
+      ]() mutable {
+        try {
+          ResultType result = func();
+           promise.set_value(result);
+        } catch (...) {
+          promise.set_exception(std::current_exception());
+        }
+      });
+      // 这种特殊行为在库之外无法实现
+      // 但 async 确实做到了。
+      // future.on_destruction([t = std::move(t)]() {
+      //  t.join();
+      // });
+      return future;
+    }
+\end{codebox}
+
+请注意那些被注释掉的几行，它们指出 \texttt{std::\allowbreak{}async} 返回的 \texttt{std::\allowbreak{}future} 有一种“销毁时”的特殊行为。这是标准库 \texttt{std::\allowbreak{}async} 实现中一种怪异而别扭的行为，也是你在自己的代码里应当避免或重新实现 \texttt{std::\allowbreak{}async} 的一个好理由：\texttt{std::\allowbreak{}async} 返回的 future 的析构函数会对底层线程调用 \texttt{.join(\allowbreak{})\allowbreak{}}！这意味着它们的析构函数可能会阻塞，而且该任务肯定不会像你自然预期的那样“在后台执行”。如果你调用 \texttt{std::\allowbreak{}async} 却没有把返回的 future 赋给某个变量，那么返回值会就地被销毁，结果具有讽刺意味的是：只包含一次 \texttt{std::\allowbreak{}async} 调用的那一行，实际上会以同步方式执行指定的函数：
+
+\begin{codebox}[cpp]
+    template<class F>
+    void fire_and_forget_wrong(const F& f) {
+      // 错误！在另一个线程中运行 f，但无论如何都会阻塞。
+      std::async(f);
+    }
+    template<class F>
+    void fire_and_forget_better(const F& f) {
+      // 更好！在另一个线程中启动 f 而不阻塞。
+      std::thread(f).detach();
+    }
+\end{codebox}
+
+最初设置这个限制的原因，似乎源于一种担忧：如果 \texttt{std::\allowbreak{}async} 以通常的方式启动后台线程，就会导致人们过度使用 \texttt{std::\allowbreak{}async}，并可能引入悬垂引用（dangling-reference）bug，就像下面这个例子：
+
+\begin{codebox}[cpp]
+    int test() {
+      int i = 0;
+      auto future = std::async([&]() {
+        i += 1;
+      });
+      // 假设我们在这里不调用 f.wait()
+      return i;
+    }
+\end{codebox}
+
+如果我们没有等待这个 future 的结果，函数 \texttt{test(\allowbreak{})\allowbreak{}} 就可能在新线程获得运行机会之前就返回到调用者那里；而当新线程最终运行、并试图对 \texttt{i} 做自增时，它访问的将会是一个已经不复存在的栈变量。所以，标准委员会与其冒让人写出这类有 bug 的代码的风险，不如决定让 \texttt{std::\allowbreak{}async} 返回带有特殊“魔法”析构函数的 future，由它们自动对线程执行 \texttt{join}。
+
+总之，过度使用 \texttt{std::\allowbreak{}async} 还会带来别的问题。最大的一个原因是：在所有流行的操作系统中，\texttt{std::\allowbreak{}thread} 都代表一个内核线程（kernel thread）——一种调度受操作系统内核控制的线程。由于操作系统用于追踪这些线程的资源是有限的，任何一个进程可用线程的数量都相当有限：通常只有几万个。如果你把 \texttt{std::\allowbreak{}async} 当作线程管理器来用，每遇到一个可能受益于并发（concurrency）的任务就新开一个 \texttt{std::\allowbreak{}thread}，你很快就会发现自己耗尽了内核线程。一旦这种情况发生，\texttt{std::\allowbreak{}thread} 的构造函数就会开始抛出 \texttt{std::\allowbreak{}system\_\allowbreak{}error} 类型的异常，其文本常常是 \texttt{Resource temporarily unavailable}。
+
+\section{构建你自己的线程池}
+
+如果你每次有新的任务就使用 \texttt{std::\allowbreak{}async} 去生成线程，就有可能耗尽你的进程可用的内核线程数量。一种更好的并发运行任务的方式是使用线程池（thread pool）——一小批“工作线程（worker thread）”，它们唯一的工作就是运行程序员提供的任务。如果任务数量多于工作线程，多余的任务会被放进一个工作队列（work queue）。每当某个工作线程完成一个任务，它就会去工作队列里查看有没有新任务。
+
+这是一个众所周知的思路，但截至 C++17 尚未被标准库采纳。不过，你可以把本章介绍的各种思路组合起来，创建属于自己的、可用于生产的线程池。我在这里会逐步带你看一个简单版本；就性能而言它算不上“可用于生产”，但在功能上它是完全线程安全且正确的。一些性能调优手段会在讲解的最后讨论。
+
+我们先从成员变量开始。请注意，我们遵循这样一条规则：所有由某个互斥量（mutex）控制的数据，都应当集中放在同一个“可视命名空间”之下；在这里，就是一个嵌套的 struct 定义。我们还打算用 \texttt{std::\allowbreak{}packaged\_\allowbreak{}task<\allowbreak{}void(\allowbreak{})\allowbreak{}>} 作为我们的只移动（move-only）函数类型；如果你的代码库里已经有某种只移动的函数类型，你大概会想直接用那个。如果你还没有只移动的函数类型，可以考虑采用 Folly 的 \texttt{folly::\allowbreak{}Function} 或 Denis Blank 的 \texttt{fu2::\allowbreak{}unique\_\allowbreak{}function}：
+
+\begin{codebox}[cpp]
+    class ThreadPool {
+      using UniqueFunction = std::packaged_task<void()>;
+      struct {
+        std::mutex mtx;
+        std::queue<UniqueFunction> work_queue;
+        bool aborting = false;
+      } m_state;
+      std::vector<std::thread> m_workers;
+      std::condition_variable m_cv;
+\end{codebox}
+
+\texttt{work\_\allowbreak{}queue} 变量会保存陆续到达的任务。成员变量 \texttt{m\_\allowbreak{}state.\allowbreak{}aborting} 会在所有工作线程应当停止工作、并“回家休息”时被置为 \texttt{true}。\texttt{m\_\allowbreak{}workers} 保存着工作线程本身；而 \texttt{m\_\allowbreak{}state.\allowbreak{}mtx} 和 \texttt{m\_\allowbreak{}cv} 仅仅用于同步。（当没有任务可做时，工作线程大部分时间都在休眠。当有新任务进来、我们需要唤醒某个工作线程时，就会去通知 \texttt{m\_\allowbreak{}cv}。）
+
+\texttt{Thread\allowbreak{}Pool} 的构造函数会生成工作线程，并填充 \texttt{m\_\allowbreak{}workers} 向量。每个工作线程都会运行成员函数 \texttt{this->worker\_\allowbreak{}loop(\allowbreak{})\allowbreak{}}，我们稍后就会看到它：
+
+\begin{codebox}[cpp]
+    public:
+      ThreadPool(int size) {
+        for (int i=0; i < size; ++i) {
+          m_workers.emplace_back([this]() { worker_loop(); });
+        }
+      }
+\end{codebox}
+
+正如承诺的那样，析构函数会把 \texttt{m\_\allowbreak{}state.\allowbreak{}aborting} 置为 \texttt{true}，然后等待所有工作线程察觉到这一变化并终止。请注意，我们去触碰 \texttt{m\_\allowbreak{}state.\allowbreak{}aborting} 时，始终是在 \texttt{m\_\allowbreak{}state.\allowbreak{}mtx} 的锁保护下进行的；我们遵循良好的卫生习惯，以避免 bug！
+
+\begin{codebox}[cpp]
+      ~ThreadPool() {
+        if (std::lock_guard lk(m_state.mtx); true) {
+          m_state.aborting = true;
+        }
+        m_cv.notify_all();
+        for (std::thread& t : m_workers) {
+          t.join();
+        }
+      }
+\end{codebox}
+
+现在让我们看看如何把任务入队到工作队列里。（我们还没看到工作线程是如何取出任务的；这一点我们会在 \texttt{worker\_\allowbreak{}loop} 成员函数里看到。）这非常直白；我们只需确保只在互斥量锁的保护下访问 \texttt{m\_\allowbreak{}state}，并且在把任务入队之后调用 \texttt{m\_\allowbreak{}cv.\allowbreak{}notify\_\allowbreak{}one(\allowbreak{})\allowbreak{}}，以便某个工作线程会被唤醒来处理这个任务：
+
+\begin{codebox}[cpp]
+      void enqueue_task(UniqueFunction task) {
+        if (std::lock_guard lk(m_state.mtx); true) {
+          m_state.work_queue.push(std::move(task));
+        }
+        m_cv.notify_one();
+      }
+\end{codebox}
+
+最后，这里是工作循环（worker loop）。这就是每个工作线程都会运行的成员函数：
+
+\begin{codebox}[cpp]
+    private:
+      void worker_loop() {
+        while (true) {
+          std::unique_lock lk(m_state.mtx);
+          while (m_state.work_queue.empty() && !m_state.aborting) {
+            m_cv.wait(lk);
+          }
+          if (m_state.aborting) break;
+          // 取出下一个任务，此时仍持有锁。
+          assert(!m_state.work_queue.empty());
+          UniqueFunction task = std::move(m_state.work_queue.front());
+          m_state.work_queue.pop();
+          lk.unlock();
+          // 真正运行任务。这可能会花一点时间。
+          task();
+          // 当我们完成这个任务后，再去取下一个。
+        }
+      }
+\end{codebox}
+
+请注意那个绕不开的 \texttt{m\_\allowbreak{}cv.\allowbreak{}wait(\allowbreak{}lk)\allowbreak{}} 循环，并注意我们是规规矩矩地只在互斥量锁的保护下访问 \texttt{m\_\allowbreak{}state} 的。还要注意的是，当我们真正去调用执行 \texttt{task} 时，会先释放互斥量锁；这保证了在用户的任务执行期间，我们不会长时间持有锁。如果我们长时间持有锁，那么其他工作线程就无法进入并取到它的下一个任务——我们实际上就降低了线程池的并发度。此外，如果我们持有锁去执行 \texttt{task}，而 \texttt{task} 本身又试图在这个线程池上入队一个新任务（这需要它自己去拿锁），那么 \texttt{task} 就会死锁（deadlock），整个程序都会冻结。这是一条更通用规则的特例：绝不要在持有互斥量锁的情况下调用用户提供的回调（callback）——那通常就是死锁的配方。
+
+最后，让我们通过实现一个安全的 \texttt{async} 版本来完成 \texttt{Thread\allowbreak{}Pool} 类。我们的版本允许对任意无需参数即可调用的 \texttt{f} 调用 \texttt{tp.\allowbreak{}async(\allowbreak{}f)\allowbreak{}}，并且和 \texttt{std::\allowbreak{}async} 一样，我们会返回一个 \texttt{std::\allowbreak{}future}，调用者可以借此在结果就绪后取回 \texttt{f} 的结果。与 \texttt{std::\allowbreak{}async} 返回的 future 不同，我们的 future 可以放心地“丢在地上”：如果调用者最终决定不想等结果了，任务仍然会留在队列中并最终被执行，而结果则会被直接忽略：
+
+\begin{codebox}[cpp]
+    public:
+      template<class F>
+      auto async(F&& func) {
+        using ResultType = std::invoke_result_t<std::decay_t<F>>;
+        std::packaged_task<ResultType()> pt(std::forward<F>(func));
+        std::future<ResultType> future = pt.get_future();
+        UniqueFunction task(
+           [pt = std::move(pt)]() mutable { pt(); }
+        );
+        enqueue_task(std::move(task));
+        // 交给用户一个用于取回结果的 future。
+        return future;
+      }
+    }; // class ThreadPool
+\end{codebox}
+
+我们可以用 \texttt{Thread\allowbreak{}Pool} 类写出像下面这个函数这样的代码，它创建了 60,000 个任务：
+
+\begin{codebox}[cpp]
+    void test() {
+      std::atomic<int> sum(0);
+      ThreadPool tp(4);
+      std::vector<std::future<int>> futures;
+      for (int i=0; i < 60000; ++i) {
+        auto f = tp.async([i, &sum](){
+          sum += i;
+          return i;
+        });
+        futures.push_back(std::move(f));
+      }
+      assert(futures[42].get() == 42);
+      assert(903 <= sum && sum <= 1799970000);
+    }
+\end{codebox}
+
+我们当然也可以试着用 \texttt{std::\allowbreak{}async} 来做同样的事，但在试图创建 60,000 个内核线程时，我们很可能会撞上线程耗尽。上面的例子只用了四个内核线程，这一点从传给 \texttt{Thread\allowbreak{}Pool} 构造函数的参数就能看出来。
+
+当你运行这段代码时，你会看到至少有数字 0 到 42 以某种顺序被打印到标准输出。我们知道 42 一定会被打印，因为函数在退出前一定会等待 \texttt{futures[42]} 就绪，而所有排在它前面的数字也必定会被打印，因为它们的任务都被放在了任务 42 之前的工作队列里。至于数字 43 到 59,999 是否会被打印，则取决于调度器；因为一旦任务 42 完成，我们就会退出 \texttt{test}，从而销毁线程池。正如我们所见，线程池的析构函数会通知它的所有工作线程：在完成当前任务后停止工作、回家休息。所以我们很可能会看到再打印出几个数字，但随后所有工作线程都会回家，剩下的任务则会被丢在地上。
+
+当然，如果你希望 \texttt{Thread\allowbreak{}Pool} 的析构函数阻塞到所有已入队的任务都执行完毕，你也可以通过修改析构函数的代码来做到。不过，通常你销毁线程池，是因为你的程序（比如一个 Web 服务器）正在退出，而那又是因为你收到了诸如用户按下 Ctrl + C 这样的信号。在这种情况下，你大概想尽快退出，而不是去试图清空队列。就我个人而言，我更倾向于添加一个成员函数 \texttt{tp.\allowbreak{}wait\_\allowbreak{}for\_\allowbreak{}all\_\allowbreak{}enqueued\_\allowbreak{}tasks(\allowbreak{})\allowbreak{}}，这样线程池的使用者就能自行决定：是要阻塞等待，还是直接把所有东西丢在地上。
+
+\subsection{改进我们线程池的性能}
+
+我们 \texttt{Thread\allowbreak{}Pool} 中最大的性能瓶颈在于，每个工作线程都在争夺同一把互斥量，即 \texttt{this->m\_\allowbreak{}state.\allowbreak{}mtx}。它们之所以都在争用这把互斥量，是因为它正是保护 \texttt{this->m\_\allowbreak{}state.\allowbreak{}work\_\allowbreak{}queue} 的那把锁，而每个工作线程
+
+需要访问那个队列，才能得知自己的下一个任务。因此，减少争用并加速程序的一种方法，就是找到一种把任务分发给工作线程的方式，而不依赖单一的中央任务队列。
+
+最简单的办法是给每个工作线程一份自己的“待办清单”；也就是说，把单一的 \texttt{std::\allowbreak{}queue<\allowbreak{}Task>\allowbreak{}} 换成一整个 \texttt{std::\allowbreak{}vector<\allowbreak{}std::\allowbreak{}queue<\allowbreak{}Task>\allowbreak{}>}，每个工作线程对应一个条目。当然，我们还需要一个 \texttt{std::\allowbreak{}vector<\allowbreak{}std::\allowbreak{}mutex>\allowbreak{}}，以便每个任务队列各有一把互斥量。\texttt{enqueue\_\allowbreak{}task} 函数以轮转（round-robin）的方式把任务分发给各个任务队列（借助对 \texttt{std::\allowbreak{}atomic<\allowbreak{}int>\allowbreak{}} 计数器的原子自增，来应对同时发生的入队操作）。
+
+你也可以使用每个入队线程各自的 \texttt{thread\_\allowbreak{}local} 计数器，前提是你足够幸运，所用的平台支持 C++11 的 \texttt{thread\_\allowbreak{}local} 关键字。在 x86-64 的 POSIX 平台上，访问 \texttt{thread\_\allowbreak{}local} 变量的速度大致相当于访问一个普通的全局变量；建立线程局部变量的全部复杂性都隐藏在幕后，并且只会在你生成新线程时发生。然而，正因为这种复杂性确实存在且需要运行时支持，许多平台至今仍不支持 \texttt{thread\_\allowbreak{}local} 存储类说明符。（在那些支持它的平台上，\texttt{thread\_\allowbreak{}local int x} 基本等同于 \texttt{static int x}，唯一的区别在于：当你的代码按名字访问 \texttt{x} 时，\texttt{x} 真正的存储地址会随 \texttt{std::\allowbreak{}this\_\allowbreak{}thread::\allowbreak{}get\_\allowbreak{}id(\allowbreak{})\allowbreak{}} 而不同。原则上，幕后某处存在一个完整的 \texttt{x} 数组，以线程 id 为索引，并由 C++ 运行时在创建和销毁线程时填充。）
+
+对我们 \texttt{Thread\allowbreak{}Pool} 而言，下一个显著的性能改进是“工作窃取”（work-stealing）：既然每个工作线程都拥有自己的待办清单，就可能出于偶然或恶意，出现某个工作线程过度繁忙、而其他所有工作线程却闲着的情况。此时，我们希望空闲的工作线程去扫描繁忙线程的队列，并在可能时“窃取”任务。这重新引入了工作线程之间的锁争用，但只在任务分配不均已经造成低效时才发生——而我们希望通过工作窃取来纠正的，正是这种低效。
+
+实现独立的工作队列和工作窃取就留作读者练习了；不过，在见识了基础版 \texttt{Thread\allowbreak{}Pool} 竟如此简单之后，我希望你不会太害怕去修改它、加入这些额外特性。
+
+当然，市面上也有专业编写的线程池（thread pool）类。例如 Boost.Asio 就包含一个，而且 Asio 有望在也许 C++20 中进入标准。借助 Boost.Asio，我们的 \texttt{Thread\allowbreak{}Pool} 类看起来是这样的：
+
+\begin{codebox}[cpp]
+    class ThreadPool {
+      boost::thread_group m_workers;
+      boost::asio::io_service m_io;
+      boost::asio::io_service::work m_work;
+    public:
+      ThreadPool(int size) : m_work(m_io) {
+        for (int i=0; i < size; ++i) {
+          m_workers.create_thread([&](){ m_io.run(); });
+        }
+      }
+      template<class F>
+      void enqueue_task(F&& func) {
+        m_io.post(std::forward<F>(func));
+      }
+      ~ThreadPool() {
+        m_io.stop();
+        m_workers.join_all();
+      }
+    };
+\end{codebox}
+
+当然，讲解 Boost.Asio 远远超出本书范围。
+
+任何使用线程池的时候，都要注意：你入队的任务绝不能在由同一线程池中其他任务所控制的条件上无限期阻塞。一个典型的例子是任务 A 在条件变量上等待，期望某个后续任务 B 会通知该条件变量。如果你创建了一个大小为 4 的 \texttt{Thread\allowbreak{}Pool}，并依次入队四份任务 A 的副本和四份任务 B 的副本，你会发现任务 B 永远得不到运行——池中四个工作线程全都被四份任务 A 的副本占满，而它们都在沉睡，等待一个永远不会到来的信号！“处理”这种情形无异于编写你自己的用户态线程库；如果你不想涉足这门生意，那么唯一稳妥的办法就是：在一开始就小心避免这种情形发生。
+
+\section{小结}
+
+多线程（multithreading）是一个困难而微妙的话题，许多陷阱只有事后回想时才显而易见。在本章中我们学到了：
+
+\texttt{volatile} 虽然对直接操作硬件很有用，却不足以保证线程安全。
+
+对标量类型 \texttt{T}（不超过机器寄存器大小）使用 \texttt{std::\allowbreak{}atomic<\allowbreak{}T>\allowbreak{}}，是在无竞争、无锁的前提下访问共享数据的正确方式。最重要的基本原子操作是比较并交换（compare-and-swap），在 C++ 中写作 \texttt{compare\_\allowbreak{}exchange\_\allowbreak{}weak}。
+
+为了强制线程轮流访问共享的非原子数据，我们使用 \texttt{std::\allowbreak{}mutex}。永远要通过 RAII 类（例如 \texttt{std::\allowbreak{}unique\_\allowbreak{}lock<\allowbreak{}M>\allowbreak{}}）来加锁。要记住，虽然 C++17 的类模板实参推导允许我们省略这些模板名字中的 \texttt{<M>\allowbreak{}}，但这只是语法上的便利；它们依旧是模板类。
+
+永远要清晰标明程序中每个互斥量控制着哪些数据。一个好的办法是借助嵌套的 struct 定义。
+
+\texttt{std::\allowbreak{}condition\_\allowbreak{}variable} 让我们可以“睡眠直到”某个条件被满足。如果该条件只能被满足一次（例如某个线程变得“就绪”），那么你大概应该用一对 promise-future 来替代条件变量。如果该条件可以被反复满足，则要考虑是否能把问题重述为工作队列模式。
+
+\texttt{std::\allowbreak{}thread} 把“执行线程”这一概念具体化了。“当前线程”无法直接作为一个 \texttt{std::\allowbreak{}thread} 对象来操控，但一组有限的操作可作为自由函数，在 \texttt{std::\allowbreak{}this\_\allowbreak{}thread} 命名空间中获得。其中最重要的操作是 \texttt{sleep\_\allowbreak{}for} 和 \texttt{get\_\allowbreak{}id}。每个 \texttt{std::\allowbreak{}thread} 在被销毁之前，必须始终先被 join 或 detach。detach 只对那些你永远不会需要干净关闭的后台线程有用。
+
+标准函数 \texttt{std::\allowbreak{}async} 接受一个函数或 lambda，让它在某个其他线程上执行，并返回一个 \texttt{std::\allowbreak{}future}，该 future 在函数执行完毕时变为就绪。尽管 \texttt{std::\allowbreak{}async} 本身存在致命缺陷（析构函数会 \texttt{join}；内核线程耗尽），因此不应用于生产代码，但通过 future 来处理并发的总体思路是好的。建议优先使用支持 \texttt{.then} 方法的 promise 与 future 实现。Folly 的实现是最好的。
+
+多线程（multithreading）是一个困难而微妙的话题，许多陷阱只有事后回想时才显而易见。

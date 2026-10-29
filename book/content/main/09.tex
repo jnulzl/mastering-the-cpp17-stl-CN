@@ -1,0 +1,1064 @@
+到目前为止，我们在标准库中只在少数几个地方见过古典多态（classical polymorphism）。我们刚刚在第 8 章「分配器」中看到了古典多态的 \texttt{std::\allowbreak{}pmr::\allowbreak{}memory\_\allowbreak{}resource}，而多态也被用于类型擦除（type-erased）类型 \texttt{std::\allowbreak{}any} 和 \texttt{std::\allowbreak{}function} 的「幕后」，正如第 5 章「词汇类型」所详述的。不过，大体而言，标准库并不依赖古典多态也能正常运转。
+
+然而，标准库中有两个地方大量使用了古典多态。其一是标准异常体系——为了方便起见，标准库抛出的所有异常都是 \texttt{std::\allowbreak{}exception} 的子类。（本书不讲解异常体系。）其二是标准 \texttt{<iostream>\allowbreak{}} 头文件中的内容，本章就会讲解它。不过，在到达那里之前，我们还有大量背景知识需要铺垫！
+
+在本章中，我们将涵盖以下主题：
+
+将输出拆分为缓冲（buffering）与格式化（formatting），并将输入拆分为缓冲、词法分析（lexing）与解析（parsing）
+
+用于无格式文件 I/O 的 POSIX API
+
+\texttt{<stdio.\allowbreak{}h>\allowbreak{}} 中的「C」式 API，它在缓冲之外又增加了格式化
+
+古典 \texttt{<iostream>\allowbreak{}} API 的优劣
+
+依赖区域设置（locale）的格式化所带来的危险，以及能帮助规避这些危险的新 C++17 特性
+
+在数值数据与字符串之间相互转换的多种方法
+
+\section{C++ 中 I/O 的难题}
+
+一个常用来衡量编程语言易用性的指标叫做 TTHW——「编写 hello world 所花的时间（time to hello world）」。许多流行的编程语言 TTHW 都很低：在许多脚本语言（比如 Python 和 Perl）中，「hello world」程序就真的是单独这一行：\texttt{print "hello world"}。
+
+C++ 及其前身 C 都是系统编程语言，也就是说，它们首要关注的是「能力」：对机器的控制、速度，以及（对 C++ 而言）借助泛型算法利用类型系统的能力。这种关注点的混合并不适合小巧的「hello world」程序。
+
+C 语言中最典型的「hello world」程序如下：
+
+\begin{codebox}[cpp]
+    #include <stdio.h>
+    int main()
+    {
+      puts("hello world");
+    }
+\end{codebox}
+
+在 C++ 中，它如下所示：
+
+\begin{codebox}[cpp]
+    #include <iostream>
+    int main()
+    {
+      std::cout << "hello world" << std::endl;
+    }
+\end{codebox}
+
+典型的 C++ 源代码并不比典型的 C 源代码长多少，但它有更多可以调整的「参数」或「旋钮」——即便是初学者，也得了解这些旋钮，哪怕他学到的全部内容就是不去动它们。举例来说，在 C 中我们调用一个名为 \texttt{puts} 的函数（通俗地说，是一个「动词」），而在 C++ 中，我们对一个名为 \texttt{std::\allowbreak{}cout} 的对象施加一个运算符（所以通俗地说，我们既有「动词」也有一个「间接宾语」）。在 C++ 的例子中，我们还得为行尾（换行）字符学习一个专门的名字——\texttt{std::\allowbreak{}endl}——而 C 的 \texttt{puts} 函数把这个细节对我们隐藏了起来。
+
+有时，这种复杂性会让 C++ 的新手「望而却步」，尤其是当他们在学校里学习 C++，而且可能本来就未必确定自己想学它的时候。然而，这是一种令人遗憾的误解！要知道，前面那段「C」源代码（使用 \texttt{puts}）同样是完全合法的 C++，使用 \texttt{<stdio.\allowbreak{}h>\allowbreak{}} 头文件所提供的设施也毫无问题。事实上，在本章中，我们会先讲解 \texttt{<stdio.\allowbreak{}h>\allowbreak{}} 的设施，然后才去攻克 \texttt{<iostream>\allowbreak{}} 的设施。不过我们也会看到，C++14 和 C++17 引入了一些鲜为人知的新特性——在 \texttt{<string>\allowbreak{}} 和 \texttt{<utility>\allowbreak{}} 这样的头文件中——它们能帮助完成一些常见的 I/O 任务。
+
+关于头文件命名，有一点说明：对于包含「C 风格」I/O 设施的头文件，我一直使用 \texttt{<stdio.\allowbreak{}h>\allowbreak{}} 这个名字。自 C++03 起，还有一个类似的标准头文件名为 \texttt{<cstdio>\allowbreak{}}。\texttt{<stdio.\allowbreak{}h>\allowbreak{}} 和 \texttt{<cstdio>\allowbreak{}} 之间唯一的区别在于：在 \texttt{<stdio.\allowbreak{}h>\allowbreak{}} 中，所有设施都保证位于全局命名空间（例如 \texttt{::\allowbreak{}printf}），并且可能在也可能不在 \texttt{std} 命名空间中（例如 \texttt{std::\allowbreak{}printf}）；而在 \texttt{<cstdio>\allowbreak{}} 中，它们保证位于 \texttt{std} 命名空间（例如 \texttt{std::\allowbreak{}printf}），但不一定在全局命名空间中（例如 \texttt{::\allowbreak{}printf}）。实际上，二者毫无差别，因为不论你包含哪个头文件，所有主流厂商都会把这些设施同时放进两个命名空间。我的建议只是：选定一种风格并坚持下去。如果你的代码库大量使用像 \texttt{<unistd.\allowbreak{}h>\allowbreak{}} 这样只有 \texttt{.h} 名字的 POSIX 头文件，那么沿用标准「C 风格」头文件的 \texttt{.h} 名字，在观感上可能更协调。
+
+\section{缓冲与格式化}
+
+如果你记住，当你「输出」某些数据时（反过来，输入数据时也同理），至少有两个不同的基本过程在同时发生，那么你将更容易理解「C 风格」的 I/O 与「I/O 流（iostream）风格」的 I/O。为了给它们起个名字，我们不妨称之为格式化与缓冲：
+
+格式化是把程序中一批强类型数据值——\texttt{int}、字符串、浮点数、用户自定义的类类型——翻译或序列化为「文本」的任务。例如，当数字 42 被打印成 \texttt{"42"}（或 \texttt{"+42"} 或 \texttt{"0x002\allowbreak{}A"}）时，那就是格式化。通常，一个格式化库会拥有它自己的「迷你语言（mini-language）」来描述你希望每个值如何被格式化。
+
+缓冲是把一批原始字节从程序取出并发送到某个输出设备（输出时），或者从某个输入设备收集数据、并以一批原始字节的形式提供给程序（输入时）的任务。库中负责缓冲的部分可能会做这样的事情：「每次收集 4096 字节的数据，然后刷新（flush）」；或者它也可能关注数据要去往何处：是文件系统中的某个文件、某个网络套接字（socket），还是内存中的某个字节数组？
+
+现在，我特意说格式化阶段的输出是「文本」，而缓冲阶段的输入是「一批字节」。在明智的操作系统上，「文本」和「字节」是一回事。然而，如果你用的是那种奇怪的操作系统——其中换行符被编码为两个字节，或者文本文件预期的编码不是 UTF-8——那么在其中一个或两个阶段的内部，甚至在更下游（比如在把数据写入文件的操作系统系统调用中），必定会进行一些额外的处理。关于这类事情我们就不多谈了，因为我希望你在实际的生产环境中并没有使用那种操作系统（或区域设置）。在生产环境中，字符编码应当始终使用 UTF-8，时区应当使用 UTC，而区域设置应当使用 \texttt{"C.\allowbreak{}UTF-8"}。因此，就我们的目的而言，可以假装「格式化」和「缓冲」是整条流水线中我们唯一需要关心的环节。
+
+当我们进行输入时，先做「缓冲」，从输入设备读取一些无格式的字节；然后再做「格式化」，把这些字节转化为强类型的数据值。输入时的「格式化」阶段还可以进一步细分为词法分析（lexing，用于确定流（stream）中单个数据项的长度）和解析（parsing，用于从这些字节中确定该数据项的实际值）。关于词法分析，我们会在第 10 章「正则表达式」中详谈。
+
+\section{使用 POSIX API}
+
+每当我们谈论文件 I/O 时，最要紧记住的一点是：C 和 C++ 中所有与 I/O 相关的东西都建立在 POSIX 标准之上。POSIX 是一份非常低层的规范，几乎达到了 Linux 系统调用的层级，它与 C 和 C++ 的 I/O 标准有着相当多的重合；而且，如果你不理解 POSIX 层的大意，就很难理解后面出现的那些概念。
+
+请记住，严格来说，下面要讲的没有一样是标准 C++！它反而是符合一份非 C++ 标准——即 POSIX 标准——的合法 C++。在实践中，这意味着它能运行在除 Windows 之外的任何操作系统上，甚至还能通过 Windows Subsystem for Linux（WSL）在现代 Windows 系统上运行。无论如何，所有标准 API（无论是 \texttt{<stdio.\allowbreak{}h>\allowbreak{}} 还是 \texttt{<iostream>\allowbreak{}}）都建立在这个模型之上。
+
+定义了下文大部分内容的标准外头文件是 \texttt{<unistd.\allowbreak{}h>\allowbreak{}} 和 \texttt{<fcntl.\allowbreak{}h>\allowbreak{}}。
+
+在 POSIX 中，术语「file（文件）」指的是磁盘上的真实文件（或者至少是某种文件系统中的文件；如果我偶尔用「磁盘」一词来指代文件系统，请多多包涵）。多个程序可以通过一种叫做文件描述符（file descriptor）的操作系统资源同时读写同一个文件。在 C 或 C++ 程序中，你永远不会直接看到文件描述符对象本身；你所能看到的只是对文件描述符的一个句柄（handle，或指针）。这些句柄（或指针）并非以指针类型呈现，而是以小型整数——字面地说，就是 \texttt{int} 类型的值——的形式出现。（制定 POSIX 的那个委员会，对类型安全的痴迷程度远不及一般的 C++ 程序员！）
+
+要创建一个新文件描述符并获得指向它的整数句柄，你使用 \texttt{open} 函数；例如，\texttt{int fd = open(\allowbreak{}"myfile.\allowbreak{}txt",\allowbreak{} O\_\allowbreak{}RDONLY)\allowbreak{}}。第二个参数是一个位掩码（bitmask），它可以包含以下任意位标志（bit-flag），并用按位或组合在一起：
+
+必需项：有且仅有一种「访问模式（access mode）」。可能的「访问模式」有 \texttt{O\_\allowbreak{}RDONLY}（只读）、\texttt{O\_\allowbreak{}WRONLY}（只写）和 \texttt{O\_\allowbreak{}RDWR}（既读又写）。
+
+可选项：一些「打开时标志（open-time flag）」，用来描述你希望系统在打开文件时采取的动作。例如，\texttt{O\_\allowbreak{}CREAT} 表示「如果指定名字的文件不存在，请为我创建它」（而不是返回失败）；你甚至可以再加上 \texttt{O\_\allowbreak{}EXCL}，它的意思是「……而如果指定名字的文件已经存在，那就返回失败」。另一个重要的打开时标志是 \texttt{O\_\allowbreak{}TRUNC}，它的意思是「在打开文件之后，将其截断——即清空、清空内容、重置——该文件」。
+
+可选项：一些「操作模式（operating mode）」，用来描述通过该文件描述符进行 I/O 的方式。这里重要的一个是 \texttt{O\_\allowbreak{}APPEND}。
+
+\texttt{O\_\allowbreak{}APPEND} 表示「追加模式（append mode）」。当一个文件处于「追加模式」时，你可以像往常一样在它里面定位（seek，稍后你会看到），但每次向该文件写入时，你的写入操作都会隐式地先定位到文件末尾（这意味着写入之后，你的光标（cursor）会位于文件末尾，即便你刚刚还在另一个位置进行读取）。如果在记录日志时使用追加模式来打开文件描述符，会很有用，尤其是当你从不同线程记录日志时。一些标准工具程序，例如 \texttt{logrotate}，在记录日志的程序正确地以「追加模式」打开其日志文件时，工作效果最好。简而言之，追加模式用途极为广泛，以至于我们会在每一个更高层的 API 中一次又一次地看到它。
+
+现在来解释「光标」和「定位（seek）」。每个 POSIX 文件描述符都有一些关联数据——基本上就是它的「成员变量」。其中一份关联数据是描述符当前的操作模式；另一份是当前文件位置指示器，此后我们称之为「光标」。就像文本编辑器中的光标一样，这个光标指向底层文件中下一次读或写将要发生的地方。对描述符使用 \texttt{read} 或 \texttt{write} 都会推进它的光标。而且，正如上一段所述，对处于「追加模式」的文件描述符使用 \texttt{write}，会把光标重置到文件的绝对末尾。请注意，每个文件描述符只有一个光标！如果你用 \texttt{O\_\allowbreak{}RDWR} 打开一个文件描述符，你并不会得到一个读光标和一个写光标，而只会得到一个由读取和写入共同推进的单一光标。
+
+\texttt{read(\allowbreak{}fd,\allowbreak{} buffer,\allowbreak{} count)\allowbreak{}}：它从底层文件读取原始字节，并存入给定的缓冲区（buffer）中——最多 \texttt{count} 字节，或者直到遇到某种临时性或永久性错误（例如，如果需要等待通过网络连接传来的更多数据，或者有人在读操作进行到一半时卸载了底层文件系统）。它返回读取到的字节数；并且记住，它会推进光标。
+
+\texttt{write(\allowbreak{}fd,\allowbreak{} buffer,\allowbreak{} count)\allowbreak{}}：它把给定缓冲区中的原始字节写入底层文件——最多 \texttt{count} 字节，或者直到遇到某种临时性或永久性错误。它返回写入的字节数；并且记住，它会推进光标。（而且在写入任何数据之前，如果文件描述符处于追加模式，它会先定位到文件末尾。）
+
+\texttt{lseek(\allowbreak{}fd,\allowbreak{} offset,\allowbreak{} SEEK\_\allowbreak{}SET)\allowbreak{}}：它定位（即移动光标）到距文件开头给定偏移量的位置，并返回该偏移量（如果操作失败，例如越过了文件末尾，则返回 \texttt{-1}）。
+
+\texttt{lseek(\allowbreak{}fd,\allowbreak{} offset,\allowbreak{} SEEK\_\allowbreak{}CUR)\allowbreak{}}：它定位到相对于当前光标的给定偏移量处。像这样的相对移动通常并不重要，但 \texttt{lseek(\allowbreak{}fd,\allowbreak{} 0,\allowbreak{} SEEK\_\allowbreak{}CUR)\allowbreak{}} 这个特例非常重要，因为正是用它来获知光标的当前位置！
+
+\texttt{lseek(\allowbreak{}fd,\allowbreak{} offset,\allowbreak{} SEEK\_\allowbreak{}END)\allowbreak{}}：它定位到相对于文件末尾的给定偏移量处。同样地，当 \texttt{offset} 为零时，这个版本最为有用。
+
+顺带一提，无法「拷贝构造」一个 POSIX 文件描述符，从而让你获得指向同一文件的第二个光标。如果你想要两个光标，就得把文件 \texttt{open} 两次。令人困惑的是，POSIX 有一个名为 \texttt{dup} 的函数，它接收一个整数文件描述符句柄，并返回一个不同的整数，可用作同一描述符的第二个句柄；这是一种原始形式的引用计数（reference-counting）。
+
+当你用完一个文件描述符后，调用 \texttt{close(\allowbreak{}fd)\allowbreak{}} 来释放你的句柄；如果这是该描述符的最后一个句柄（也就是说，在此期间没有人调用过 \texttt{dup}），那么文件描述符本身就会被操作系统回收——换言之，底层文件就被「关闭」了。
+
+把上述一切都组合起来，我们可以用 POSIX API 编写这样一个简单的程序，来打开、读取、写入、定位并关闭文件描述符：
+
+\begin{codebox}[cpp]
+    #include <cassert>
+    #include <string>
+    #include <unistd.h>
+    #include <fcntl.h>
+    int main()
+    {
+      int fdw = open("myfile.txt", O_WRONLY | O_CREAT | O_TRUNC);
+      int fdr = open("myfile.txt", O_RDONLY);
+      if (fdw == -1 || fdr == -1)
+        return EXIT_FAILURE;
+
+      write(fdw, "hello world", 11);
+      lseek(fdw, 6, SEEK_SET);
+      write(fdw, "neighbor", 8);
+      std::string buffer(14, '\0');
+      int b = read(fdr, buffer.data(), 14);
+      assert(b == 14);
+      assert(buffer == "hello neighbor");
+      close(fdr);
+      close(fdw);
+    }
+\end{codebox}
+
+请注意，POSIX API 完全不与任何格式化相关的事情打交道。它只关心确保我们能把原始字节读入和写出磁盘上的文件；也就是说，它只关心缓冲阶段的一半——「数据要去往何处」那一半。POSIX 并不理会「带缓冲的输出」；当你调用 \texttt{write} 时，你的数据就会被写出。也就是说，它或许仍然停留在操作系统层面的缓冲区中，或磁盘控制器层面，或硬件中，但就你的程序而言，数据已经在路上了。输出中的任何进一步延迟都超出了你的控制范围，也并非你的过错。这反过来意味着，如果你需要用 POSIX API 高效地写入大量数据，你的程序就必须负责把数据写入一个缓冲区，然后一次性把整个缓冲区交给 \texttt{write}。一次写入 4096 字节的 \texttt{write} 会比 4096 次每次写入 1 字节的 \texttt{write} 快得多！
+
+或者，你也可以不自己编写缓冲区管理代码，而是向上提升一个抽象层级，使用 C 语言 API。
+
+\section{使用标准 C API}
+
+这段描述必然与我们前面关于 POSIX 的讨论一样简略而不完整。要完整了解 \texttt{<stdio.\allowbreak{}h>\allowbreak{}} 中提供的设施，你得去查阅其他资料，例如 \texttt{cppreference.\allowbreak{}com} 或你本地的 \texttt{man} 手册页。
+
+在「C 风格」API 中，POSIX 文件描述符被赋予了新的名字：对应于文件描述符的东西叫做 \texttt{FILE}，而对应于整数文件描述符句柄的东西（自然地）叫做 \texttt{FILE*}。不过，与 POSIX API 中一样，你永远不需要自己构造 \texttt{FILE} 的实例。
+
+要创建一个新 \texttt{FILE} 对象并获得指向它的指针，你使用 \texttt{fopen} 函数；例如，\texttt{FILE *fp = fopen(\allowbreak{}"myfile.\allowbreak{}txt",\allowbreak{} "r")\allowbreak{}}。第二个参数是一个字符串（即指向一个以空字符结尾的字符数组的指针——通常你会像我这里一样，直接使用字符串字面量），它必须是下列之一：
+
+\texttt{"r"}：等价于 POSIX 的 \texttt{O\_\allowbreak{}RDONLY}。以只读方式打开。若文件不存在则失败（即返回 \texttt{nullptr}）。
+
+\texttt{"w"}：等价于 POSIX 的 \texttt{O\_\allowbreak{}WRONLY | O\_\allowbreak{}CREAT | O\_\allowbreak{}TRUNC}。以写入方式打开。若文件不存在则创建它。无论如何，在继续之前都会把文件清空。
+
+\texttt{"r+"}：等价于 POSIX 的 \texttt{O\_\allowbreak{}RDWR | O\_\allowbreak{}CREAT}。以读写方式打开。若文件不存在则创建为空文件。
+
+\texttt{"w+"}：等价于 POSIX 的 \texttt{O\_\allowbreak{}RDWR | O\_\allowbreak{}CREAT | O\_\allowbreak{}TRUNC}。以读写方式打开。若文件不存在则创建它。无论如何，在继续之前都会把文件清空。
+
+\texttt{"a"}：等价于 POSIX 的 \texttt{O\_\allowbreak{}WRONLY | O\_\allowbreak{}CREAT | O\_\allowbreak{}APPEND}。以写入方式打开。若文件不存在则创建为空文件。进入追加模式。
+
+\texttt{"a+"}：等价于 POSIX 的 \texttt{O\_\allowbreak{}RDWR | O\_\allowbreak{}CREAT | O\_\allowbreak{}APPEND}。以读写方式打开。若文件不存在则创建为空文件。进入追加模式。
+
+请注意，前面的这些字符串存在某种规律——带有 \texttt{'+'} 的字符串总是映射到 \texttt{O\_\allowbreak{}RDWR}，带有 \texttt{'w'} 的字符串总是映射到 \texttt{O\_\allowbreak{}TRUNC}，而带有 \texttt{'a'} 的字符串总是映射到 \texttt{O\_\allowbreak{}APPEND}；然而，并不存在一种完美规整的规律来描述从
+
+将 \texttt{fopen} 的模式字符串转换成 POSIX 的 \texttt{open} 标志。
+
+某些平台支持在模式字符串后追加额外字符；例如，POSIX 平台上一个常见的扩展是追加一个 \texttt{'x'} 表示 \texttt{O\_\allowbreak{}EXCL}；在 GNU 平台，追加一个 \texttt{'e'} 表示 \texttt{O\_\allowbreak{}CLOEXEC}；而在 Windows 上，追加一个大写字母 \texttt{'N'} 也能得到类似的效果。
+
+唯一可以在任何平台上追加到模式字符串的字符（也就是说，C++ 标准保证它在所有地方都可用）是表示“二进制”的 \texttt{'b'}。它只在 Windows 上有意义：如果你不指定这个字符，库会自动把你输出的每个 \texttt{'\textbackslash n'} 字节转换为 Windows 的行终止符序列 \texttt{'\textbackslash r',\allowbreak{} '\textbackslash n'}。如果你确实希望在 Windows 上得到这种转换，一个有用的约定是在模式字符串中追加 \texttt{'t'}。所有厂商的库都会识别并忽略这个字符；它只是向人类读者表明：你确实是有意以“文本”模式打开文件，而不是不小心漏掉了本想写的 \texttt{'b'}。
+
+使用完一个文件之后，你必须调用 \texttt{fclose(\allowbreak{}fp)\allowbreak{}}，它对应于在底层的文件描述符句柄上调用 \texttt{close(\allowbreak{}fd)\allowbreak{}}。
+
+为了处理 C 风格 \texttt{FILE} 指针的簿记工作，你可能想使用第 5 章「词汇类型」中介绍的 RAII 智能指针。你可以像下面这样编写一个“独占 \texttt{FILE} 指针”：
+
+\begin{codebox}[cpp]
+    struct fcloser {
+      void operator()(FILE *fp) const {
+        fclose(fp);
+      }
+      static auto open(const char *name, const char *mode) {
+        return std::unique_ptr<FILE, fcloser>(fopen(name, mode));
+      }
+    };
+    void test() {
+      auto f = fcloser::open("test.txt", "w");
+      fprintf(f.get(), "hello world\n");
+        // f 会被自动关闭
+    }
+\end{codebox}
+
+此外要记住，如果你想要引用计数式的、“最后离开房间的人关灯”语义，你随时可以把 \texttt{unique\_\allowbreak{}ptr} 移动（move）进 \texttt{shared\_\allowbreak{}ptr}：
+
+\begin{codebox}[cpp]
+    auto f = fcloser::open("test.txt", "w");
+    std::shared_ptr<FILE> g1 = std::move(f);
+      // 此时 f 为空，g1 的引用计数为 1
+    if (true) {
+      std::shared_ptr<FILE> g2 = g1;
+        // g1 的引用计数现在为 2
+      fprintf(g2.get(), "hello ");
+        // g1 的引用计数回落到 1
+    }
+    fprintf(g1.get(), "world\n");
+      // g1 的引用计数降为 0；文件被关闭
+\end{codebox}
+
+\subsection{标准 C 语言 API 中的缓冲}
+
+标准 C 语言 API 提供了一系列函数，它们看起来和 POSIX 函数一模一样，只是名字前面多了一个字母 \texttt{f}。
+
+函数 \texttt{fread(\allowbreak{}buffer,\allowbreak{} 1,\allowbreak{} count,\allowbreak{} fp)\allowbreak{}} 从底层文件中读取原始字节，并存入给定的缓冲区（buffer）—最多 \texttt{count} 个字节，或者直到遇到某种永久性错误（例如，有人在读操作进行到一半时卸载了底层文件系统）。它返回读取的字节数，并推进游标（cursor）。那个调用中的字面量 \texttt{1} 并不是笔误！严格来说，函数的签名是 \texttt{fread(\allowbreak{}buffer,\allowbreak{} k,\allowbreak{} count,\allowbreak{} fp)\allowbreak{}}。它会读取最多 \texttt{k * count} 个字节，或者直到遇到永久性错误，并返回读取的字节数除以 \texttt{k} 的结果。然而，在你自己的代码中，\texttt{k} 应该始终是字面量 \texttt{1}；使用其他任何值都是错误的，至少有两点原因。首先，由于返回值总是除以 \texttt{k}，如果 \texttt{k} 不是 \texttt{1}，你就会丢失信息。例如，若 \texttt{k} 为 8，返回值为 3 表示“在 24 到 31 之间”的某个字节数已被读取并存入缓冲区，但 \texttt{buffer[3]} 现在可能含有一个只写了一半的值—也就是说，垃圾数据—而你根本没有办法检测这一点。其次，由于库内部会计算 \texttt{k * count}，传入除 1 以外的任何 \texttt{k} 都有溢出、从而算出错误缓冲区长度的风险。流行的实现都不会检查这次乘法是否溢出；就算只为了性能，它们也不会这么做。如果每个程序员都已经知道绝不会给 \texttt{k} 传入 1 以外的值，那么把 CPU 时间花在昂贵的除法运算上根本没有意义！
+
+函数 \texttt{fwrite(\allowbreak{}buffer,\allowbreak{} 1,\allowbreak{} count,\allowbreak{} fp)\allowbreak{}} 把给定 \texttt{buffer} 中的原始字节写入底层文件—最多 \texttt{count} 个字节，或者直到遇到某种永久性错误。它返回写入的字节数，并推进游标。（在写入任何数据之前，如果文件描述符处于追加（append）模式，它会先定位到文件末尾。）
+
+函数 \texttt{fseek(\allowbreak{}fp,\allowbreak{} offset,\allowbreak{} SEEK\_\allowbreak{}SET)\allowbreak{}} 用于定位（即移动游标）到相对于文件开头的给定偏移处；\texttt{fseek(\allowbreak{}fp,\allowbreak{} offset,\allowbreak{} SEEK\_\allowbreak{}CUR)\allowbreak{}} 定位到相对于当前游标的给定偏移处；\texttt{fseek(\allowbreak{}fp,\allowbreak{} offset,\allowbreak{} SEEK\_\allowbreak{}END)\allowbreak{}} 定位到相对于文件末尾的给定偏移处。与 POSIX 的 \texttt{lseek} 不同，标准 C 版本的 \texttt{fseek} 并不返回当前游标的值；它只是在成功时返回 \texttt{0}，失败时返回 \texttt{-1}。
+
+函数 \texttt{ftell(\allowbreak{}fp)\allowbreak{}} 返回当前游标的值；也就是说，它等价于底层的 POSIX 调用 \texttt{lseek(\allowbreak{}fd,\allowbreak{} 0,\allowbreak{} SEEK\_\allowbreak{}CUR)\allowbreak{}}。
+
+说到底层的 POSIX 调用：如果你在 POSIX 平台上，并且需要针对某个标准 C 的 \texttt{FILE *} 底层的 POSIX 文件描述符做一些不可移植的操作，你随时可以通过调用 \texttt{fileno(\allowbreak{}fp)\allowbreak{}} 取回该文件描述符。所以，举例来说，我们可以把 \texttt{ftell} 表达如下：
+
+\begin{codebox}[cpp]
+    long ftell(FILE *fp)
+    {
+      int fd = fileno(fp);
+      return lseek(fd, 0, SEEK_CUR);
+    }
+\end{codebox}
+
+使用 \texttt{fread} 和 \texttt{fwrite} 完全可行，但它并不是使用 C 语言 API 最常见的方式。许多程序更喜欢不以大块数据、而逐个字符或逐个字节地处理输入和输出。最初的“Unix 哲学”面向那些读取并变换字节流（stream）的小型简单命令行工具；这些小型的、面向流的程序被称为“过滤器（filter）”，当你用 Unix shell 的管道把它们串起来时，它们才真正大放异彩。例如，下面是一个小程序，它打开一个文件，并用 \texttt{<stdio.\allowbreak{}h>\allowbreak{}} API 统计该文件中的字节数、以空格分隔的“单词”数以及行数：
+
+\begin{codebox}[cpp]
+    struct LWC {
+      int lines, words, chars;
+    };
+    LWC word_count(FILE *fp)
+    {
+      LWC r {};
+      bool in_space = true;
+      while (true) {
+        int ch = getc(fp);
+        if (ch == EOF) break;
+        r.lines += (ch == '\n');
+        r.words += (in_space && !isspace(ch));
+        r.chars += 1;
+        in_space = isspace(ch);
+      }
+      return r;
+    }
+    int main(int argc, const char **argv)
+    {
+      FILE *fp = (argc < 2) ? stdin : fopen(argv[1], "r");
+      auto [lines, words, chars] = word_count(fp);
+      printf("%8d %7d %7d\n", lines, words, chars);
+    }
+\end{codebox}
+
+（你认出来了吗？这就是命令行工具 \texttt{wc}。）
+
+这个程序引入了两个新思路（除了一个标准保证：所有 \texttt{FILE} 对象在程序退出时都会被隐式关闭，因此我们在这个例子里可以放心地省去 \texttt{fclose} 的簿记、少写几行代码）。第一个思路是标准流（stream）的概念。C 和 C++ 中共有三种标准流：\texttt{stdin}、\texttt{stdout} 和 \texttt{stderr}。在我们的字数统计程序中，我们遵循这样一条规则：如果命令行用户没有显式地告诉我们任何要读取的文件名，我们就从 \texttt{stdin}（标准输入流）读取，它通常是控制台（或者说终端或键盘—重点是，它就是坐在那里打字的那个人）的同义词。操作系统和命令行 shell 内部的各种机制可以把标准输入流重定向自其他输入；这些机制（例如在 shell 提示符下输入 \texttt{wc <myfile.\allowbreak{}txt}）远远超出了本书的范围。关于这三种标准流，要记住的主要一点是：你无需对它们调用 \texttt{fopen} 就能按名字直接使用它们；而对它们中的任何一个调用 \texttt{fclose} 永远都是错误的。
+
+我们的字数统计程序引入的第二个新思路是 \texttt{getc} 函数。函数 \texttt{getc(\allowbreak{}fp)\allowbreak{}} 从给定的 \texttt{FILE *} 读取单个字节，并返回读到的字节。如果发生错误，或者（更常见地）到达文件末尾，它会返回一个名为 \texttt{EOF} 的特殊值。\texttt{EOF} 的数值通常是 \texttt{-1}，但关于它所能保证的一点是：它和任何可能的有效字节都完全不同。正因如此，\texttt{getc(\allowbreak{}fp)\allowbreak{}} 并不会以 \texttt{char} 类型返回其值；它以 \texttt{int} 类型返回，而 \texttt{int} 大到足以容纳任何可能的 \texttt{char}，此外还足以容纳与那些 \texttt{char} 值都不同的 \texttt{EOF} 值（如果你的平台上 \texttt{char} 是有符号类型—就像在许多平台上那样—那么 \texttt{getc} 在返回之前会把读到的 \texttt{char} 转换成 \texttt{unsigned char}；这保证了如果输入文件中出现 \texttt{0x\allowbreak{}FF} 字节，它会被作为 \texttt{255} 返回，这是一个与表示 \texttt{EOF} 的 \texttt{-1} 不同的整数值）。
+
+现在，来看 \texttt{fread}/\texttt{fwrite} 与 \texttt{read}/\texttt{write} 之间的关键区别。回想一下，POSIX API 不会对输入或输出字节做任何额外缓冲（buffering）；当你调用 \texttt{read} 时，你是一路直达操作系统去取回下一块输入字节。如果 \texttt{getc(\allowbreak{}fp)\allowbreak{}} 被实现为 \texttt{fread(\allowbreak{}\&ch,\allowbreak{} 1,\allowbreak{} 1,\allowbreak{} fp)\allowbreak{}}，而 \texttt{fread(\allowbreak{}buf,\allowbreak{} 1,\allowbreak{} count,\allowbreak{} fp)\allowbreak{}} 被实现为 \texttt{read(\allowbreak{}fileno(\allowbreak{}fp)\allowbreak{},\allowbreak{} buf,\allowbreak{} count)\allowbreak{}}，那么我们的字数统计程序效率就会糟糕透顶—读取一个百万字节的文件会导致一百万次系统调用！所以，当 C 库把一个文件描述符句柄包装进一个 \texttt{FILE} 对象时，它还额外增加了一个特性：缓冲（buffer）。
+
+FILE 流可以是“无缓冲（unbuffered）”的（意味着每次 \texttt{fread} 确实都对应一次 \texttt{read}，每次 \texttt{fwrite} 都对应一次 \texttt{write}）；可以是“全缓冲（fully buffered）”，也叫“块缓冲（block buffered）”（意味着写入会被累积进一个私有缓冲区，只有当它填满时才发送给底层文件描述符，同理，读取也是从一个私有缓冲区中供应，只有当它变空时才从底层文件描述符重新填满）；也可以是“行缓冲（line-buffered）”的（意味着有一个和前一种情况一样的私有缓冲区，但写入 \texttt{'\textbackslash n'} 即使缓冲区尚未填满也会触发一次刷新（flush））。当程序启动并打开它的标准流时，\texttt{stdin} 和 \texttt{stdout} 是行缓冲的，而 \texttt{stderr} 是无缓冲的。你通过 \texttt{fopen} 自行打开的任何文件通常都是全缓冲的，不过操作系统对此也可能另有说法；例如，如果你打开的“文件”实际上是一个终端设备，它可能最终默认就是行缓冲的。
+
+在极少数情况下，如果你需要控制某个 \texttt{FILE} 流的缓冲模式，可以通过标准函数 \texttt{setvbuf} 来实现。你也可以利用 \texttt{setvbuf} 来提供自己的缓冲区，如下例所示：
+
+\begin{codebox}[cpp]
+ FILE *fp = fopen("myfile.txt", "w");
+    int fd = fileno(fp);
+    char buffer[150];
+    setvbuf(fp, buffer, _IOFBF, 150);
+      // setvbuf 成功时返回 0，失败时返回 EOF。
+    std::string AAAA(160, 'A');
+    int bytes_written = fwrite(AAAA.data(), 1, 160, fp);
+      // 这会用 150 个字节填满缓冲区，并将其刷新，
+      // 再向缓冲区写入 10 个字节。
+    assert(bytes_written == 160);
+    assert(lseek(fd, 0, SEEK_CUR) == 150);
+    assert(ftell(fp) == 160);
+\end{codebox}
+
+请注意例子最后一行里 \texttt{ftell(\allowbreak{}fp)\allowbreak{}} 与 \texttt{lseek(\allowbreak{}fd,\allowbreak{} 0,\allowbreak{} SEEK\_\allowbreak{}CUR)\allowbreak{}} 之间的差异。有 10 个字节仍然缓存在 \texttt{FILE} 的缓冲区中；因此 \texttt{FILE} 报告你的游标当前位于偏移 160 处，但实际上，底层 POSIX 文件描述符的游标仍然停在偏移 150 处，并且会一直停在那里，直到 \texttt{FILE} 的缓冲区填满并第二次被刷新（flush）—到那时底层 POSIX 文件描述符的游标会跳到偏移 300。这感觉别扭，但其实这正是我们想要的！我们希望获得“以大块方式写入底层文件描述符”所带来的效率。（注意，150 字节在现实中并不“大”。如果你完全不使用 \texttt{setvbuf}，典型的默认文件缓冲区大小会更接近 4096 字节。）
+
+在某些平台上，调用 \texttt{ftell} 会顺带导致缓冲区被刷新，因为这能让库的簿记更轻松；库不喜欢被抓到说谎。（调用 \texttt{fseek} 也很可能导致一次刷新。）然而，在其他平台上，\texttt{ftell} 甚至 \texttt{fseek} 并不总是刷新缓冲区。为了确保你的 \texttt{FILE} 流的缓冲区确实已经被刷新到底层文件，请使用 \texttt{fflush}。我们继续前面的例子如下：
+
+\begin{codebox}[cpp]
+    // 强制刷新 FILE 的缓冲区。
+    fflush(fp);
+    // 此时 fd 与 fp 对文件状态的认识一致。
+    assert(lseek(fd, 0, SEEK_CUR) == 160);
+\end{codebox}
+
+把这些放在一起，我们可以用 \texttt{<stdio.\allowbreak{}h>\allowbreak{}} API 打开、读取、写入、定位（seek）、刷新并关闭文件流，从而把“使用 POSIX API”那一节里的简单程序改写如下：
+
+\begin{codebox}[cpp]
+    #include <cassert>
+    #include <cstdio>
+    #include <string>
+    int main()
+    {
+      FILE *fpw = fopen("myfile.txt", "w");
+      FILE *fpr = fopen("myfile.txt", "r");
+      if (fpw == nullptr || fpr == nullptr)
+        return EXIT_FAILURE;
+      fwrite("hello world", 1, 11, fpw);
+      fseek(fpw, 6, SEEK_SET);
+      fwrite("neighbor", 1, 8, fpw);
+      fflush(fpw);
+      std::string buffer(14, '\0');
+      int b = fread(buffer.data(), 1, 14, fpr);
+      assert(b == 14 && buffer == "hello neighbor");
+      fclose(fpr);
+      fclose(fpw);
+    }
+\end{codebox}
+
+至此，我们对标准 \texttt{<stdio.\allowbreak{}h>\allowbreak{}} API 的缓冲能力的探索就告一段落；接下来，我们转向考察 \texttt{<stdio.\allowbreak{}h>\allowbreak{}} 是如何处理格式化（formatting）的。
+
+\subsection{使用 printf 和 snprintf 进行格式化}
+
+在格式化（formatting）阶段，我们从想要打印出来的高层数据值出发；例如，我们可能想打印出芝加哥钢琴调音师的数量，而我们的程序已经把它算成了 225。打印出三字节字符串 \texttt{"225"} 很容易；我们在前面的几节里已经解决了这个问题。格式化的任务，是让我们从数字 225（假设是一个 \texttt{int}）到达那个三字节字符串 \texttt{"225"}。
+
+打印数字时，我们有许多可能要考虑的问题：这个数字应该以 10 进制、16 进制、8 进制、2 进制还是其他进制打印？如果数字是负数，我们大概应该给它加上前缀 \texttt{-}；如果是正数，要不要加上前缀 \texttt{+}？我们要不要使用千位分隔符，如果要，是用逗号、句点还是空格？小数点又怎么办？一旦涉及浮点数，我们应当在小数点后打印多少位数字？或者，我们要不要使用科学计数法，如果要，保留多少位有效数字？
+
+此外，还有一些甚至会延伸到非数值输入的问题。打印出来的值是否应当在一个固定宽度的列中对齐？如果要，是左对齐、右对齐，还是用某种其他巧妙的方式对齐？（那么又该用哪个字符来填充那些未占用的列？）如果这个值放不进给定的列宽怎么办—是从左截断、从右截断，还是干脆溢出列的边界？
+
+类似地，当读取格式化输入（也就是解析）时，我们也要回答许多关于数值的相同问题：我们要不要千位分隔符？科学计数法？前导 \texttt{+} 号？我们期望的是哪种数值进制？甚至对于非数值：我们要不要前导空白？如果我们要读入一个“字符串（string）”类型的值，除了 \texttt{EOF} 之外，还有什么能标志这个值已经结束？
+
+标准 C 语言 API 提供了一整个格式化函数家族，它们的名字都以 \texttt{printf} 结尾，还有一个与之匹配的解析函数家族，名字都以 \texttt{scanf} 结尾。这个家族里每个函数的一个共同点在于：它接受一个可变参数列表（使用的是 C 风格的 varargs，而不是 C++ 的可变参数模板），并且在可变参数之前，有一个单独的“格式字符串（format string）”，它为每一个待格式化的参数回答了上述许多问题（但不是全部），同时也为整条消息提供了一个“形状”，库会把格式化后的参数插入其中：
+
+\begin{codebox}[cpp]
+    int tuners = 225;
+    const char *where = "Chicago";
+    printf("There are %d piano tuners in %s.\n", tuners, where);
+\end{codebox}
+
+此外还有 \texttt{fprintf(\allowbreak{}fp,\allowbreak{} "format",\allowbreak{} args...)\allowbreak{}} 可以打印到任意流（stream）（不一定是 \texttt{stdout}）；\texttt{snprintf(\allowbreak{}buf,\allowbreak{} n,\allowbreak{} "format",\allowbreak{} args...)\allowbreak{}} 可以写入一个缓冲区，我们稍后会再讨论它；以及与之匹配的一个 \texttt{vprintf}、\texttt{vfprintf} 和 \texttt{vsnprintf} 函数家族，它们在构建你自己类似 \texttt{printf} 的函数时很有用。正如你在这一章里大概已经学会预期的那样，对 C 风格格式字符串的完整论述超出了本书的范围。然而，C 风格的“格式字符串语言”即便在不直接脱胎于 C 的语言中也广泛使用；例如，在 Python 2 中，你可以这样写：
+
+\begin{codebox}[cpp]
+    tuners = 225
+    where = "Chicago"
+    print "There are %d piano tuners in %s." % (tuners, where)
+\end{codebox}
+
+然而，C 里发生的事和 Python 里发生的事之间有着重大区别！最大的区别在于 Python 是动态类型的，所以如果你写 \texttt{"\%s tuners" \% (\allowbreak{}tuners)\allowbreak{}}，它仍然能正确地完成工作。而对于 C 风格的可变参数列表，\texttt{tuners} 的原始类型已经丢失；如果你把期望 \texttt{const char *} 参数的 \texttt{"\%s"} 格式说明符用在一个 \texttt{int} 类型的参数上，轻则得到一个友好的编译器警告，重则导致未定义行为（UB）。也就是说，当你使用 \texttt{<stdio.\allowbreak{}h>\allowbreak{}} 进行格式化
+
+就函数而言，格式字符串身兼两职：它不仅要编码如何格式化每个数据值，还要编码每个数据值的类型——如果你把其中某个类型搞错了，比如本想用 \texttt{"\%d"} 却写成了 \texttt{"\%s"}，程序就会出现 bug。所幸如今所有主流编译器都能检测并诊断出这类不匹配问题，只要你的格式字符串是直接传给 \texttt{printf}，或者传给一个用（非标准的）\texttt{format} 属性标注过的函数——我们稍后会在代码示例中看到。
+
+遗憾的是，当你在处理依赖平台的类型的 typedef 时，这些诊断并不可靠；例如，某些 64 位编译器不会诊断出用 \texttt{"\%llu"} 格式说明符去格式化一个 \texttt{size\_\allowbreak{}t} 值的问题，即便正确可移植的说明符本应是 \texttt{"\%zu"}。
+
+另一个区别在于：在 C 语言里，\texttt{printf} 实际上是直接写入标准输出流（standard output stream）\texttt{stdout}，数据的格式化与输出字节的缓冲是交错进行的。在 Python 中，\texttt{"There are \%d piano tuners in \%s." \% (\allowbreak{}tuners,\allowbreak{} where)\allowbreak{}} 这种写法实际上是一个 \texttt{str}（字符串）类型的表达式；全部格式化都在那里当场完成，生成一个字节都已正确的单一字符串值，而我们甚至还没决定要不要把这个字符串打印到 \texttt{stdout}。
+
+如果要使用 \texttt{<stdio.\allowbreak{}h>\allowbreak{}} 接口生成一个格式化后的字符串，我们会用 \texttt{snprintf}：
+
+\begin{codebox}[cpp]
+    char buf[13];
+    int needed = snprintf(
+      buf, sizeof buf,
+      "There are %d piano tuners in %s", tuners, where
+    );
+    assert(needed == 37);
+    assert(std::string_view(buf) == "There are 22");
+\end{codebox}
+
+注意，\texttt{snprintf} 总会对其缓冲区做空字符（null）终止，哪怕这意味着无法把整条消息写进去；并且它会返回它本想写入的消息的 \texttt{strlen}（长度）。要格式化任意长的消息，一个常见的惯用法是先用 \texttt{nullptr} 调用一次 \texttt{snprintf}，探明消息的最终长度；然后再用一个该长度的缓冲区调用第二次：
+
+\begin{codebox}[cpp]
+    template<class... Args>
+    std::string format(const char *fmt, const Args&... args)
+    {
+      int needed = snprintf(nullptr, 0, fmt, args...);
+      std::string s(needed + 1, '\0');
+      snprintf(s.data(), s.size(), fmt, args...);
+      s.pop_back(); // 移除写入的 '\0'
+      return s;
+    }
+    void test()
+    {
+      std::string s = format("There are %d piano tuners in %s", tuners,
+where);
+      assert(s == "There are 225 piano tuners in Chicago");
+    }
+\end{codebox}
+
+上面这个 \texttt{format} 的实现使用了一个可变参数函数模板，这往往会生成大量相似的代码副本。一个更高效（就编译时间和代码膨胀而言）的实现方式是：使用单个（非模板）函数，配上 C 风格的可变参数列表，并用 \texttt{vsnprintf} 来做格式化。遗憾的是，对 \texttt{va\_\allowbreak{}list} 和 \texttt{vsnprintf} 的进一步讨论远远超出了本书的范围。
+
+\begin{codebox}[cpp]
+    std::string better_format(const char *fmt, ...)
+    {
+      va_list ap;
+      va_start(ap, fmt);
+      int needed = vsnprintf(nullptr, 0, fmt, ap);
+      va_end(ap);
+      std::string s(needed + 1, '\0');
+      va_start(ap, fmt);
+      vsnprintf(s.data(), s.size(), fmt, ap);
+      va_end(ap);
+      s.pop_back(); // 移除写入的 '\0'
+      return s;
+    }
+\end{codebox}
+
+关于 \texttt{scanf} 格式字符串的讨论，我们留到本章的「食谱」部分再进行。要全面了解 \texttt{scanf}，请参阅 \texttt{cppreference.\allowbreak{}com} 或某本讲解 C 标准库的书。
+
+既然已经见识了缓冲与格式化（至少是输出格式化）在 \texttt{<stdio.\allowbreak{}h>\allowbreak{}} 体系下是如何运作的，我们现在转向标准的 C++ \texttt{<iostream>\allowbreak{}} 接口。
+
+\section{经典的 I/O 流层次结构}
+
+\texttt{<stdio.\allowbreak{}h>\allowbreak{}} 接口至少存在三个问题。第一，它的格式化功能远算不上类型安全。第二，它的缓冲功能被别扭地拆成了「缓冲到文件流」(\texttt{FILE *} 和 \texttt{fprintf}) 与「缓冲到字符缓冲区（buffer）」(\texttt{snprintf}) 两部分。（严格说，GNU 的 C 库提供了 \texttt{fopencookie} 来构造一个可缓冲到任意目标的 \texttt{FILE *}；但这相当冷门，且极其非标准。）第三，它没有任何简便方式来扩展对用户自定义类的格式化功能；我连打印一个 \texttt{std::\allowbreak{}string} 都做不到，更别提 \texttt{my::\allowbreak{}Widget} 了！
+
+在 20 世纪 80 年代中期 C++ 被开发出来时，设计者们感到需要一套类型安全、可组合、可扩展的 I/O 库。于是诞生了被称为「iostreams」（I/O 流），或者干脆就叫「C++ 流（stream）」的特性（不要把它和我们刚刚讲完的 \texttt{<stdio.\allowbreak{}h>\allowbreak{}} 流混淆）。iostreams 的基本架构自 80 年代中期以来从未改变，这使得它与标准库中其他任何东西都大不相同，唯一的例外（无意双关）大概就是 \texttt{std::\allowbreak{}exception} 体系了。
+
+C++ 的 iostreams 库由两大块组成：负责格式化的流（stream），以及负责缓冲的 \texttt{streambuf}。绝大多数 C++ 程序员永远不会直接接触 \texttt{streambuf}，只会接触流。不过，我们还是快速解释一下 \texttt{streambuf} 是什么。
+
+\texttt{streambuf} 与 C 接口中的 \texttt{FILE} 非常相似。它告诉程序：输入（以原始字节的形式）应该来自哪里，输出又应该去向哪里。它还会维持一个字节缓冲区，以减少往返这些目标的次数（比如 POSIX 的 \texttt{read} 和 \texttt{write} 函数）。为了让不同种类的 \texttt{streambuf} 拥有相同的接口——还记得我承诺过本章会看到古典多态（classical polymorphism）吗？我们终于讲到它了！
+
+\texttt{std::\allowbreak{}streambuf}（它实际上只是 \texttt{std::\allowbreak{}basic\_\allowbreak{}streambuf<\allowbreak{}char,\allowbreak{}} \texttt{char\_\allowbreak{}traits<char>{}>} 的别名，不过我们就不把事情复杂化了）是一个继承体系的基类，其派生类包括 \texttt{std::\allowbreak{}filebuf} 和 \texttt{std::\allowbreak{}stringbuf}。\texttt{streambuf} 接口提供的虚方法多得列不完，但其中包括 \texttt{sb.\allowbreak{}setbuf(\allowbreak{}buf,\allowbreak{} n)\allowbreak{}}（对应于 \texttt{setvbuf(\allowbreak{}fp,\allowbreak{} buf,\allowbreak{} \_\allowbreak{}IO\_\allowbreak{}FBF,\allowbreak{} n)\allowbreak{}}）、\texttt{sb.\allowbreak{}overflow(\allowbreak{})\allowbreak{}}（对应于 \texttt{fflush(\allowbreak{}fp)\allowbreak{}}），以及 \texttt{sb.\allowbreak{}seekpos(\allowbreak{}offset,\allowbreak{} whence)\allowbreak{}}（对应于 \texttt{fseek(\allowbreak{}fp,\allowbreak{} offset,\allowbreak{} whence)\allowbreak{}}）。我这里说的「对应」，当然是指对应于 \texttt{std::\allowbreak{}filebuf}。这些方法在 \texttt{std::\allowbreak{}stringbuf} 上被调用时，行为是实现定义的（而实践中，是不可移植的）。
+
+任何 \texttt{streambuf} 派生类还必须支持一些基本操作来与自己的缓冲区交互（放入或取出字节）。不过，这些基本操作并不是给普通程序员用的；它们是给那个包裹了这个 \texttt{streambuf}、并提供了更友好的程序员接口的流对象用的。
+
+一个 C++ 流封装了 \texttt{streambuf}，并限制了你能对它执行的操作集合。例如，注意 \texttt{streambuf} 没有任何「访问模式（access mode）」的概念：你把字节放进去（「写」）和把字节取出来（「读」）一样容易。然而，当我们把这个 \texttt{streambuf} 用 \texttt{std::\allowbreak{}ostream} 包起来之后，这个 \texttt{ostream} 对象只暴露一个 \texttt{write} 方法；\texttt{ostream} 上并没有 \texttt{read} 方法。
+
+下面的图展示了 C++17 中流与 \texttt{streambuf} 的类层次结构，定义于标准的 \texttt{<iostream>\allowbreak{}}、\texttt{<fstream>\allowbreak{}}，以及/或者 \texttt{<sstream>\allowbreak{}} 头文件中。\texttt{streambuf}、\texttt{istream}、\texttt{ostream} 和 \texttt{iostream} 这几个基类是「准抽象（abstract-ish）」的：它们虽然没有纯虚方法，但只包含一个从 \texttt{ios} 继承来的 \texttt{streambuf*} 成员变量。为了防止你不小心构造出这些「准抽象」类型的实例，标准库把它们的构造函数定义成了 \texttt{protected}。
+
+反过来说，那些名字里含有 \texttt{stringstream} 和 \texttt{fstream} 的类，实际上分别包含了 \texttt{stringbuf} 和 \texttt{filebuf} 的实例，它们的构造函数会把继承来的 \texttt{streambuf*} 成员初始化为指向这些实例。本章稍后的「解决操纵符（manipulator）粘滞问题（sticky-manipulator problem）」一节里，我们会看到如何构造一个 \texttt{ostream} 对象，其 \texttt{streambuf*} 成员指向一个并不归 \texttt{*this} 所有的 \texttt{streambuf} 实例：
+
+\myGraphic{0.9}{images/fig_p282_1.png}{}
+
+这些流类暴露出一堆五花八门的方法，大体上精确对应于我们前面见过两次的函数。具体来说，\texttt{fstream} 类包裹了 \texttt{filebuf}，二者合起来表现得非常像 C 接口里的 \texttt{FILE}：\texttt{filebuf} 有一个「游标（cursor）」，你可以用 \texttt{fstream} 的 \texttt{seekp} 方法来操纵它。（\texttt{seekp} 这个名字继承自 \texttt{ostream} 类。在 \texttt{ifstream} 上，这个方法叫 \texttt{seekg}：「g」代表「get」，「p」代表「put」。在一个完整的 \texttt{fstream} 上，你可以随便用 \texttt{seekg} 或 \texttt{seekp}；那种情况下它们是同义词。一如既往，请记住这里其实只有一个游标，即便 iostreams 接口在这种情况下给这个游标起了两个不同的名字！）
+
+\texttt{fstream} 的构造函数接受一个由 \texttt{std::\allowbreak{}ios\_\allowbreak{}base::\allowbreak{}in}、\texttt{out}、\texttt{app}（「追加模式（append mode）」）、\texttt{trunc}、\texttt{ate} 和 \texttt{binary} 等标志值按位或（or）组合而成的位掩码；不过，正如我们在 \texttt{fopen} 上看到的那样，这些标志到底是如何翻译成 POSIX 的 \texttt{open} 标志的，几乎没有什么条理可言：
+
+\texttt{in}：等价于 \texttt{fopen(\allowbreak{}"r")\allowbreak{}}，或者 POSIX 的 \texttt{O\_\allowbreak{}RDONLY}。
+
+\texttt{out}：等价于 \texttt{fopen(\allowbreak{}"w")\allowbreak{}}，或者 POSIX 的 \texttt{O\_\allowbreak{}WRONLY | O\_\allowbreak{}CREAT |} \texttt{O\_\allowbreak{}TRUNC}。（注意，单独一个 \texttt{out} 就意味着 \texttt{O\_\allowbreak{}TRUNC}，即便没有传 \texttt{trunc}！）
+
+\texttt{in|out}：等价于 \texttt{fopen(\allowbreak{}"r+")\allowbreak{}}，或者 POSIX 的 \texttt{O\_\allowbreak{}RDWR | O\_\allowbreak{}CREAT}。
+
+\texttt{in|out|trunc}：等价于 \texttt{fopen(\allowbreak{}"w+")\allowbreak{}}，或者 POSIX 的 \texttt{O\_\allowbreak{}RDWR |} \texttt{O\_\allowbreak{}CREAT | O\_\allowbreak{}TRUNC}。（注意，这种情况下 iostreams 的语法比 \texttt{fopen} 的语法更有道理。）
+
+\begin{codebox}[cpp]
+out|app: This is equivalent to fopen("a"), or POSIX O_WRONLY | O_CREAT |
+O_APPEND.
+in|out|app: This is equivalent to fopen("a+"), or POSIX O_RDWR | O_CREAT
+| O_APPEND.
+\end{codebox}
+
+往位掩码里加 \texttt{binary}，就跟往 \texttt{fopen} 里加 \texttt{"b"} 一样。加上 \texttt{ate} 则会让流一开始就定位到文件末尾，即便文件并不是以 \texttt{O\_\allowbreak{}APPEND} 模式打开的。
+
+传入一组不被支持的标志（例如 \texttt{app|trunc}）仍然会构造出这个流对象，但会把它置于「失败（fail）」状态，我们稍后会讨论。一般来说，你应该把你自己的类设计成：构造函数用异常来表达失败。这条规则在这里被打破，一方面是因为这套类层次结构几乎是四十年前设计的，另一方面也因为我们反正需要一个「失败」机制，来处理那个相对很可能发生的情况——即指定名字的文件打不开（比如它根本不存在）。
+
+把这些串起来，我们可以用 \texttt{<fstream>\allowbreak{}} 接口把「使用 POSIX 接口」那一节里的简单程序改写如下，用其来打开、读取、写入、定位、刷新并关闭文件流：
+
+\begin{codebox}[cpp]
+    #include <cassert>
+    #include <fstream>
+    #include <string>
+    int main()
+    {
+      std::fstream fsw("myfile.txt", std::ios_base::out);
+      std::fstream fsr("myfile.txt", std::ios_base::in);
+      if (fsw.fail() || fsr.fail())
+        return EXIT_FAILURE;
+      fsw.write("hello world", 11);
+      fsw.seekp(6, std::ios_base::beg);
+      fsw.write("neighbor", 8);
+      fsw.flush();
+      std::string buffer(14, '\0');
+      fsr.read(buffer.data(), 14);
+      assert(fsr.gcount() == 14 && buffer == "hello neighbor");
+    }
+\end{codebox}
+
+前面这个例子里有个怪异之处：\texttt{fsr.\allowbreak{}read(\allowbreak{}buffer.\allowbreak{}data(\allowbreak{})\allowbreak{},\allowbreak{} 14)\allowbreak{}} 根本不返回读了多少字节的指示！相反，它把读取的字节数存在一个成员变量里，你必须自己通过访问函数 \texttt{fsr.\allowbreak{}gcount(\allowbreak{})\allowbreak{}} 去取这个数。而 \texttt{write} 方法甚至根本不让你知道写了多少字节。这看起来像是个问题；但总的来说，如果一个流在读取或写入时遇到错误，这个错误往往本质上就是「不可恢复」的——一方面因为实际从底层文件描述符读出或写入的字节数本就不确定，另一方面也因为应用程序和硬件之间隔着好几层缓冲区。
+
+一旦遇到读取或写入错误，我们基本只能放弃去理解那个流的状态——唯一的特例是输入时的「文件结束（end of file）」。如果我们本打算读 100 字节，结果却撞上了「文件结束」，那问一句「我们成功读到了多少字节？」是有意义的。可是，如果我们本打算写 100 字节，结果却收到一个网络错误或磁盘错误，那问「我们成功写了多少字节？」就没那么有意义了。我们根本无从判断那些「已写入」的字节到底有没有抵达它们的目的地。
+
+如果我们要了 100 字节，却在撞上文件结束之前只读了 99（或更少）字节，那么 \texttt{fs.\allowbreak{}gcount(\allowbreak{})\allowbreak{}} 不仅会报告一个小于 100 的数，而且 \texttt{eof} 指示符也会在流对象的状态上被置位。你可以用下列访问函数向任意流询问它的当前状态：\texttt{fs.\allowbreak{}good(\allowbreak{})\allowbreak{}}（一切正常吗？）、\texttt{fs.\allowbreak{}bad(\allowbreak{})\allowbreak{}}（底层流遇到了不可恢复的错误吗？）、\texttt{fs.\allowbreak{}eof(\allowbreak{})\allowbreak{}}（上一次输入操作撞上文件结束了吗？），以及 \texttt{fs.\allowbreak{}fail(\allowbreak{})\allowbreak{}}（上一次操作因任何原因「失败（fail）」了吗？）。注意，\texttt{fs.\allowbreak{}good(\allowbreak{})\allowbreak{}} 并非 \texttt{fs.\allowbreak{}bad(\allowbreak{})\allowbreak{}} 的反面；一个流完全可能处于这样一种状态——比如 \texttt{eof}——也就是 \texttt{!good(\allowbreak{})\allowbreak{}} \texttt{\&\& !bad(\allowbreak{})\allowbreak{}}。
+
+我们现在已经看到了用 \texttt{fstream} 流做缓冲式输入输出最简单、最原始的方式。然而，如果你就是这样用 C++ 流的，那你还不如直接用 \texttt{FILE *}，甚至直接用 POSIX 接口。C++ 流那「新的、（可以说）改进过的」东西，在于它处理格式化的方式。
+
+\subsection{流式输出与操纵符}
+
+回想一下，用 \texttt{printf} 时，参数的原始类型会丢失，因此格式字符串必须身兼两职：既要编码如何格式化每个数据值，又要编码每个数据值的类型。而当我们使用 iostreams 时，这个缺点就消失了。用 iostreams 做格式化长这样：
+
+\begin{codebox}[cpp]
+    int tuners = 225;
+    const char *where = "Chicago";
+    std::cout << "There are " << tuners << " piano tuners in " << where <<
+"\n";
+\end{codebox}
+
+这里，\texttt{std::\allowbreak{}cout} 是一个 \texttt{ostream} 类型的全局变量，对应于 \texttt{stdout} 或 POSIX 的文件描述符 1。还有 \texttt{std::\allowbreak{}cerr}，对应于无缓冲的 \texttt{stderr} 或 POSIX 的文件描述符 2；\texttt{std::\allowbreak{}clog}，同样对应于文件描述符 2，但这次是完全缓冲的；以及 \texttt{std::\allowbreak{}cin}，一个 \texttt{istream} 类型的全局变量，对应于 \texttt{stdin} 或 POSIX 的文件描述符 0。
+
+标准的 \texttt{ostream} 类——再说一遍，它其实就是 \texttt{basic\_\allowbreak{}ostream<\allowbreak{}char,\allowbreak{}} \texttt{char\_\allowbreak{}traits<char>{}>}，不过我们暂且忽略这点——拥有许许多多非成员函数版的 \texttt{operator<<} 重载。例如，下面就是最简单的一个 \texttt{operator<<} 重载：
+
+\begin{codebox}[cpp]
+    namespace std {
+      ostream& operator<< (ostream& os, const string& s)
+      {
+        os.write(s.data(), s.size());
+        return os;
+      }
+    } // namespace std
+\end{codebox}
+
+由于这个函数返回它所收到的同一个 \texttt{os} 的引用，我们就能把 \texttt{<<} 运算符串起来，就像前面的例子那样。这使得我们得以格式化复杂的消息。
+
+遗憾的是，我们那个简单的 \texttt{operator<<(\allowbreak{}ostream\&,\allowbreak{} const string\&)\allowbreak{}} 远不足以满足「用 \texttt{printf} 和 \texttt{snprintf} 做格式化」一节里描述的种种格式化需求。假设我们想把这个左对齐的字符串打印在宽度为 7 的一栏里，该怎么做？\texttt{operator<<} 的语法不允许我们传入任何额外的「格式化选项」参数，这意味着，除非格式化选项被携带在 \texttt{<<} 的左侧（也就是 \texttt{ostream} 对象本身）或右侧（即待格式化的对象）之中，否则我们根本做不了复杂格式化。
+
+标准库把这两种方式混着用。一般来说，那些在 20 世纪 80 和 90 年代首次出现的功能，把格式化选项放在 \texttt{ostream} 对象自身里；而后来才加进去的东西——因为往 \texttt{ostream} 里加新的成员变量会破坏二进制兼容性——就只能将就着去摆弄 \texttt{<<} 运算符的右侧。让我们以「栏内对齐」为例看看 80 年代的方式。这是我们的 \texttt{operator<<} 针对 \texttt{std::\allowbreak{}string} 的一个功能稍更完备的版本：
+
+\begin{codebox}[cpp]
+    void pad(std::ostream& os, size_t from, size_t to)
+    {
+      char ch = os.fill();
+      for (auto i = from; i < to; ++i) {
+        os.write(&ch, 1);
+      }
+    }
+    std::ostream& operator<< (std::ostream& os, const std::string& s)
+    {
+      auto column_width = os.width();
+      auto padding = os.flags() & std::ios_base::adjustfield;
+      if (padding == std::ios_base::right) {
+        pad(os, s.size(), column_width);
+      }
+      os.write(s.data(), s.size());
+      if (padding == std::ios_base::left) {
+        pad(os, s.size(), column_width);
+      }
+      os.width(0); // 把「栏宽」重置为 0
+      return os;
+    }
+\end{codebox}
+
+这里，\texttt{os.\allowbreak{}width(\allowbreak{})\allowbreak{}}、\texttt{os.\allowbreak{}flags(\allowbreak{})\allowbreak{}} 和 \texttt{os.\allowbreak{}fill(\allowbreak{})\allowbreak{}} 都是 \texttt{std::\allowbreak{}ostream} 类的内建成员。还有针对浮点数的 \texttt{os.\allowbreak{}precision(\allowbreak{})\allowbreak{}}，而 \texttt{os.\allowbreak{}flags(\allowbreak{})\allowbreak{}} 也能指示某些数值类型的十进制、十六进制或八进制输出。你可以通过调用 \texttt{os.\allowbreak{}width(\allowbreak{}n)\allowbreak{}} 来设置一个流上的「栏宽（column width）」状态；然而，如果每次输出前都得写上一句 \texttt{std::\allowbreak{}cout.\allowbreak{}width(\allowbreak{}10)\allowbreak{}}、\texttt{std::\allowbreak{}cout.\allowbreak{}setfill(\allowbreak{}'.')\allowbreak{}} 等等来搭建环境，那会相当痛苦（而且蠢！）
+
+操作。因此，I/O 流（iostreams）库提供了一些标准的流操纵符（manipulator），可以用一种更“流畅”的方式来达到这些成员函数的效果。这些操纵符通常定义在标准头文件 \texttt{<iomanip>\allowbreak{}} 中，而非 \texttt{<iostream>\allowbreak{}} 自身。例如，下面是一个用来设置流列宽的操纵符：
+
+\begin{codebox}[cpp]
+    struct WidthSetter { int n; };
+    auto& operator<< (std::ostream& os, WidthSetter w)
+    {
+      os.width(w.n);
+      return os;
+    }
+    auto setw(int n) { return WidthSetter{n}; }
+\end{codebox}
+
+下面还有两个标准操纵符，其中一个你现在应该已经非常熟悉了。\texttt{std::\allowbreak{}endl} 操纵符会向输出流写入一个换行符，然后刷新它：
+
+\begin{codebox}[cpp]
+    using Manip = std::ostream& (*)(std::ostream&);
+    auto& operator<< (std::ostream& os, Manip f) {
+      return f(os);
+    }
+    std::ostream& flush(std::ostream& os) {
+      return os.flush();
+    }
+    std::ostream& endl(std::ostream& os) {
+      return os << '\n' << flush;
+    }
+\end{codebox}
+
+一旦我们拥有了 \texttt{std::\allowbreak{}setw}；它的伙伴 \texttt{std::\allowbreak{}left}、\texttt{std::\allowbreak{}right}、\texttt{std::\allowbreak{}hex}、\texttt{std::\allowbreak{}dec}、\texttt{std::\allowbreak{}oct}、\texttt{std::\allowbreak{}setfill} 以及 \texttt{std::\allowbreak{}precision}；还有其他所有——我是说，一旦我们拥有所有这些操纵符——，就能写出看起来几乎自然、尽管极其啰嗦的 I/O 流代码。比较下面这两段 \texttt{<stdio.\allowbreak{}h>\allowbreak{}} 与 \texttt{<iostream>\allowbreak{}} 代码片段：
+
+\begin{codebox}[cpp]
+    printf("%-10s.%6x\n", where, tuners);
+      // "Chicago . e1"
+    std::cout << std::setw(8) << std::left << where << "."
+              << std::setw(4) << std::right << std::hex
+              << tuners << "\n";
+      // "Chicago . e1"
+\end{codebox}
+
+请记住，每次使用这些操纵符之一，我们都在命令式地改变流对象自身的状态；这种效果可能比当前这条输出语句存在得更久。例如，我们前面的代码片段可能会这样继续：
+
+\begin{codebox}[cpp]
+    printf("%d\n", 42); // "42"
+    std::cout << 42 << "\n"; // "2a" —— 糟糕！
+\end{codebox}
+
+\texttt{std::\allowbreak{}hex} 操纵符在上例中把这个流的模式设成了“十六进制输出数字”，而此后没有任何东西把它设回“默认”的十进制模式。于是，我们无意间让程序后面所有的输出也都变成了十六进制！这是 I/O 流库（也是一般有状态、命令式编程）的一大劣势。
+
+\subsection{流与包装器}
+
+\texttt{std::\allowbreak{}ios\_\allowbreak{}base} 提供的参数（\texttt{left}、\texttt{right}、\texttt{hex}、\texttt{width}、\texttt{precision} 等等）是一组封闭的集合——这组集合定义于 20 世纪 80 年代中期，此后基本没有变动。因为每个操纵符都会修改流状态中的这些参数之一，所以操纵符的集合本质上也是封闭的。现代的做法是，要影响某个数据值的格式化，就把它包进一个包装器里。例如，假设我们已经写好了一个用于在数据文件中给值加引号的泛型算法：
+
+\begin{codebox}[cpp]
+    template<class InputIt, class OutputIt>
+    OutputIt do_quote(InputIt begin, InputIt end,
+      OutputIt dest)
+    {
+      *dest++ = '"';
+      while (begin != end) {
+        auto ch = *begin++;
+        if (ch == '"') {
+            *dest++ = '\\';
+        }
+        *dest++ = ch;
+      }
+      *dest++ = '"';
+      return dest;
+    }
+\end{codebox}
+
+（这个算法并非标准库的一部分。）有了这个算法，我们就能轻松构造一个包装器类，其中该包装器类的 \texttt{operator<<} 会调用下面的算法：
+
+\begin{codebox}[cpp]
+    struct quoted {
+      std::string_view m_view;
+      quoted(const char *s) : m_view(s) {}
+      quoted(const std::string& s) : m_view(s) {}
+    };
+    std::ostream& operator<< (std::ostream& os, const quoted& q)
+    {
+      do_quote(
+        q.m_view.begin(),
+        q.m_view.end(),
+        std::ostreambuf_iterator<char>(os)
+      );
+      return os;
+    }
+\end{codebox}
+
+（\texttt{std::\allowbreak{}ostreambuf\_\allowbreak{}iterator<\allowbreak{}char>\allowbreak{}} 类型是标准库的一部分；它来自 \texttt{<iterator>\allowbreak{}} 头文件。我们会在本章后面见到它的伙伴 \texttt{istream\_\allowbreak{}iterator}。）那么，有了这个包装器类，我们就能写出看起来相当合理、向输出流打印带引号值的代码：
+
+\begin{codebox}[cpp]
+    std::cout << quoted("I said \"hello\".");
+\end{codebox}
+
+我们刚刚发明的包装器刻意与标准库 \texttt{<iomanip>\allowbreak{}} 头文件中的 \texttt{std::\allowbreak{}quoted} 包装器函数相似。主要区别在于，\texttt{std::\allowbreak{}quoted} 不用基于迭代器的算法来产生输出；它先把整个输出构造成一个局部的 \texttt{std::\allowbreak{}string} 变量，然后用 \texttt{os << str} 一次性把它打印出来。这意味着 \texttt{std::\allowbreak{}quoted} 不是分配器感知的（参见第 8 章「分配器」），因此不适合禁止堆分配的环境。
+
+尽管本例中的细节可能有些粗糙，但使用包装器函数或类来调整某个数据值格式化的基本思路是很好的。你能在 Boost.Format 这类库中看到它被发挥到极致，其中下面这样的语法是合法的：
+
+\begin{codebox}[cpp]
+    std::cout << boost::format("There are %d piano tuners in %s.") % tuners
+    % where
+              << std::endl;
+\end{codebox}
+
+应当优先使用描述自包含格式化操作的包装器，而不是操纵符——操纵符会“粘滞地”修改流的状态。在上面的代码中，我们看到一个放错位置的 \texttt{std::\allowbreak{}hex} 会给所有“下游”对象带来诅咒。现在，我们来看看解决这个问题的两种方法——以及取而代之冒出来的两个新问题！
+
+\subsection{解决操纵符粘滞问题}
+
+我们的“粘滞 \texttt{std::\allowbreak{}hex}”问题可以通过在每次复杂输出操作前后保存并恢复 \texttt{ostream} 的状态来解决，也可以在每次想要输出时创建一个全新的 \texttt{ostream}。前者的一个例子如下：
+
+\begin{codebox}[cpp]
+    void test() {
+      std::ios old_state(nullptr);
+      old_state.copyfmt(std::cout);
+        std::cout << std::hex << 225; // "e1"
+      std::cout.copyfmt(old_state);
+      std::cout << 42; // "42"
+    }
+\end{codebox}
+
+后者的一个例子如下：
+
+\begin{codebox}[cpp]
+    void test() {
+      std::ostream os(std::cout.rdbuf());
+      os << std::hex << 225; // "e1"
+      std::cout << 42; // "42"
+    }
+\end{codebox}
+
+注意 I/O 流库把“streambuf”的概念与“stream”的概念分离开来是多么方便；在前面的例子中，我们只需取出它的 streambuf：\texttt{std::\allowbreak{}cout.\allowbreak{}rdbuf(\allowbreak{})\allowbreak{}}，就能把一个流所有与格式化相关的字段剥离掉，然后在这个相同的 streambuf 之上叠加上一个全新的流（带有它自己与格式化相关的字段）。
+
+然而，I/O 流格式化还有另一个重大劣势。我们预期消息的每一片段，一旦执行到其对应的 \texttt{operator<<} 就会“急切地”输出——或者，如果你愿意，每一片段只有执行到其对应的 \texttt{operator<<} 时才会“懒惰地”被计算——于是就有了下面这段代码：
+
+\begin{codebox}[cpp]
+    void test() {
+      try {
+        std::cout << "There are "
+                  << computation_that_may_throw()
+                  << "piano tuners here.\n";
+      } catch (...) {
+        std::cout << "An exception was thrown";
+      }
+    }
+\end{codebox}
+
+对于上面这段代码，我们会看到输出 \texttt{There are An exception was thrown}。
+
+此外，I/O 流格式化对国际化（“i18n”）极为不友好，因为整体消息的“形态”从未出现在源代码里。我们没有一个代表完整语义的单一字符串字面量 \texttt{"There are \%d piano tuners here.\textbackslash n"}（它可以由人工翻译并存储在外面的翻译消息文件中）；取而代之的是两个句子片段：\texttt{"There are "} 和 \texttt{"piano tuners here.\textbackslash n"}，两者都无法被单独翻译。
+
+基于所有这些原因，我强烈不建议你试图把 I/O 流作为代码库的基础。使用 \texttt{<stdio.\allowbreak{}h>\allowbreak{}} 或像 \texttt{fmt} 这样的第三方库来做格式化更为可取。Boost.Format 也是一种可能，尽管与前两者相比，它往往编译时间很长、运行时性能很差。如果你发现自己每周输入 \texttt{<<}、\texttt{std::\allowbreak{}hex} 或 \texttt{os.\allowbreak{}rdbuf(\allowbreak{})\allowbreak{}} 超过一两次，那你就是哪里做错了。
+
+不过，I/O 流库仍然有一些可用、甚至有用的特性！我们来看看其中之一。
+
+\subsection{使用 ostringstream 进行格式化}
+
+到目前为止，我们主要讨论的是 \texttt{fstream}，它大致对应于 C API 中的 \texttt{fprintf} 和 \texttt{vfprintf} 格式化函数。还有 \texttt{stringstream}，它对应于 \texttt{snprintf} 和 \texttt{vsnprintf}。
+
+一个 \texttt{ostringstream} 和 \texttt{ostream} 一样，暴露出所有常用的 \texttt{operator<<} 功能；然而，它的背后是 \texttt{stringbuf}，它不写入文件描述符，而是写入一个可调整大小的字符缓冲区——实际上也就是 \texttt{std::\allowbreak{}string}！你可以用 \texttt{oss.\allowbreak{}str(\allowbreak{})\allowbreak{}} 方法获取这个字符串的副本供自己使用。由此就引出了下面这种惯用法，例如把任意类型 \texttt{T} 的对象“字符串化”：
+
+\begin{codebox}[cpp]
+    template<class T>
+    std::string to_string(T&& t)
+    {
+      std::ostringstream oss;
+      oss << std::forward<T>(t);
+      return oss.str();
+    }
+\end{codebox}
+
+在 C++17 中，你甚至可以设想一个多参数的 \texttt{to\_\allowbreak{}string} 版本：
+
+\begin{codebox}[cpp]
+    template<class... Ts>
+    std::string to_string(Ts&&... ts)
+    {
+      std::ostringstream oss;
+      (oss << ... << std::forward<Ts>(ts));
+      return oss.str();
+    }
+\end{codebox}
+
+有了这个版本，像 \texttt{to\_\allowbreak{}string(\allowbreak{}a,\allowbreak{} " ",\allowbreak{} b)\allowbreak{}} 或 \texttt{to\_\allowbreak{}string(\allowbreak{}std::\allowbreak{}hex,\allowbreak{} 42)\allowbreak{}} 这样的调用就会具有恰当的语义。
+
+\subsection{关于区域设置的一点说明}
+
+无论何时，只要使用 \texttt{printf} 或 \texttt{ostream} 做字符串格式化（或字符串解析），都仍有一个隐蔽的陷阱需要警惕。这个陷阱就是区域设置（locale）。对区域设置的完整论述超出了本书的范围；不过简而言之，区域设置是“用户环境中依赖于语言和文化习惯的那一部分”。区域设置信息通过操作系统以编程方式暴露出来，使得单个程序能够根据当前用户偏好的区域设置调整其行为，例如控制“á”是否被视为字母字符、一周是从周日还是周一开始、日期打印为“23-01-2017”还是“01-23-2017”、以及浮点数打印为“1234.56”还是“1.234,56”。现在，一位来自 21 世纪的程序员看到所有这些例子，可能会说：“这太疯狂了！你的意思是，这些东西没有一个是被标准规定的？这情形看起来必然会导致微妙而痛苦的 bug！”——而你是对的！
+
+\begin{codebox}[cpp]
+    std::setlocale(LC_ALL, "C.UTF-8");
+    std::locale::global(std::locale("C.UTF-8"));
+    auto json = to_string('[', 3.14, ']');
+    assert(json == "[3.14]"); // 成功！
+    std::setlocale(LC_ALL, "en_DK.UTF-8");
+    std::locale::global(std::locale("en_DK.UTF-8"));
+    json = to_string('[', 3.14, ']');
+    assert(json == "[3,14]"); // 无声的、彻底的失败！
+\end{codebox}
+
+通过将全局区域设置改为 \texttt{"en\_\allowbreak{}DK.\allowbreak{}UTF-8"}，我们让所有 JSON 打印都不再工作了。可怜的用户若试图在 \texttt{"C.\allowbreak{}UTF-8"} 之外的任何区域设置下运行 Web 服务器或数据库，就只能自尝苦果了！
+
+除了区域设置相关编程在正确性上的代价，我们还必须面对性能上的代价。请注意，“当前区域设置”是一个全局变量，这意味着对它的每次访问都必须由原子访问、或者——更糟——一把全局互斥锁来保护。而且，每次调用 \texttt{snprintf} 或 \texttt{operator<<(\allowbreak{}ostream\&,\allowbreak{} double)\allowbreak{}} 都必须访问当前区域设置。这是一个可怕的性能代价，在某些场景下，它甚至能成为多线程代码中的性能瓶颈。
+
+作为应用程序员，对于复杂度超过一定水平的应用，你应该养成把 \texttt{std::\allowbreak{}locale::\allowbreak{}global(\allowbreak{}std::\allowbreak{}locale(\allowbreak{}"C")\allowbreak{})\allowbreak{}} 作为 \texttt{main(\allowbreak{})\allowbreak{}} 第一行的习惯。（如果你只写 \texttt{setlocale(\allowbreak{}LC\_\allowbreak{}ALL,\allowbreak{} "C")\allowbreak{}}，就像在 C 程序里那样，你确实能让 \texttt{<stdio.\allowbreak{}h>\allowbreak{}} 正确工作，却不会影响 \texttt{<iostream>\allowbreak{}} 所使用的区域设置。换句话说，设置 C++ 库的“全局区域设置”同时也会修改 C 库的“全局区域设置”，但反过来则不成立。）
+
+如果你甚至不信任你的用户会使用 UTF-8，也许更应该选用区域设置名 \texttt{"C.\allowbreak{}UTF-8"} 而不是单纯的 \texttt{"C"}；不过要注意，\texttt{"C.\allowbreak{}UTF-8"} 这个名字大约从 2015 年才出现，在较老的系统上可能不可用。事实上，除 \texttt{"C"} 之外任何区域设置的可用性都取决于用户。区域设置在这方面与时区相似：全世界任何平台上都保证可用的区域设置和时区都只有一个，而且并非巧合的是，那正是你应该始终使用的那个。
+
+作为第三方库的程序员，你有两条可能的路。较容易的一条是假设你的库只会在那些已将全局区域设置设为 \texttt{"C"} 的应用中使用，于是你无需担心区域设置；尽管放心地使用 \texttt{snprintf} 和 \texttt{operator<<} 好了。（不过要注意，这并没有解决区域设置感知编程所带来的性能问题。那把全局互斥锁依然会在那里，占用宝贵的周期。）较难的一条——之所以较难，是因为它需要自觉地遵循一条微妙的准则——是避免使用所有区域设置感知的格式化函数。这条路直到 C++17 才真正变得可行，借助一些最新的库设施，我们现在就来看它们。
+
+\section{将数字转换为字符串}
+
+请看下面这些声明：
+
+\begin{codebox}[cpp]
+    std::ostringstream oss;
+    std::string str;
+    char buffer[100];
+    int intvalue = 42;
+    float floatvalue = 3.14;
+    std::to_chars_result r;
+\end{codebox}
+
+要把 \texttt{intvalue} 这个整数转换为一串数字字符，C++17 为我们提供了如下几种选择：
+
+\begin{codebox}[cpp]
+    snprintf(buffer, sizeof buffer, "%d", intvalue);
+      // 在 <stdio.h> 中可用
+      // 与区域设置无关（%d 不受区域设置影响）
+      // 不分配内存
+      // 仅支持 8、10、16 进制
+    oss << intvalue;
+    str = oss.str();
+      // 在 <sstream> 中可用
+      // 与区域设置相关（可能插入千位分隔符）
+      // 会分配内存；分配器感知
+      // 仅支持 8、10、16 进制
+    str = std::to_string(intvalue);
+      // 自 C++11 起在 <string> 中可用
+      // 与区域设置无关（等价于 %d）
+      // 会分配内存；非分配器感知
+      // 仅十进制
+    r = std::to_chars(buffer, std::end(buffer), intvalue, 10);
+    *r.ptr = '\0';
+      // 自 C++17 起在 <charconv> 中可用
+      // 设计上即与区域设置无关
+      // 不分配内存
+      // 支持 2 到 36 进制
+\end{codebox}
+
+这四种方案各有优势。\texttt{std::\allowbreak{}to\_\allowbreak{}string} 的主要优点是，它能在高层代码中方便地组合进更大的消息里：
+
+\begin{codebox}[cpp]
+    std::string response =
+      "Content-Length: " + std::to_string(body.size()) + "\r\n" +
+      "\r\n" +
+      body;
+\end{codebox}
+
+\texttt{std::\allowbreak{}to\_\allowbreak{}chars} 的主要优点是，它与区域设置无关，并且能方便地在底层代码中组合使用：
+
+\begin{codebox}[cpp]
+    char *write_string(char *p, char *end, const char *from)
+    {
+      while (p != end && *from != '\0') *p++ = *from++;
+      return p;
+    }
+    char *write_response_headers(char *p, char *end, std::string body)
+    {
+      p = write_string(p, end, "Content-Length: ");
+      p = std::to_chars(p, end, body.size(), 10).ptr;
+      p = write_string(p, end, "\r\n\r\n");
+      return p;
+    }
+\end{codebox}
+
+\texttt{std::\allowbreak{}to\_\allowbreak{}chars} 的主要缺点是它是 C++17 中非常新的特性；在撰写本书时，\texttt{<charconv>\allowbreak{}} 头文件尚未出现在任何主流的标准库实现中。
+
+要把浮点型的 \texttt{floatvalue} 数字转换为一串数字字符，C++17 为我们提供了如下选择：
+
+\begin{codebox}[cpp]
+    snprintf(buffer, sizeof buffer, "%.6e", floatvalue);
+    snprintf(buffer, sizeof buffer, "%.6f", floatvalue);
+    snprintf(buffer, sizeof buffer, "%.6g", floatvalue);
+      // 在 <stdio.h> 中可用
+      // 与区域设置相关（小数点）
+      // 不分配内存
+    oss << floatvalue;
+    str = oss.str();
+      // 在 <sstream> 中可用
+      // 与区域设置相关（小数点）
+      // 会分配内存；分配器感知
+    str = std::to_string(floatvalue);
+      // 自 C++11 起在 <string> 中可用
+      // 与区域设置相关（等价于 %f）
+      // 会分配内存；非分配器感知
+      // 无法调整格式
+    r = std::to_chars(buffer, std::end(buffer), floatvalue,
+                      std::chars_format::scientific, 6);
+    r = std::to_chars(buffer, std::end(buffer), floatvalue,
+                      std::chars_format::fixed, 6);
+    r = std::to_chars(buffer, std::end(buffer), floatvalue,
+                      std::chars_format::general, 6);
+    *r.ptr = '\0';
+      // 自 C++17 起在 <charconv> 中可用
+      // 设计上即与区域设置无关
+      // 不分配内存
+\end{codebox}
+
+请注意，在打印浮点数时，除了 \texttt{std::\allowbreak{}to\_\allowbreak{}string} 之外的每个方法都提供了调整格式的可能性；而除了 \texttt{std::\allowbreak{}to\_\allowbreak{}chars} 之外的每个方法都是区域设置感知的，因此在可移植的代码中都会出问题。所有这些方法对 \texttt{double} 和 \texttt{long double} 数据类型，以及对 \texttt{float} 都可用。无论如何，整数格式化的优劣点同样适用。
+
+\section{将字符串转换为数字}
+
+格式化数字以输出的反向问题，是从用户输入中解析数字。解析本质上比格式化微妙得多、也困难得多，因为我们
+
+必须考虑到出错的可能性。每一个数字都可以合理地转换为一串数字字符，但并非每个字符串（甚至并非每个由数字组成的字符串！）都能合理地转换为一个数字。因此，任何号称能解析数字的函数，都必须有某种方式来应对那些并不代表有效数字的字符串。
+考虑以下声明：
+
+\begin{codebox}[cpp]
+     std::istringstream iss;
+     std::string str = "42";
+     char buffer[] = "42";
+     int intvalue;
+     float floatvalue;
+     int rc;
+     char *endptr;
+     size_t endidx;
+     std::from_chars_result r;
+\end{codebox}
+
+要把 \texttt{buffer} 或 \texttt{str} 里的字符串转换为 \texttt{intvalue} 整型，C++17 为我们提供了如下几种选择：
+
+\begin{codebox}[cpp]
+     intvalue = strtol(buffer, &endptr, 10);
+       // 溢出时取饱和值
+       // 多数错误会设置全局变量 "errno"
+       // 无法解析输入时令 endptr==buffer
+       // 在 <stdlib.h> 中提供
+       // 理论上存在区域设置问题
+       // 不分配内存
+       // 支持 0 以及 2 到 36 进制
+       // 总是跳过前导空白
+       // 在 16 进制下跳过前导 0x
+       // 同时识别大小写
+     rc = sscanf(buffer, "%d", &intvalue);
+       // 无法检测溢出
+       // 输入无法解析时返回 0（而非 1）
+       // 在 <stdio.h> 中提供
+       // 存在区域设置问题（等价于 strtol）
+       // 不分配内存
+       // 仅支持 0、8、10、16 进制
+       // 总是跳过前导空白
+       // 在 16 进制下跳过前导 0x
+       // 同时识别大小写
+     intvalue = std::stoi(str, &endidx, 10);
+       // 溢出或出错时抛异常
+       // 自 C++11 起在 <string> 中提供
+       // 存在区域设置问题（等价于 strtol）
+       // 不支持分配器
+       // 支持 0 以及 2 到 36 进制
+       // 总是跳过前导空白
+       // 在 16 进制下跳过前导 0x
+       // 同时识别大小写
+     iss.str("42");
+     iss >> intvalue;
+       // 溢出时取饱和值
+       // 出现任何错误时设置 iss.fail()
+       // 在 <sstream> 中提供
+       // 存在区域设置问题
+       // 需要分配内存；支持分配器
+       // 仅支持 8、10、16 进制
+       // 在 16 进制下跳过前导 0x
+       // 默认跳过空白
+     r = std::from_chars(buffer, buffer + 2, intvalue, 10);
+       // 出现任何错误时设置 r.ec != 0
+       // 自 C++17 起在 <charconv> 中提供
+       // 设计上独立于区域设置
+       // 不分配内存
+       // 支持 2 到 36 进制
+       // 总是跳过前导空白
+       // 仅识别小写字母
+\end{codebox}
+
+这里的解析方法比上一节的格式化方法还要多；这是因为仅 C 标准库就为我们提供了三种不同的方法：\texttt{atoi}，最古老的方法，也是对无效输入的行为在字面意义上属于未定义行为（UB）的唯一方法，因此应在生产代码中避免使用；\texttt{strtol}，作为 \texttt{atoi} 的标准替代品，通过全局变量 \texttt{errno} 来传达溢出错误，这对多线程或高性能代码可能并不合适；以及 \texttt{sscanf}，它与 \texttt{snprintf} 同属一个函数族。
+
+\texttt{std::\allowbreak{}stoi} 在一次性解析用户输入时是 \texttt{atoi} 的一个很好的替代品，但在高性能场景下却是个糟糕的选择。它在检测错误方面做得相当出色——\texttt{std::\allowbreak{}stoi(\allowbreak{}"2147483648")\allowbreak{}} 会抛出 \texttt{std::\allowbreak{}out\_\allowbreak{}of\_\allowbreak{}range}，而 \texttt{std::\allowbreak{}stoi(\allowbreak{}"abc")\allowbreak{}} 会抛出 \texttt{std::\allowbreak{}invalid\_\allowbreak{}argument}。（而且，尽管 \texttt{std::\allowbreak{}stoi(\allowbreak{}"42abc")\allowbreak{}} 会毫无怨言地返回 42，但调用 \texttt{std::\allowbreak{}stoi(\allowbreak{}"42abc",\allowbreak{} \&endidx)\allowbreak{}} 会把 \texttt{endidx} 设为 2 而不是 5，说明可能哪里出了问题。）\texttt{std::\allowbreak{}stoi} 的主要缺点在于它只能作用于确切的类型 \texttt{std::\allowbreak{}string}——不存在针对 \texttt{string\_\allowbreak{}view} 的 \texttt{std::\allowbreak{}stoi} 重载，没有针对 \texttt{std::\allowbreak{}pmr::\allowbreak{}string} 的重载，当然更没有针对 \texttt{const char *} 的重载！
+
+\texttt{std::\allowbreak{}from\_\allowbreak{}chars} 是解析整型时最现代、性能最高的选择。它的主要优势在于，与其余竞争者都不同，\texttt{from\_\allowbreak{}chars} 不要求输入缓冲区以空字符结尾——它接收一对 \texttt{begin,\allowbreak{} end} 指针来指明待解析字符的范围，并且绝不会越过 \texttt{end} 往后读取。它仍有一些令人遗憾的局限——例如，它无法被设定为不去跳过空白，也无法被设定为解析大写十六进制输入。用于检测 \texttt{r.\allowbreak{}ec} 错误的惯用法展示在第 12 章「文件系统」的开头附近。
+
+\texttt{strtol}、\texttt{sscanf} 与 \texttt{stoi} 这几个函数都表示它们能识别“base 0”。这是库中的一种特殊语法：传入基数 \texttt{0}（或者，就 \texttt{sscanf} 而言，传入格式说明符 \texttt{"\%i"}）会告诉库把输入当作 C 整型字面量来解析：\texttt{0123} 会被解析为十进制 83 的八进制表示，\texttt{0x123} 会被解析为 291 的十六进制表示，而 \texttt{019} 会被解析为整型 1 的八进制表示，字符 \texttt{9} 因为不是合法的八进制数字而未被解析。“Base 0” 对计算机程序而言从来都不是合适的行为，\texttt{from\_\allowbreak{}chars} 明智地把它丢进了本该属于它的垃圾桶。
+
+要把字符串转换为浮点型 \texttt{floatvalue}，C++17 提供了如下几种选择：
+
+\begin{codebox}[cpp]
+     floatvalue = strtof(buffer, &endptr);
+       // 溢出时取饱和值
+       // 多数错误时设置全局变量 "errno"
+       // 无法解析输入时令 endptr==buffer
+       // 在 <stdlib.h> 中提供
+       // 存在区域设置问题
+       // 不分配内存
+       // 10 或 16 进制，自动检测
+       // 总是跳过前导空白
+     rc = sscanf(buffer, "%f", &floatvalue);
+       // 无法检测溢出
+       // 输入无法解析时返回 0（而非 1）
+       // 在 <stdio.h> 中提供
+       // 存在区域设置问题（等价于 strtof）
+       // 不分配内存
+       // 10 或 16 进制，自动检测
+       // 总是跳过前导空白
+     floatvalue = std::stof(str, &endidx);
+       // 溢出或出错时抛异常
+       // 自 C++11 起在 <string> 中提供
+       // 存在区域设置问题（等价于 strtol）
+       // 不支持分配器
+       // 10 或 16 进制，自动检测
+       // 总是跳过前导空白
+     iss.str("3.14");
+     iss >> floatvalue;
+       // 溢出时取饱和值
+       // 出现任何错误时设置 iss.fail()
+       // 在 <sstream> 中提供
+       // 存在区域设置问题
+       // 需要分配内存；支持分配器
+       // 10 或 16 进制，自动检测
+       // 默认跳过空白
+       // 对尾部文本的行为不可移植
+     r = std::from_chars(buffer, buffer + 2, floatvalue,
+                         std::chars_format::general);
+       // 出现任何错误时设置 r.ec != 0
+       // 自 C++17 起在 <charconv> 中提供
+       // 设计上独立于区域设置
+       // 不分配内存
+       // 10 或 16 进制，自动检测
+       // 总是跳过前导空白
+\end{codebox}
+
+所有这些解析器——即便是 \texttt{std::\allowbreak{}from\_\allowbreak{}chars}——都接受输入字符串 \texttt{"Infinity"} 与 \texttt{"Nan"}（不区分大小写），并且也接受“hex float”输入；例如，\texttt{"0x1.c"} 会被解析为十进制数 1.75。除 \texttt{std::\allowbreak{}from\_\allowbreak{}chars} 之外，其余都是区域设置相关的，因此在可移植代码中会带来问题。整数解析中的区域设置问题在很大程度上只是理论上的，但在现实世界中，许多区域设置的 \texttt{.} 并不是小数分隔符，这意味着很容易遇到 \texttt{std::\allowbreak{}stof} 与 \texttt{std::\allowbreak{}stod} 不按预期工作的情况：
+
+\begin{codebox}[cpp]
+     std::setlocale(LC_ALL, "C.UTF-8");
+     assert(std::stod("3.14") == 3.14); // 成功！
+     std::setlocale(LC_ALL, "en_DK.UTF-8");
+     assert(std::stod("3.14") == 3.00); // 无声的、彻底的失败！
+\end{codebox}
+
+顺带注意一下与 \texttt{istringstream} 相关的“non-portable behavior on trailing text”（尾部文本的不可移植行为）。不同的库厂商对流输入的处理各不相同，到底哪一种才算“correct”（正确）并不总是很清楚：
+
+\begin{codebox}[cpp]
+     double d = 17;
+     std::istringstream iss("42abc");
+     iss >> d;
+     if (iss.good() && d == 42) {
+       puts("Your library vendor is libstdc++");
+     } else if (iss.fail() && d == 0) {
+       puts("Your library vendor is libc++");
+     }
+\end{codebox}
+
+由于这些可移植性问题——它们普遍是流输入微妙复杂性的表现——，我建议你避免使用 \texttt{istringstream} 来做输入解析，尽管 \texttt{ostringstream} 有时可能是输出格式化最合适的选择。
+
+另一个不错的经验法则是：把输入的有效性校验（或词法分析）与输入的解析分开。如果你能事先校验某个字符串全由数字组成，或者符合某个合法浮点数的正则表达式语法，那么只需挑选一种能够检测溢出和/或尾部文本的解析方法即可，例如 \texttt{std::\allowbreak{}stof} 或 \texttt{std::\allowbreak{}from\_\allowbreak{}chars}。关于用正则表达式做输入词法分析的更多内容，请参阅第 10 章「正则表达式」。
+
+\section{逐行或逐词读取}
+
+在简单脚本中，每次从标准输入读取一行是非常常见的任务，而大多数脚本语言都把它做成了一行代码。例如，在 Python 中：
+
+\begin{codebox}[cpp]
+     for line in sys.stdin:
+     # 保留行尾换行符
+     process(line)
+\end{codebox}
+
+而在 Perl 中：
+
+\begin{codebox}[cpp]
+     while (<>) {
+       # 保留行尾换行符
+       process($_);
+     }
+\end{codebox}
+
+在 C++ 中，这个任务也几乎同样简单。请注意，与其他语言的惯用法不同，C++ 的 \texttt{std::\allowbreak{}getline} 函数会去掉它读取的每一行末尾的换行符（如果有）：
+
+\begin{codebox}[cpp]
+     std::string line;
+     while (std::getline(std::cin, line)) {
+       // 自动去除行尾换行符
+       process(line);
+     }
+\end{codebox}
+
+在上述每种情况下，整个输入都不会一次性驻留在内存中；我们确实是高效地“streaming”（流式传输）这些行穿过我们的程序。（而且 \texttt{std::\allowbreak{}getline} 函数是支持分配器的；如果我们确实必须避免堆分配，可以把 \texttt{std::\allowbreak{}string line} 换成 \texttt{std::\allowbreak{}pmr::\allowbreak{}string}。）\texttt{process} 函数可以接收每一行，并用正则表达式（参见第 10 章「正则表达式」）对其进行校验，再把该行拆分成字段以便进一步解析。
+
+要逐词而不是逐行地读取，我们可以以下面的代码片段作为指引（当然，前提是我们信任当前区域设置对 \texttt{isspace} 的定义能够正确地分隔单词）：
+
+\begin{codebox}[cpp]
+     template<class T>
+     struct streamer {
+       std::istream& m_in;
+       explicit streamer(std::istream& in) : m_in(in) {}
+       auto begin() const
+         { return std::istream_iterator<T>(m_in); }
+       auto end() const
+         { return std::istream_iterator<T>{}; }
+     };
+     int main()
+     {
+       for (auto word : streamer<std::string>(std::cin)) {
+         process(word);
+       }
+     }
+\end{codebox}
+
+\texttt{std::\allowbreak{}istream\_\allowbreak{}iterator<\allowbreak{}T>\allowbreak{}} 是标准库中的一个类型，定义于 \texttt{<iterator>\allowbreak{}} 头文件中，它包装了一个指向 \texttt{istream} 的指针。该迭代器的 \texttt{operator++} 会从 istream 读取一个类型为 \texttt{T} 的值，就像通过 \texttt{operator>\allowbreak{}>} 那样，而该值由迭代器的 \texttt{operator*} 返回。综合起来，这使我们能够从 \texttt{std::\allowbreak{}cin} 读取一整序列由空白分隔的单词，所依赖的事实是：\texttt{std::\allowbreak{}istream::\allowbreak{}operator>\allowbreak{}>(\allowbreak{}std::\allowbreak{}string\&)\allowbreak{}} 会读取单个由空白分隔的单词。
+
+我们可以复用 \texttt{streamer} 类模板，从 \texttt{std::\allowbreak{}cin} 读取一整序列整数，并对其中每一个进行处理：
+
+\begin{codebox}[cpp]
+     // 把用户给出的每个 int 翻倍
+     for (auto value : streamer<int>(std::cin)) {
+       printf("%d\n", 2*value);
+     }
+\end{codebox}
+
+尽管 C++ 的 I/O 设施确实非常复杂——这倒也符合一门根植于 1980 年代的系统级编程语言的身份——但从最后这几个例子可以看出，我们仍然有可能把这种复杂性隐藏在抽象层之下，最终得到几乎和 Python 一样简洁的代码。
+
+\section{小结}
+
+数据输出大致可以划分为格式化（formatting）与缓冲（buffering）。数据输入同样可以粗略地划分为缓冲与解析（parsing）；不过，如果你能在前面加一个词法分析（lexing）步骤，解析这一步就会变得容易些。（我们会在下一章详细讨论词法分析！）
+
+经典的 I/O 流（iostreams）API 构建在 \texttt{<stdio.\allowbreak{}h>\allowbreak{}} 之上，而 \texttt{<stdio.\allowbreak{}h>\allowbreak{}} 又构建在 POSIX 文件描述符 API 之上。如果不充分理解底层的各个层级，就无法理解上层。特别是，\texttt{fopen} 模式字符串与 \texttt{fstream} 构造函数标志的混乱状况，只有参考那些把它们映射到底层 POSIX \texttt{open} 标志的查找表才能弄清楚。
+
+POSIX API 只关心在文件描述符之间搬移数据块；它并不在朴素意义上对数据进行“缓冲（buffer）”。\texttt{<stdio.\allowbreak{}h>\allowbreak{}} API 在 POSIX 之上加了一层缓冲；C 语言的 \texttt{FILE} 可以是全缓冲、行缓冲或无缓冲的。此外，\texttt{<stdio.\allowbreak{}h>\allowbreak{}} 提供了高性能（但区域设置相关）的格式化例程，其中最重要的是 \texttt{fprintf}、\texttt{snprintf} 与 \texttt{sscanf}。
+
+\texttt{<iostream>\allowbreak{}} API 把 \texttt{streambuf}（用于标识原始字节的源或汇，以及它的缓冲模式）与 \texttt{stream}（持有与格式化相关的状态）分离开来。不同种类的流（\texttt{stream}）（输入还是输出？文件还是字符串？）构成了一个经典的（classical）、多态（polymorphic）的层级，其继承关系复杂，有时甚至不直观。在生产代码中最好避免使用 \texttt{<iostream>\allowbreak{}}，因为与 \texttt{<stdio.\allowbreak{}h>\allowbreak{}} 或 POSIX 接口相比，它既慢又难以洞察。无论如何，都要当心区域设置相关的格式化例程。
+
+对于一次性的快速任务，优先使用 \texttt{std::\allowbreak{}stoi} 来解析数字（它会在出错时检测并抛异常），并使用 \texttt{std::\allowbreak{}to\_\allowbreak{}string} 或 \texttt{snprintf} 来格式化。对于高性能场景，若你能找到支持 \texttt{<charconv>\allowbreak{}} 头文件中这些全新函数的库实现，那么使用 \texttt{std::\allowbreak{}from\_\allowbreak{}chars} 解析、使用 \texttt{std::\allowbreak{}to\_\allowbreak{}chars} 格式化会更可取。

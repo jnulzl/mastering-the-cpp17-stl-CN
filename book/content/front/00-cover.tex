@@ -1,0 +1,16 @@
+% =============================================================================
+%  原书封面（Cover）—— 从原版 Packt PDF 第 1 页提取的真实封面，满版整页
+%  · 不做任何文字/版式加工，仅整页插入原图
+%  · 用 tikz overlay 把图片左上角对齐页面左上角，并强制铺满 paper 尺寸
+%    （原图 541×666pt 与本页 531.36×628.83bp 比例差约 4%，强制拉伸肉眼无感）
+% =============================================================================
+\thispagestyle{empty}
+
+\begin{tikzpicture}[remember picture, overlay]
+  \node[inner sep=0pt, anchor=north west]
+    at (current page.north west)
+    {\includegraphics[width=\paperwidth, height=\paperheight]{images/cover_original.png}};
+\end{tikzpicture}
+
+\null
+\clearpage

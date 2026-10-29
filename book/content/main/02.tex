@@ -1,0 +1,647 @@
+在上一章中，我们实现了若干作用于容器（container）的泛型算法（algorithm），但实现方式并不高效。在本章中，你将学习：
+
+C++ 如何以及为何把指针这一概念加以泛化，从而创造出迭代器（iterator）这一概念（concept）。
+
+范围（range）在 C++ 中的重要性，以及用一对迭代器表达半开区间（half-open range）的标准方式。
+
+如何编写你自己的、可靠且常量正确（const-correct）的迭代器类型。
+
+如何编写作用于迭代器对（iterator pair）之上的泛型算法。
+
+标准的迭代器层级结构及其在算法上的重要性。
+
+\section{整数下标的问题}
+
+在上一章中，我们实现了若干作用于容器的泛型算法。现在再来考察其中的一个算法：
+
+\begin{codebox}[cpp]
+    template<typename Container>
+    void double_each_element(Container& arr)
+    {
+      for (int i=0; i < arr.size(); ++i) {
+        arr.at(i) *= 2;
+      }
+    }
+\end{codebox}
+
+这个算法建立在更低层的两个操作 \texttt{.size(\allowbreak{})\allowbreak{}} 和 \texttt{.at(\allowbreak{})\allowbreak{}} 之上。对于 \texttt{array\_\allowbreak{}of\_\allowbreak{}ints} 或 \texttt{std::\allowbreak{}vector} 这样的容器（container）类型，它运转得相当不错；但若是面对诸如上一章的 \texttt{list\_\allowbreak{}of\_\allowbreak{}ints} 这样的链表，它就显得力不从心了：
+
+\begin{codebox}[cpp]
+    class list_of_ints {
+      struct node {
+        int data;
+        node *next;
+      };
+      node *head_ = nullptr;
+      node *tail_ = nullptr;
+      int size_ = 0;
+    public:
+      int size() const { return size_; }
+      int& at(int i) {
+        if (i >= size_) throw std::out_of_range("at");
+        node *p = head_;
+        for (int j=0; j < i; ++j) {
+          p = p->next;
+        }
+        return p->data;
+      }
+      void push_back(int value) {
+        node *new_tail = new node{value, nullptr};
+        if (tail_) {
+          tail_->next = new_tail;
+        } else {
+          head_ = new_tail;
+        }
+        tail_ = new_tail;
+        size_ += 1;
+      }
+      ~list_of_ints() {
+        for (node *next, *p = head_; p != nullptr; p = next) {
+          next = p->next;
+          delete p;
+        }
+      }
+    };
+\end{codebox}
+
+\texttt{list\_\allowbreak{}of\_\allowbreak{}ints::\allowbreak{}at(\allowbreak{})\allowbreak{}} 的实现，其复杂度（关于链表长度）是 $O(n)$——链表越长，\texttt{at(\allowbreak{})\allowbreak{}} 就越慢。尤其是，当我们的 \texttt{count\_\allowbreak{}if} 函数遍历链表的每个元素时，它对那个 \texttt{at(\allowbreak{})\allowbreak{}} 函数调用了 n 次，这使得我们泛型算法（algorithm）的运行时间变成了 $O(n^2)$——而对于一个本该是 $O(n)$ 的简单计数操作来说，这实在太糟了！
+
+事实证明，用 \texttt{.at(\allowbreak{})\allowbreak{}} 做整数下标访问，并不是构筑算法大厦的好地基。我们应当挑选一种更贴近计算机实际操纵数据方式的原语操作。
+
+\section{超越指针}
+
+在没有任何抽象的情况下，人们通常是如何定位数组中的一个元素、链表中的一个元素，或者树中的一个元素的呢？最直接的方式，就是使用指向该元素在内存中地址的指针。下面给出一些指向不同数据结构元素的指针示例：
+
+\myGraphic{0.9}{images/fig_p029_1.png}{}
+
+要遍历一个数组，我们只需要那个指针就够了；以一个指向首元素的指针为起点，不断地对该指针做自增，直到它抵达最后一个元素，就能处理数组中的所有元素。在 C 语言中：
+
+\begin{codebox}[cpp]
+    for (node *p = lst.head_; p != nullptr; p = p->next) {
+      if (pred(p->data)) {
+        sum += 1;
+      }
+   }
+\end{codebox}
+
+但是，要想高效地遍历一条链表，仅靠一个裸指针是不够的；对 \texttt{node*} 类型的指针做自增，几乎不可能得到指向链表中下一个节点的指针！在这种情况下，我们需要某种行为类似指针的东西——具体而言，我们应当能够解引用它来获取或修改它所指向的元素——但它又要在“自增”这一抽象概念上附带特殊的、与具体容器相关的行为。在 C++ 中，既然语言内置了运算符重载（operator overloading），那么当我说“把特殊行为关联到自增这一概念上”时，你应当想到的是“我们来重载 \texttt{++} 运算符”。而事实正是如此，我们将这样做：
+
+\begin{codebox}[cpp]
+    struct list_node {
+      int data;
+      list_node *next;
+    };
+    class list_of_ints_iterator {
+      list_node *ptr_;
+      friend class list_of_ints;
+      explicit list_of_ints_iterator(list_node *p) : ptr_(p) {}
+    public:
+      int& operator*() const { return ptr_->data; }
+      list_of_ints_iterator& operator++() { ptr_ = ptr_->next; return
+*this; }
+      list_of_ints_iterator operator++(int) { auto it = *this; ++*this;
+return it; }
+      bool operator==(const list_of_ints_iterator& rhs) const
+        { return ptr_ == rhs.ptr_; }
+      bool operator!=(const list_of_ints_iterator& rhs) const
+        { return ptr_ != rhs.ptr_; }
+    };
+    class list_of_ints {
+      list_node *head_ = nullptr;
+      list_node *tail_ = nullptr;
+      // ...
+    public:
+      using iterator = list_of_ints_iterator;
+      iterator begin() { return iterator{head_}; }
+      iterator end() { return iterator{nullptr}; }
+    };
+    template<class Container, class Predicate>
+    int count_if(Container& ctr, Predicate pred)
+    {
+      int sum = 0;
+      for (auto it = ctr.begin(); it != ctr.end(); ++it) {
+        if (pred(*it)) {
+            sum += 1;
+        }
+      }
+      return sum;
+   }
+\end{codebox}
+
+注意，我们还重载了单目 \texttt{*} 运算符（用于解引用）以及 \texttt{==} 和 \texttt{!=} 运算符；我们的 \texttt{count\_\allowbreak{}if} 模板要求循环控制变量 \texttt{it} 上所有这些操作都合法。（嗯，严格来说，我们的 \texttt{count\_\allowbreak{}if} 并不要求 \texttt{==} 操作；但如果你打算重载其中一个比较运算符，那就应该把另一个也一并重载。）
+
+\section{常量迭代器}
+
+在我们抛弃这个链表迭代器示例之前，还有最后一个复杂之处要考虑。请注意，我悄悄地把我们的 \texttt{count\_\allowbreak{}if} 函数模板改成了接受 \texttt{Container\&} 而非 \texttt{const Container\&}！这是因为我们所提供的 \texttt{begin(\allowbreak{})\allowbreak{}} 和 \texttt{end(\allowbreak{})\allowbreak{}} 成员函数是非 const 成员函数；而这是因为它们返回的迭代器（iterator），其 \texttt{operator*} 返回的是指向链表元素的非 const 引用。我们希望让自己的链表类型（及其迭代器）做到完全常量正确（const-correct）——也就是说，我们希望你能够定义并使用 \texttt{const list\_\allowbreak{}of\_\allowbreak{}ints} 类型的变量，同时又阻止你修改一个 const 链表的各个元素。
+
+标准库（standard library）通常这样处理这个问题：为每一个标准容器提供两种不同种类的迭代器（iterator）：\texttt{bag::\allowbreak{}iterator} 与 \texttt{bag::\allowbreak{}const\_\allowbreak{}iterator}。非 const 成员函数 \texttt{bag::\allowbreak{}begin(\allowbreak{})\allowbreak{}} 返回一个 \texttt{iterator}，而 \texttt{bag::\allowbreak{}begin(\allowbreak{})\allowbreak{} const} 成员函数则返回 \texttt{const\_\allowbreak{}iterator}。那个下划线至关重要！请注意，\texttt{bag::\allowbreak{}begin(\allowbreak{})\allowbreak{} const} 返回的并不是什么普通的 \texttt{const iterator}（常量迭代器）；如果返回的对象本身是 \texttt{const}，那我们就不能对它做 \texttt{++} 了。（而这反过来又会让遍历一个 \texttt{const bag} 变得极其困难！）不，\texttt{bag::\allowbreak{}begin(\allowbreak{})\allowbreak{} const} 返回的是某种更微妙的东西：一个非 const 的 \texttt{const\_\allowbreak{}iterator} 对象，它的 \texttt{operator*} 恰好产生的是指向其元素的 const 引用。
+
+也许一个例子会有所帮助。我们来动手为 \texttt{list\_\allowbreak{}of\_\allowbreak{}ints} 容器实现 \texttt{const\_\allowbreak{}iterator}。由于 \texttt{const\_\allowbreak{}iterator} 类型的代码，绝大部分都与 \texttt{iterator} 类型的代码完全相同，我们的第一反应可能是复制粘贴。但这是 C++！当我说“这段代码绝大部分将和另一段代码完全相同”时，你应当想到的是“我们把公共部分做成一个模板（template）”。而事实正是如此，我们将这样做：
+
+\begin{codebox}[cpp]
+    struct list_node {
+      int data;
+      list_node *next;
+    };
+    template<bool Const>
+    class list_of_ints_iterator {
+      friend class list_of_ints;
+      friend class list_of_ints_iterator<!Const>;
+      using node_pointer = std::conditional_t<Const, const list_node*,
+list_node*>;
+      using reference = std::conditional_t<Const, const int&, int&>;
+      node_pointer ptr_;
+      explicit list_of_ints_iterator(node_pointer p) : ptr_(p) {}
+    public:
+      reference operator*() const { return ptr_->data; }
+      auto& operator++() { ptr_ = ptr_->next; return *this; }
+      auto operator++(int) { auto result = *this; ++*this; return result; }
+      // 支持 iterator 与 const_iterator 类型之间的比较
+      template<bool R>
+      bool operator==(const list_of_ints_iterator<R>& rhs) const
+        { return ptr_ == rhs.ptr_; }
+      template<bool R>
+      bool operator!=(const list_of_ints_iterator<R>& rhs) const
+        { return ptr_ != rhs.ptr_; }
+      // 支持 iterator 到 const_iterator 的隐式转换
+      // （反之则不行）
+      operator list_of_ints_iterator<true>() const
+        { return list_of_ints_iterator<true>{ptr_}; }
+    };
+    class list_of_ints {
+      list_node *head_ = nullptr;
+      list_node *tail_ = nullptr;
+      // ...
+    public:
+      using const_iterator = list_of_ints_iterator<true>;
+      using iterator = list_of_ints_iterator<false>;
+      iterator begin() { return iterator{head_}; }
+      iterator end() { return iterator{nullptr}; }
+      const_iterator begin() const { return const_iterator{head_}; }
+      const_iterator end() const { return const_iterator{nullptr}; }
+    };
+\end{codebox}
+
+上面的代码为我们的 \texttt{list\_\allowbreak{}of\_\allowbreak{}ints} 实现了完全常量正确的迭代器类型。
+
+\section{一对迭代器定义一个范围}
+
+既然我们已经理解了迭代器（iterator）这一基本概念（concept），那就把它用在实处吧。我们已经看到，如果你有一对由 \texttt{begin(\allowbreak{})\allowbreak{}} 和 \texttt{end(\allowbreak{})\allowbreak{}} 返回的迭代器，就可以用 for 循环遍历底层容器（container）的所有元素。但更强大的是，你还可以用某对迭代器来遍历容器元素中任意一个子范围（sub-range）！比方说，你只想查看一个 \texttt{std::\allowbreak{}vector}（向量）的前一半：
+
+\begin{codebox}[cpp]
+    template<class Iterator>
+    void double_each_element(Iterator begin, Iterator end)
+    {
+      for (auto it = begin; it != end; ++it) {
+        *it *= 2;
+      }
+    }
+    int main()
+    {
+      std::vector<int> v {1, 2, 3, 4, 5, 6};
+      double_each_element(v.begin(), v.end());
+        // 将整个向量中的每个元素翻倍
+      double_each_element(v.begin(), v.begin()+3);
+        // 将向量前半部分中的每个元素翻倍
+      double_each_element(&v[0], &v[3]);
+        // 将向量前半部分中的每个元素翻倍
+    }
+\end{codebox}
+
+请注意，在 \texttt{main(\allowbreak{})\allowbreak{}} 的前两个测试用例中，我们传入的是从 \texttt{v.\allowbreak{}begin(\allowbreak{})\allowbreak{}} 派生出来的一对迭代器；也就是说，是两个 \texttt{std::\allowbreak{}vector::\allowbreak{}iterator} 类型的值。在第三个测试用例中，我们传入的是两个 \texttt{int*} 类型的值。由于 \texttt{int*} 在此情形下满足了一个迭代器类型的全部要求——即：它可自增、可比较、可解引用——我们的代码即便使用指针也能正常运行！这个例子展示了迭代器对（iterator pair）模型的灵活性。（不过，一般而言，如果你在使用诸如 \texttt{std::\allowbreak{}vector} 这样提供了正规迭代器类型的容器，就应当避免去摆弄裸指针。请改用从 \texttt{begin(\allowbreak{})\allowbreak{}} 和 \texttt{end(\allowbreak{})\allowbreak{}} 派生出来的迭代器。）
+
+我们可以说，一对迭代器隐式地定义了一个数据元素的范围（range）。而对于数量惊人的一大类算法来说，这就足够了！为了执行某些搜索或变换（transformation），我们并不需要能访问到容器本身；我们只需要能访问到正在被搜索或被变换的那段特定范围即可。沿着这条思路继续深入，最终会把我们引向“非拥有视图（non-owning view）”这一概念（它之于数据序列，就如同 C++ 的引用之于单个变量）；但视图与范围都还是更现代的概念，在谈论它们之前，我们应当先把 1998 年版本的 STL 讲完。
+
+在前面那段示例代码中，我们看到了第一个真正的 STL 风格泛型（generic）算法（algorithm）的例子。平心而论，\texttt{double\_\allowbreak{}each\_\allowbreak{}element} 算不上一个特别“泛型”的算法——如果“泛型”指的是实现一种我们或许想在别的程序里复用的行为的话；但这个函数现在的这个版本，在“只作用于迭代器（Iterator）对”这个意义上是完全泛型的，这里的 \texttt{Iterator} 可以是世界上任何一个实现了可自增性、可比较性、可解引用性的类型。（我们会在本书的下一章，在讨论 \texttt{std::\allowbreak{}transform} 时，看到在这个第一种意义上更具通用性的该算法版本。）
+
+\section{迭代器类别}
+
+让我们重新回顾一下我们在第 1 章「古典多态与泛型编程（Classical Polymorphism and Generic Programming）」中介绍过的 \texttt{count} 和 \texttt{count\_\allowbreak{}if} 函数。把下一个例子里的函数模板定义与那一章中相似的代码做个比较，你会发现二者几乎一模一样，唯一的差别是用一对迭代器（Iterators）（也就是一个隐式定义的范围（range））替换了 \texttt{Container\&} 参数——以及我把第一个函数的名字从 \texttt{count} 改成了 \texttt{distance}。这是因为，你几乎可以原封不动地在标准模板库（Standard Template Library）中以 \texttt{std::\allowbreak{}distance} 这个名字找到这个函数，而以 \texttt{std::\allowbreak{}count\_\allowbreak{}if} 这个名字找到第二个函数：
+
+\begin{codebox}[cpp]
+    template<typename Iterator>
+    int distance(Iterator begin, Iterator end)
+    {
+      int sum = 0;
+      for (auto it = begin; it != end; ++it) {
+        sum += 1;
+      }
+      return sum;
+    }
+    template<typename Iterator, typename Predicate>
+    int count_if(Iterator begin, Iterator end, Predicate pred)
+    {
+      int sum = 0;
+      for (auto it = begin; it != end; ++it) {
+        if (pred(*it)) {
+            sum += 1;
+        }
+      }
+      return sum;
+    }
+    void test()
+    {
+      std::vector<int> v = {3, 1, 4, 1, 5, 9, 2, 6};
+      int number_above = count_if(v.begin(), v.end(), [](int e) { return e
+> 5; });
+      int number_below = count_if(v.begin(), v.end(), [](int e) { return e
+< 5; });
+      int total = distance(v.begin(), v.end()); // DUBIOUS
+      assert(number_above == 2);
+      assert(number_below == 5);
+      assert(total == 8);
+    }
+\end{codebox}
+
+不过，让我们来看看那个例子中标记为 \texttt{DUBIOUS} 的那一行。这里，我们是通过不断地对其中一个迭代器做自增，直到它追上另一个，来计算两个迭代器（Iterator）之间的距离（distance）的。这种做法的性能如何？对于某些种类的迭代器——例如 \texttt{list\_\allowbreak{}of\_\allowbreak{}ints::\allowbreak{}iterator}——我们确实没法做得比这更好了。但对于 \texttt{vector::\allowbreak{}iterator} 或 \texttt{int*} 这种遍历连续（contiguous）数据的迭代器来说，明明可以用简单的指针相减在 $O(1)$ 时间内完成同样的事情，我们却去使用一个循环外加一个 $O(n)$ 算法，这就显得有些愚蠢了。也就是说，我们希望标准库（standard library）版的 \texttt{std::\allowbreak{}distance} 能包含一个类似下面这样的模板特化（template specialization）：
+
+\begin{codebox}[cpp]
+    template<typename Iterator>
+    int distance(Iterator begin, Iterator end)
+    {
+      int sum = 0;
+      for (auto it = begin; it != end; ++it) {
+        sum += 1;
+      }
+      return sum;
+    }
+    template<>
+    int distance(int *begin, int *end)
+    {
+      return end - begin;
+    }
+\end{codebox}
+
+但我们并不希望这个特化只存在于 \texttt{int*} 和 \texttt{std::\allowbreak{}vector::\allowbreak{}iterator} 之上。我们希望标准库的 \texttt{std::\allowbreak{}distance} 对所有支持这一特定操作的迭代器类型都高效。也就是说，我们开始形成一种直觉：迭代器（iterator）至少有两种不同的种类：一种是可自增、可比较、可解引用的；另一种则在此基础上还能相减！事实表明，对于任何“\texttt{i = p - q} 有意义”的迭代器类型，其逆操作 \texttt{q = p + i} 同样有意义。能够支持相减与相加的迭代器，被称为随机访问迭代器（random-access iterator）。
+
+因此，标准库的 \texttt{std::\allowbreak{}distance} 对于随机访问迭代器（random-access iterator）和其他种类的迭代器都应当高效。为了让这些模板的偏特化（partial specialization）更容易提供，标准库引入了“迭代器种类层级”这一思想。像 \texttt{int*} 这样支持相加与相减的迭代器，被称为随机访问迭代器。我们会说，它们满足随机访问迭代器（RandomAccessIterator）这一概念（concept）。
+
+比随机访问迭代器稍弱一些的迭代器，也许不支持对任意距离做相加或相减，但它们至少支持用 \texttt{++p} 和 \texttt{--p} 做自增与自减。这类迭代器被称为双向迭代器（bidirectional iterator）（\texttt{Bidirectional\allowbreak{}Iterator}）。所有的 \texttt{Random\allowbreak{}Access\allowbreak{}Iterator} 都是 \texttt{Bidirectional\allowbreak{}Iterator}，但反之未必成立。在某种意义上，我们可以把 \texttt{Random\allowbreak{}Access\allowbreak{}Iterator} 想象成相对于 \texttt{Bidirectional\allowbreak{}Iterator} 的一个子类或子概念（sub-concept）；并且可以说，\texttt{Bidirectional\allowbreak{}Iterator} 是一个比 \texttt{Random\allowbreak{}Access\allowbreak{}Iterator} 更弱的概念，施加的要求更少。
+
+比这更弱的一个概念，是那种连自减都不支持的迭代器。例如，我们的 \texttt{list\_\allowbreak{}of\_\allowbreak{}ints::\allowbreak{}iterator} 类型就不支持自减，因为我们的链表没有前驱指针；一旦你拿到一个指向链表中某个元素的迭代器，你就只能向前移动到更靠后的元素，永远无法向后退回到先前的元素。只支持 \texttt{++p} 而不支持 \texttt{--p} 的迭代器，被称为前向迭代器（forward iterator）（\texttt{Forward\allowbreak{}Iterator}）。\texttt{Forward\allowbreak{}Iterator} 是比 \texttt{Bidirectional\allowbreak{}Iterator} 更弱的概念。
+
+\section{输入与输出迭代器}
+
+我们甚至可以想象出比 \texttt{Forward\allowbreak{}Iterator} 更弱的概念！例如，有一种有用的
+
+使用 \texttt{Forward\allowbreak{}Iterator} 能做的一件事，就是复制它、保存副本，然后用副本把同一份数据再迭代一遍。操作迭代器（或其副本）完全不会影响底层的数据范围。但我们也能发明出像下面代码片段里那样的迭代器——它根本没有底层数据，甚至复制这个迭代器本身都没有任何意义：
+
+\begin{codebox}[cpp]
+    class getc_iterator {
+      char ch;
+    public:
+      getc_iterator() : ch(getc(stdin)) {}
+      char operator*() const { return ch; }
+      auto& operator++() { ch = getc(stdin); return *this; }
+      auto operator++(int) { auto result(*this); ++*this; return result; }
+      bool operator==(const getc_iterator&) const { return false; }
+      bool operator!=(const getc_iterator&) const { return true; }
+    };
+\end{codebox}
+
+（事实上，标准库里确实包含一些与这个非常相似的迭代器类型；我们将在第 9 章「I/O 流」中讨论其中一个，即 \texttt{std::\allowbreak{}istream\_\allowbreak{}iterator}。）这类迭代器无法被有意义地复制，也不指向任何有实际意义的数据元素，它们被称为输入迭代器（\texttt{Input\allowbreak{}Iterator}）类型。
+
+镜像般的情况同样可能出现。请看下面这个虚构的迭代器类型：
+
+\begin{codebox}[cpp]
+    class putc_iterator {
+      struct proxy {
+        void operator= (char ch) { putc(ch, stdout); }
+      };
+    public:
+      proxy operator*() const { return proxy{}; }
+      auto& operator++() { return *this; }
+      auto& operator++(int) { return *this; }
+      bool operator==(const putc_iterator&) const { return false; }
+      bool operator!=(const putc_iterator&) const { return true; }
+    };
+    void test()
+    {
+      putc_iterator it;
+      for (char ch : {'h', 'e', 'l', 'l', 'o', '\n'}) {
+        *it++ = ch;
+      }
+    }
+\end{codebox}
+
+（同样地，标准库中也包含一些与此非常相似的迭代器类型：我们将在第 3 章「迭代器对算法」中讨论 \texttt{std::\allowbreak{}back\_\allowbreak{}insert\_\allowbreak{}iterator}，并在第 9 章「I/O 流」中讨论 \texttt{std::\allowbreak{}ostream\_\allowbreak{}iterator}。）这类迭代器无法被有意义地复制，且只能写入、不能读出，被称为输出迭代器（\texttt{Output\allowbreak{}Iterator}）类型。
+
+C++ 中的每一种迭代器类型，都至少属于以下五个类别之一：
+
+\begin{codebox}[cpp]
+InputIterator
+OutputIterator
+ForwardIterator
+BidirectionalIterator, and/or
+RandomAccessIterator
+\end{codebox}
+
+请注意：虽然我们很容易在编译期判断某个迭代器类型是否满足 \texttt{Bidirectional\allowbreak{}Iterator} 或 \texttt{Random\allowbreak{}Access\allowbreak{}Iterator} 的要求，却无法（仅凭它所支持的语法操作）分辨出我们面对的到底是 \texttt{Input\allowbreak{}Iterator}、\texttt{Output\allowbreak{}Iterator} 还是 \texttt{Forward\allowbreak{}Iterator}。在我们刚才的例子里，\texttt{getc\_\allowbreak{}iterator}、\texttt{putc\_\allowbreak{}iterator} 和 \texttt{list\_\allowbreak{}of\_\allowbreak{}ints::\allowbreak{}iterator} 所支持的语法操作完全一样——用 \texttt{*it} 解引用、用 \texttt{++it} 自增、用 \texttt{it != it} 比较。这三个类的差别只体现在语义层面。那么标准库究竟如何区分它们呢？
+
+事实证明，标准库需要从每个新迭代器类型的实现者那里得到一点帮助。标准库的算法只会对那些定义了名为 \texttt{iterator\_\allowbreak{}category}（迭代器类别）的成员类型别名的迭代器类生效。也就是说：
+
+\begin{codebox}[cpp]
+    class getc_iterator {
+      char ch;
+    public:
+      using iterator_category = std::input_iterator_tag;
+      // …
+    };
+    class putc_iterator {
+      struct proxy {
+        void operator= (char ch) { putc(ch, stdout); }
+      };
+    public:
+      using iterator_category = std::output_iterator_tag;
+      // …
+    };
+    template<bool Const>
+    class list_of_ints_iterator {
+      using node_pointer = std::conditional_t<Const, const list_node*,
+       list_node*>;
+      node_pointer ptr_;
+    public:
+      using iterator_category = std::forward_iterator_tag;
+      // …
+    };
+\end{codebox}
+
+这样一来，任何想要依据其模板类型参数的迭代器类别来定制行为的标准（甚至非标准）算法，都只需检查这些类型的 \texttt{iterator\_\allowbreak{}category} 就能完成定制。
+
+上一段所描述的各个迭代器类别，对应着在 \texttt{<iterator>\allowbreak{}} 头文件中定义的如下五个标准标签类型：
+
+\begin{codebox}[cpp]
+    struct input_iterator_tag { };
+    struct output_iterator_tag { };
+    struct forward_iterator_tag : public input_iterator_tag { };
+    struct bidirectional_iterator_tag : public forward_iterator_tag { };
+    struct random_access_iterator_tag : public bidirectional_iterator_tag
+    { };
+\end{codebox}
+
+请注意，\texttt{random\_\allowbreak{}access\_\allowbreak{}iterator\_\allowbreak{}tag} 实际上（在古典面向对象、多态类层次结构的意义上）派生自 \texttt{bidirectional\_\allowbreak{}iterator\_\allowbreak{}tag}，依此类推：迭代器种类的概念层次，被反映在了 \texttt{iterator\_\allowbreak{}category} 标签类的类层次结构中。这在你做标签分发（tag dispatch）的模板元编程时会非常有用；但就使用标准库而言，你只需知道一件事——如果你要把某个 \texttt{iterator\_\allowbreak{}category} 传给函数，那么类型为 \texttt{random\_\allowbreak{}access\_\allowbreak{}iterator\_\allowbreak{}tag} 的标签，可以匹配期望参数为 \texttt{bidirectional\_\allowbreak{}iterator\_\allowbreak{}tag} 类型的函数：
+
+\begin{codebox}[cpp]
+    void foo(std::bidirectional_iterator_tag t [[maybe_unused]])
+    {
+      puts("std::vector's iterators are indeed bidirectional...");
+    }
+    void bar(std::random_access_iterator_tag)
+    {
+      puts("...and random-access, too!");
+    }
+    void bar(std::forward_iterator_tag)
+    {
+      puts("forward_iterator_tag is not as good a match");
+    }
+    void test()
+    {
+      using It = std::vector<int>::iterator;
+      foo(It::iterator_category{});
+      bar(It::iterator_category{});
+    }
+\end{codebox}
+
+此时你大概会纳闷："那 \texttt{int*} 又该怎么办？对于根本不是类类型、而是原始标量类型的东西，我们要怎么为它提供成员类型别名呢？标量类型不可能拥有成员类型别名。"好吧，和软件工程中的大多数问题一样，这个问题可以通过增加一层间接来解决。标准算法并不会直接引用 \texttt{T::\allowbreak{}iterator\_\allowbreak{}category}，而是始终谨慎地引用 \texttt{std::\allowbreak{}iterator\_\allowbreak{}traits<\allowbreak{}T>\allowbreak{}::\allowbreak{}iterator\_\allowbreak{}category}。类模板 \texttt{std::\allowbreak{}iterator\_\allowbreak{}traits<\allowbreak{}T>\allowbreak{}} 针对 \texttt{T} 为指针类型的情况做了恰当的特化。
+
+此外，\texttt{std::\allowbreak{}iterator\_\allowbreak{}traits<\allowbreak{}T>\allowbreak{}} 还被证明是挂接其他成员类型别名的便利之所。当且仅当 \texttt{T} 自身提供全部这五个类型别名（或者 \texttt{T} 是指针类型）时，它才会提供以下五个成员类型别名：\texttt{iterator\_\allowbreak{}category}、\texttt{difference\_\allowbreak{}type}、\texttt{value\_\allowbreak{}type}、\texttt{pointer} 和 \texttt{reference}。
+
+\section{整合起来}
+
+把本章所学的一切整合起来，我们现在可以写出类似下面示例的代码了。在这个示例里，我们用自己的迭代器类（包含一个具备常量正确性的 \texttt{const\_\allowbreak{}iterator} 版本）来实现自己的 \texttt{list\_\allowbreak{}of\_\allowbreak{}ints}；并通过提供那五个至关重要的成员类型别名，让它能与标准库协同工作。
+
+\begin{codebox}[cpp]
+    struct list_node {
+      int data;
+      list_node *next;
+    };
+    template<bool Const>
+    class list_of_ints_iterator {
+      friend class list_of_ints;
+      friend class list_of_ints_iterator<!Const>;
+      using node_pointer = std::conditional_t<Const, const list_node*,
+        list_node*>;
+      node_pointer ptr_;
+      explicit list_of_ints_iterator(node_pointer p) : ptr_(p) {}
+    public:
+      // std::iterator_traits 要求的成员类型别名
+      using difference_type = std::ptrdiff_t;
+      using value_type = int;
+      using pointer = std::conditional_t<Const, const int*, int*>;
+      using reference = std::conditional_t<Const, const int&, int&>;
+      using iterator_category = std::forward_iterator_tag;
+      reference operator*() const { return ptr_->data; }
+      auto& operator++() { ptr_ = ptr_->next; return *this; }
+      auto operator++(int) { auto result = *this; ++*this; return result; }
+      // 支持 iterator 与 const_iterator 类型之间的比较
+      template<bool R>
+      bool operator==(const list_of_ints_iterator<R>& rhs) const
+        { return ptr_ == rhs.ptr_; }
+      template<bool R>
+      bool operator!=(const list_of_ints_iterator<R>& rhs) const
+        { return ptr_ != rhs.ptr_; }
+      // 支持 iterator 向 const_iterator 的隐式转换
+      // （反之则不支持）
+      operator list_of_ints_iterator<true>() const { return
+        list_of_ints_iterator<true>{ptr_}; }
+    };
+    class list_of_ints {
+      list_node *head_ = nullptr;
+      list_node *tail_ = nullptr;
+      int size_ = 0;
+    public:
+      using const_iterator = list_of_ints_iterator<true>;
+      using iterator = list_of_ints_iterator<false>;
+      // begin 与 end 成员函数
+      iterator begin() { return iterator{head_}; }
+      iterator end() { return iterator{nullptr}; }
+      const_iterator begin() const { return const_iterator{head_}; }
+      const_iterator end() const { return const_iterator{nullptr}; }
+      // 其他成员操作
+      int size() const { return size_; }
+      void push_back(int value) {
+        list_node *new_tail = new list_node{value, nullptr};
+        if (tail_) {
+          tail_->next = new_tail;
+        } else {
+          head_ = new_tail;
+        }
+        tail_ = new_tail;
+        size_ += 1;
+      }
+      ~list_of_ints() {
+        for (list_node *next, *p = head_; p != nullptr; p = next) {
+          next = p->next;
+          delete p;
+        }
+      }
+    };
+\end{codebox}
+
+然后，为了证明我们理解了标准库是如何实现泛型算法的，我们将完全按照 C++17 标准库的方式来实现 \texttt{distance} 和 \texttt{count\_\allowbreak{}if} 这两个函数模板。请注意 \texttt{distance} 中使用了 C++17 新增的 \texttt{if constexpr} 语法。本书不会过多讨论 C++17 的核心语言特性，但简而言之，相比你在 C++14 中不得不写的那些代码，用 \texttt{if constexpr} 可以消除大量别扭的样板代码。
+
+\begin{codebox}[cpp]
+    template<typename Iterator>
+    auto distance(Iterator begin, Iterator end)
+    {
+      using Traits = std::iterator_traits<Iterator>;
+      if constexpr (std::is_base_of_v<std::random_access_iterator_tag,
+        typename Traits::iterator_category>) {
+          return (end - begin);
+        } else {
+         auto result = typename Traits::difference_type{};
+         for (auto it = begin; it != end; ++it) {
+           ++result;
+         }
+         return result;
+       }
+    }
+    template<typename Iterator, typename Predicate>
+    auto count_if(Iterator begin, Iterator end, Predicate pred)
+    {
+      using Traits = std::iterator_traits<Iterator>;
+      auto sum = typename Traits::difference_type{};
+      for (auto it = begin; it != end; ++it) {
+        if (pred(*it)) {
+          ++sum;
+        }
+      }
+      return sum;
+    }
+    void test()
+    {
+       list_of_ints lst;
+       lst.push_back(1);
+       lst.push_back(2);
+       lst.push_back(3);
+       int s = count_if(lst.begin(), lst.end(), [](int i){
+          return i >= 2;
+       });
+       assert(s == 2);
+       int d = distance(lst.begin(), lst.end());
+       assert(d == 3);
+    }
+\end{codebox}
+
+在下一章里，我们将不再从零开始实现那么多自己的函数模板，而是开始逐一过一遍标准模板库提供的函数模板。不过，在结束这场关于迭代器的深入讨论之前，还有一件事我想谈一谈。
+
+\section{被废弃的 \texttt{std::\allowbreak{}iterator}}
+
+你也许会想："我实现的每个迭代器类都得提供同样的五个成员类型别名。这可是一大堆样板代码——如果可以的话，我很想把这堆重复的输入抽出来。"难道就没有办法消除所有这些样板代码吗？
+
+其实，从 C++98 一直到 C++17，标准库都包含了一个专门做这件事的辅助类模板。它名叫 \texttt{std::\allowbreak{}iterator}，接受五个模板类型参数，分别对应 \texttt{std::\allowbreak{}iterator\_\allowbreak{}traits} 所要求的那五个成员类型别名。
+
+其中三个参数带有"合理的默认值"，也就是说最简单的用例已经被很好地覆盖了：
+
+\begin{codebox}[cpp]
+    namespace std {
+      template<
+        class Category,
+        class T,
+        class Distance = std::ptrdiff_t,
+        class Pointer = T*,
+        class Reference = T&
+      > struct iterator {
+        using iterator_category = Category;
+        using value_type = T;
+        using difference_type = Distance;
+        using pointer = Pointer;
+        using reference = Reference;
+      };
+    }
+    class list_of_ints_iterator :
+      public std::iterator<std::forward_iterator_tag, int>
+    {
+       // …
+    };
+\end{codebox}
+
+可惜对 \texttt{std::\allowbreak{}iterator} 而言，现实生活并没有那么简单；而且 \texttt{std::\allowbreak{}iterator} 在 C++17 中被废弃（deprecated），原因有若干条，我们马上就会讨论。
+
+正如我们在「常量迭代器」一节中所见，常量正确性（const-correctness）要求我们在提供每个"非常量迭代器"类型的同时，也提供一个常量迭代器类型。所以，仿照那个例子，我们最终真正写出来的代码是这样的：
+
+\begin{codebox}[cpp]
+    template<
+      bool Const,
+      class Base = std::iterator<
+        std::forward_iterator_tag,
+        int,
+        std::ptrdiff_t,
+        std::conditional_t<Const, const int*, int*>,
+        std::conditional_t<Const, const int&, int&>
+      >
+    >
+    class list_of_ints_iterator : public Base
+    {
+      using typename Base::reference; // 别扭！
+      using node_pointer = std::conditional_t<Const, const list_node*,
+        list_node*>;
+      node_pointer ptr_;
+    public:
+      reference operator*() const { return ptr_->data; }
+      // …
+    };
+\end{codebox}
+
+上面这段代码，并不比那个不使用 \texttt{std::\allowbreak{}iterator} 的版本更容易读或写；而且，按预期方式使用 \texttt{std::\allowbreak{}iterator} 还会通过公开继承把我们的代码弄得更复杂——换句话说，它看起来非常像古典面向对象的类层次结构。初学者很有可能会被引诱，在编写下面这样的函数时去利用那个类层次结构：
+
+\begin{codebox}[cpp]
+    template<typename... Ts, typename Predicate>
+    int count_if(const std::iterator<Ts...>& begin,
+                 const std::iterator<Ts...>& end,
+                 Predicate pred);
+\end{codebox}
+
+这表面上很像我们在第 1 章「古典多态与泛型编程」里见过的"多态编程"示例——那种通过接受基类引用类型的参数来实现不同行为的函数。但在 \texttt{std::\allowbreak{}iterator} 这个例子里，这种相似纯属偶然，而且具有误导性；从 \texttt{std::\allowbreak{}iterator} 继承并不会给我们带来一个多态的类层次结构，而在我们自己的函数里引用那个"基类"也永远不是正确的做法！
+
+因此，C++17 标准废弃了 \texttt{std::\allowbreak{}iterator}，并计划在 2020 年或某个更晚的标准中将其彻底移除。你不该在自己写的代码里使用 \texttt{std::\allowbreak{}iterator}。
+
+不过，如果你在代码库里使用了 Boost，或许可以看看与 \texttt{std::\allowbreak{}iterator} 对应的 Boost 版本，它写作 \texttt{boost::\allowbreak{}iterator\_\allowbreak{}facade}。与 \texttt{std::\allowbreak{}iterator} 不同，\texttt{boost::\allowbreak{}iterator\_\allowbreak{}facade} 这个基类为那些烦人的成员函数（例如 \texttt{operator++(\allowbreak{}int)\allowbreak{}} 和 \texttt{operator!=}）提供了默认实现，否则它们会成为冗长乏味的样板代码。要使用 \texttt{iterator\_\allowbreak{}facade}，只需继承它，并定义几个原始成员函数，如 \texttt{dereference}、\texttt{increment} 和 \texttt{equal}。
+
+（因为我们的链表迭代器是一个 \texttt{Forward\allowbreak{}Iterator}，所以这些就足够了。而对于 \texttt{Bidirectional\allowbreak{}Iterator}，你还需要额外提供一个 \texttt{decrement} 成员函数，依此类推。）
+
+由于这些原始成员函数是 \texttt{private} 的，我们通过下面这条声明把访问权授予 Boost：\texttt{friend class boost::\allowbreak{}iterator\_\allowbreak{}core\_\allowbreak{}access;}：
+
+\begin{codebox}[cpp]
+    #include <boost/iterator/iterator_facade.hpp>
+    template<bool Const>
+    class list_of_ints_iterator : public boost::iterator_facade<
+      list_of_ints_iterator<Const>,
+      std::conditional_t<Const, const int, int>,
+      std::forward_iterator_tag
+    >
+    {
+      friend class boost::iterator_core_access;
+      friend class list_of_ints;
+      friend class list_of_ints_iterator<!Const>;
+      using node_pointer = std::conditional_t<Const, const list_node*,
+        list_node*>;
+      node_pointer ptr_;
+      explicit list_of_ints_iterator(node_pointer p) : ptr_(p) {}
+      auto& dereference() const { return ptr_->data; }
+      void increment() { ptr_ = ptr_->next; }
+      // 支持 iterator 与 const_iterator 类型之间的比较
+      template<bool R>
+      bool equal(const list_of_ints_iterator<R>& rhs) const {
+        return ptr_ == rhs.ptr_;}
+    public:
+      // 支持 iterator 向 const_iterator 的隐式转换
+      // （反之则不支持）
+      operator list_of_ints_iterator<true>() const { return
+        list_of_ints_iterator<true>{ptr_}; }
+    };
+\end{codebox}
+
+请注意，\texttt{boost::\allowbreak{}iterator\_\allowbreak{}facade} 的第一个模板类型参数，永远是你正在定义的那个类——这正是奇异递归模板模式（CRTP），我们将在第 6 章「智能指针」中再次见到它。
+
+这段使用 \texttt{boost::\allowbreak{}iterator\_\allowbreak{}facade} 的链表迭代器代码，比前面的代码要简短得多——
+
+上节中的同一段代码；节省的工作量主要来自不必重复编写那些关系运算符。由于我们的列表迭代器是一个 \texttt{Forward\allowbreak{}Iterator}，我们当时只有两个关系运算符；但如果它是一个 \texttt{Random\allowbreak{}Access\allowbreak{}Iterator}，那么 \texttt{iterator\_\allowbreak{}facade} 就会基于那个唯一的原语成员函数 \texttt{distance\_\allowbreak{}to}，为运算符 \texttt{-}、\texttt{<}、\texttt{>}、\texttt{<=} 和 \texttt{>=} 全部生成默认实现。
+
+\section{小结}
+
+在本章中，我们认识到，遍历是你能对数据结构做的最基础的操作之一。然而，仅凭裸指针不足以遍历复杂的结构：对裸指针使用 \texttt{++} 往往不会按预期「走到下一个元素」。
+
+C++ 标准模板库（STL）把迭代器（iterator）这一概念作为裸指针的推广提供出来。两个迭代器界定出一段数据范围（range）。这个范围可能只是某个容器内容的一部分；也可能根本没有任何内存支撑，正如我们在 \texttt{getc\_\allowbreak{}iterator} 和 \texttt{putc\_\allowbreak{}iterator} 中看到的那样。迭代器类型的一些属性被编码在它的迭代器类别之中——输入、输出、前向、双向或随机访问——以便函数模板能对特定类别的迭代器使用更快的算法。
+
+如果你要定义自己的容器类型，你还需要定义自己的迭代器类型——包括常量（const）和非常量两个版本。模板（template）是完成这件事的便捷手段。在实现自己的迭代器类型时，应当避开已被弃用的 \texttt{std::\allowbreak{}iterator}，但可以考虑 \texttt{boost::\allowbreak{}iterator\_\allowbreak{}facade}。

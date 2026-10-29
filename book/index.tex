@@ -1,0 +1,31 @@
+% book/index.tex —— 封面、目录与全书章节索引（STL 中文版，完整版）
+
+% 原书封面（Packt 原版真实封面，从第 1 页提取），置于最前
+\myFrontNoToc{content/front/00-cover}
+
+% 中文内封（仿原书配色重画的标题页）
+\myFrontNoToc{content/front/00-title}
+
+\newpage
+\thispagestyle{empty}
+\tableofcontents
+\newpage
+
+\myFront{关于作者}{content/front/02-author}
+\myFront{关于审校者}{content/front/03-reviewer}
+\myFront{前言}{content/front/01-preface}
+
+\myChapter{1}{古典多态与泛型编程}{content/main/01}
+\myChapter{2}{迭代器与范围}{content/main/02}
+\myChapter{3}{迭代器对算法}{content/main/03}
+\myChapter{4}{容器动物园}{content/main/04}
+\myChapter{5}{词汇类型}{content/main/05}
+\myChapter{6}{智能指针}{content/main/06}
+\myChapter{7}{并发}{content/main/07}
+\myChapter{8}{分配器}{content/main/08}
+\myChapter{9}{I/O 流}{content/main/09}
+\myChapter{10}{正则表达式}{content/main/10}
+\myChapter{11}{随机数}{content/main/11}
+\myChapter{12}{文件系统}{content/main/12}
+
+\myFront{索引}{content/back/00-index}

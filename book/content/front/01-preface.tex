@@ -1,0 +1,117 @@
+C++ 语言历史悠久，可追溯到 20 世纪 80 年代。最近它经历了一场复兴，在 2011 年和 2014 年引入了重要的新特性。在本书付印之时，C++17 标准已经近在咫尺。
+
+C++11 实际上让标准库（Standard Library）的规模翻了一倍，新增了 \texttt{<tuple>\allowbreak{}}、\texttt{<type\_\allowbreak{}traits>\allowbreak{}} 和 \texttt{<regex>\allowbreak{}} 等头文件（header）。C++17 再次让库规模翻倍，新增了 \texttt{<optional>\allowbreak{}}、\texttt{<any>\allowbreak{}} 和 \texttt{<filesystem>\allowbreak{}} 等内容。一位把时间花在写代码、而不是关注标准化进程上的程序员，大概会由衷地感到标准库已经让他望尘莫及——库里新增的东西实在太多，他永远无法掌握全部，甚至无法分辨其中的精华与糟粕。
+
+毕竟，谁愿意花一个月去研读 \texttt{std::\allowbreak{}locale} 和 \texttt{std::\allowbreak{}ratio} 的技术文档，结果发现它们在日常工作中根本用不上呢？
+
+在本书中，我将向你讲授 C++17 标准库最重要的特性。出于篇幅考虑，我会略过某些部分，例如前面提到的 \texttt{<type\_\allowbreak{}traits>\allowbreak{}}；但我们会覆盖整个现代 STL（每一个标准容器（container）和每一个标准算法（algorithm）），此外还包括智能指针（smart pointer）、随机数（random number）、正则表达式（regular expression），以及 C++17 新增的 \texttt{<filesystem>\allowbreak{}} 库等重要主题。
+
+我会通过示例来教学。你将学会构建自己的迭代器（iterator）类型；使用 \texttt{std::\allowbreak{}pmr::\allowbreak{}memory\_\allowbreak{}resource} 构建自己的内存分配器（allocator）；以及使用 \texttt{std::\allowbreak{}future} 构建自己的线程池（thread pool）。
+
+我会讲授参考手册中找不到的概念。你将了解单态（monomorphic）、多态（polymorphic）与泛型（generic）算法之间的区别（第 1 章「古典多态与泛型编程」）；了解 \texttt{std::\allowbreak{}string} 或 \texttt{std::\allowbreak{}any} 被称为「词汇类型（vocabulary type）」意味着什么（第 5 章「词汇类型」）；以及我们对 2020 年及以后未来 C++ 标准可以有哪些期待。
+
+我假设你已经对 C++11 的核心语言相当熟悉；例如，你已经知道如何编写类和函数模板（template），了解左值引用与右值引用之间的区别，等等。
+
+\section{本书内容涵盖}
+
+第 1 章「古典多态与泛型编程」介绍了古典多态（虚成员函数）与泛型编程（模板）。
+
+第 2 章「迭代器与范围」把迭代器解释为指针的一般化，并阐述了以迭代器对表示的半开区间（half-open range）的用处。
+
+第 3 章「迭代器对算法」探索了数量众多的标准泛型算法（generic algorithm），它们作用于以迭代器对表示的范围（range）。
+
+第 4 章「容器动物园」探索了数量同样庞大的标准容器（container）类模板，以及哪些容器适合哪些工作。
+
+第 5 章「词汇类型」带你了解 \texttt{std::\allowbreak{}optional} 这样的代数类型（algebraic type），以及 \texttt{std::\allowbreak{}function} 这样对 ABI 友好、采用类型擦除（type erasure）的类型。
+
+第 6 章「智能指针」讲授智能指针（smart pointer）的目的与用法。
+
+第 7 章「并发（Concurrency）」涵盖原子类型（atomic）、互斥量（mutex）、条件变量（condition variable）、线程（thread）、future 与 promise。
+
+第 8 章「分配器（Allocator）」讲解 C++17 的 \texttt{<memory\_\allowbreak{}resource>\allowbreak{}} 头文件的新特性。
+
+第 9 章「I/O 流」探索了 C++ 的 I/O 模型从 \texttt{<unistd.\allowbreak{}h>\allowbreak{}} 到 \texttt{<stdio.\allowbreak{}h>\allowbreak{}} 再到 \texttt{<iostream>\allowbreak{}} 的演进。
+
+第 10 章「正则表达式（Regular Expression）」讲授 C++ 中的正则表达式。
+
+第 11 章「随机数（Random Number）」带你了解 C++ 对伪随机数（pseudo-random number）生成的支持。
+
+第 12 章「文件系统（Filesystem）」涵盖 C++17 新增的 \texttt{<filesystem>\allowbreak{}} 库。
+
+\section{本书所需环境}
+
+由于本书并非参考手册，手边备一本参考手册（例如 cppreference（\texttt{en.\allowbreak{}cppreference.\allowbreak{}com/\allowbreak{}w/\allowbreak{}cpp}））或许对你很有帮助，可以用来厘清任何令人困惑之处。
+
+手边有一款 C++17 编译器肯定会有帮助。在本书付印之时，已经有若干或多或少特性完整的 C++17 实现，包括 GCC、Clang 和 Microsoft Visual Studio。你可以在本地运行它们，也可以通过许多免费的在线编译服务来运行，例如 Wandbox（\texttt{wandbox.\allowbreak{}org}）、Godbolt（\texttt{gcc.\allowbreak{}godbolt.\allowbreak{}org}）和 Rextester（\texttt{rextester.\allowbreak{}com}）。
+
+\section{本书的目标读者}
+
+本书面向那些希望掌握 C++17 STL 并充分利用其组件的开发者。读者需具备一定的 C++ 基础。
+
+\section{排版约定}
+
+在本书中，你会发现许多用来区分不同种类信息的文本样式。下面是这些样式的一些示例，以及对其含义的说明。
+
+正文中的代码字、数据库表名、文件夹名、文件名、文件扩展名、路径名、虚拟 URL、用户输入和 Twitter 账号都按如下方式显示：「\texttt{buffer(\allowbreak{})\allowbreak{}} 函数接受 \texttt{int} 类型的参数。」
+
+代码块按如下方式设置：
+
+\begin{codebox}[cpp]
+    try {
+      none.get();
+    } catch (const std::future_error& ex) {
+      assert(ex.code() == std::future_errc::broken_promise);
+    }
+\end{codebox}
+
+新术语和重要词汇以粗体显示。
+
+警告或重要说明以这种方式出现。
+
+提示与说明以这种方式出现。
+
+\section{读者反馈}
+
+我们始终欢迎读者的反馈。请让我们知道你对本书的看法——你喜欢或不喜欢的地方。
+
+读者反馈对我们很重要，因为它能帮助我们打造出你真正能从中获益的图书。若要向我们发送一般性的反馈，只需发送电子邮件到 \texttt{feedback@packtpub.\allowbreak{}com}，并在邮件主题中注明书名。
+
+如果你在某个主题上有专长，并且有意为本书撰稿或参与贡献，请参阅我们的作者指南：\texttt{www.\allowbreak{}packtpub.\allowbreak{}com/\allowbreak{}authors}。
+
+\section{客户支持}
+
+既然你已经成为一本 Packt 图书的自豪拥有者，我们准备了若干内容来帮助你充分利用这次购买。
+
+\subsection{下载示例代码}
+
+你可以从你的账户 \texttt{http:/\allowbreak{}/\allowbreak{}www.\allowbreak{}packtpub.\allowbreak{}com} 下载本书的示例代码文件。如果你是在其他地方购买的本书，可以访问 \texttt{http:/\allowbreak{}/\allowbreak{}www.\allowbreak{}packtpub.\allowbreak{}com/\allowbreak{}support} 并注册，让文件直接通过电子邮件发送给你。
+
+你可以按以下步骤下载代码文件：
+
+\begin{enumerate}
+\item 使用你的电子邮件地址和密码登录或注册我们的网站。
+\item 将鼠标指针悬停在顶部的 SUPPORT 选项卡上。
+\item 点击 Code Downloads \& Errata。
+\item 在搜索框中输入书名。
+\item 选择你要下载代码文件的图书。
+\item 从下拉菜单中选择你购买本书的渠道。
+\item 文件下载完成后，请确保使用以下工具的最新版本解压或提取该文件夹：
+\end{enumerate}
+
+Windows 平台使用 WinRAR / 7-Zip；Mac 平台使用 Zipeg / iZip / UnRarX；Linux 平台使用 7-Zip / PeaZip。
+
+本书的代码包也托管在 GitHub 上：\texttt{https:/\allowbreak{}/\allowbreak{}github.\allowbreak{}com/\allowbreak{}Packt\allowbreak{}Publishing/\allowbreak{}Mastering-the-Cpp17-STL}。我们也提供了来自丰富图书与视频目录的其他代码包，地址为 \texttt{https:/\allowbreak{}/\allowbreak{}github.\allowbreak{}com/\allowbreak{}Packt\allowbreak{}Publishing/\allowbreak{}}。
+
+去看看吧！
+
+\subsection{勘误}
+
+尽管我们已尽心确保内容准确，但错误仍可能发生。如果你在我们的某本书中发现了错误——也许是正文或代码中的错误——若能向我们报告，我们将不胜感激。这样做可以避免其他读者感到沮丧，并帮助我们改进本书的后续版本。如果你发现了任何勘误，请访问 \texttt{http:/\allowbreak{}/\allowbreak{}www.\allowbreak{}packtpub.\allowbreak{}com/\allowbreak{}submit-errata}，选择你的图书，点击 Errata Submission Form 链接，并填写勘误的详细信息。一旦你的勘误通过核实，你的提交就会被接受，勘误将被上传到我们的网站，或添加到该书勘误部分下的现有勘误列表中。若要查看此前提交的勘误，请访问 \texttt{https:/\allowbreak{}/\allowbreak{}www.\allowbreak{}packtpub.\allowbreak{}com/\allowbreak{}books/\allowbreak{}content/\allowbreak{}support}，并在搜索框中输入书名。所需信息将显示在勘误部分下。
+
+\subsection{盗版}
+
+互联网上受版权保护内容的盗版问题，是横跨所有媒体的一个持续存在的问题。在 Packt，我们非常重视对自身版权和许可的保护。如果你在互联网上以任何形式发现了我们作品的任何非法副本，请立即向我们提供其位置地址或网站名称，以便我们采取补救措施。请通过 \texttt{copyright@packtpub.\allowbreak{}com} 与我们联系，并附上疑似盗版材料的链接。我们感谢你协助保护我们的作者，以及我们为你带来有价值内容的能力。
+
+\subsection{问题}
+
+如果你对本书的任何方面有问题，可以通过 \texttt{questions@packtpub.\allowbreak{}com} 与我们联系，我们将尽力解决。

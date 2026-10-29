@@ -1,0 +1,665 @@
+在上一章中，我们全面学习了 C++ 中的格式化输入与输出。我们看到，格式化输出其实有很好的解决方案——只要你确保自己处于 \texttt{C} 区域设置（locale）——但尽管有诸多输入解析的办法，哪怕只是从字符串中解析出一个 \texttt{int} 这样的简单任务，也可能相当困难。（回想一下，在两种最稳妥的方法中，\texttt{std::\allowbreak{}stoi(\allowbreak{}x)\allowbreak{}} 需要把 \texttt{x} 转换成在堆上分配的 \texttt{std::\allowbreak{}string}，而冗长的 \texttt{std::\allowbreak{}from\_\allowbreak{}chars(\allowbreak{}x.\allowbreak{}begin(\allowbreak{})\allowbreak{},\allowbreak{} x.\allowbreak{}end(\allowbreak{})\allowbreak{},\allowbreak{} \&value,\allowbreak{} 10)\allowbreak{}} 在各大厂商的 C++17 实现中普及程度还落后于其他部分。）解析数字时最让人头疼的部分，就是处理输入中那些非数字的内容！
+
+如果能把解析拆成两个子任务，事情就会容易一些：首先，确定输入中有多少字节对应于一个「输入项」（这称为词法分析（lexing））；其次，解析该输入项的值，并在其值超出范围或毫无意义时进行一定的错误恢复。如果把这种方法应用到整数输入上，词法分析就对应于在输入中找到最长的起始数字序列，而解析则对应于以十进制计算该序列的数值。
+
+正则表达式（regular expression，或 regexes）是许多编程语言都提供的一种工具，它不仅能解决数字序列的词法分析问题，还能应对任意复杂的输入格式。自 2011 年起，正则表达式就已成为 C++ 标准库的一部分，位于 \texttt{<regex>\allowbreak{}} 头文件中。在本章中，我们将向你展示如何使用正则表达式来简化一些常见的解析任务。
+
+请注意，对于日常工作中遇到的大多数解析任务来说，正则表达式很可能会「杀鸡用牛刀」。它们可能既慢又臃肿，而且不可避免地需要堆分配（也就是说，正则数据类型并不像第 8 章「分配器（allocator）」中描述的那样具备分配器感知能力）。正则表达式真正大放异彩的地方，在于那些即便手写解析代码也同样缓慢的复杂任务；以及那些极为简单的任务，此时正则表达式的可读性与健壮性足以抵消其性能开销。简而言之，对正则表达式的支持让 C++ 向 Python、Perl 等脚本语言在日常可用性上又走近了一步。
+
+本章我们将学习：
+\begin{itemize}
+\item 改良版 ECMAScript（C++ 正则表达式所用的方言）
+\item 如何使用正则表达式进行匹配、搜索，乃至替换子串
+\item 悬垂迭代器更多的危险
+\item 应当避免的正则表达式特性
+\end{itemize}
+
+\section{什么是正则表达式？}
+
+正则表达式是一种把规则记录下来、用以判断一串字节或字符是否属于某个特定「语言」的方法。在这里，「语言」可以是任何东西，从「所有数字序列的集合」到「所有合法 C++ 词法单元（token）序列的集合」。本质上，「语言」只是一种规则，用来把全部字符串的世界划分为两个集合——符合该语言规则的字符串集合，以及不符合的字符串集合。
+
+有些语言所遵循的规则足够简单，可以被一台有限状态机（finite state machine）识别——那是一种毫无内存可言的计算机程序，只有一个程序计数器和一根指针，对输入做一次扫描。而「数字序列」这种语言，显然属于能够被有限状态机识别的语言类别。我们称这类语言为正则语言（regular language）。
+
+也存在非正则语言（non-regular language）。一种非常常见的非正则语言是「合法的算术表达式」，或者更本质地说，是「括号正确匹配」。任何一个能够区分正确匹配的字符串 \texttt{(\allowbreak{}(\allowbreak{}(\allowbreak{}(\allowbreak{})\allowbreak{})\allowbreak{})\allowbreak{})\allowbreak{}} 与不正确匹配的字符串 \texttt{(\allowbreak{}(\allowbreak{}(\allowbreak{}(\allowbreak{})\allowbreak{})\allowbreak{})\allowbreak{}} 和 \texttt{(\allowbreak{}(\allowbreak{}(\allowbreak{}(\allowbreak{})\allowbreak{})\allowbreak{})\allowbreak{})\allowbreak{})\allowbreak{}} 的程序，本质上都必须能够「计数」——要分清是四个括号，还是三个或五个。这种计数离不开一个可修改的变量或下推栈（push-down stack）；所以括号匹配并不是一种正则语言。
+
+事实证明，对于任意一种正则语言，都存在一种简洁直白的方法来书写识别它的有限状态机的表示，而这当然也就是该语言本身规则的表示。我们称这种表示为正则表达式（regular expression，或 regex）。正则表达式的标准记法诞生于 20 世纪 50 年代，并在 20 世纪 70 年代末随着 \texttt{grep}、\texttt{sed} 等 Unix 程序而真正定型——这些程序今天仍然非常值得学习，但当然超出了本书的范围。
+
+C++ 标准库提供了好几种不同的正则表达式语法「风味」，但默认的那一种（也是你应当始终使用的那一种）是从 ECMAScript 标准——即更广为人知的语言 JavaScript——整体借来的，仅在方括号构造附近做了细微修改。我在本章末尾附了一篇 ECMAScript 正则语法入门；但只要你用过 \texttt{grep}，不参考那一节也能轻松读懂本章其余部分。
+
+\subsection{关于反斜杠转义（backslash-escaping）的说明}
+
+在本章中，我们会频繁提到包含字面值反斜杠的字符串和正则表达式。正如你所知，要在 C++ 中写出包含字面值反斜杠的字符串，必须用另一个反斜杠来转义它：因此 \texttt{"\textbackslash n"} 表示一个换行符，而 \texttt{"\textbackslash\textbackslash n"} 表示由「反斜杠」后接「n」组成的两个字符的字符串。这类事情通常不难跟踪，但在本章我们却必须格外小心。
+
+正则表达式是纯粹以库特性实现的；所以当你写出 \texttt{std::\allowbreak{}regex(\allowbreak{}"\textbackslash n")\allowbreak{}} 时，正则库看到的「正则」只包含一个空白字符；而如果你写出 \texttt{std::\allowbreak{}regex(\allowbreak{}"\textbackslash\textbackslash n")\allowbreak{}}，库会看到一个以反斜杠开头的两个字符的字符串，并将其解释为一个表示「换行」的两字符转义序列。如果你想要把字面量「反斜杠-n」这个概念传递给正则库，就必须让正则库看到三字符的字符串 \texttt{\textbackslash\textbackslash\textbackslash\textbackslash n}，这意味著在你的 C++ 源码中需要写出五字符的字符串 \texttt{"\textbackslash\textbackslash\textbackslash\textbackslash n"}。
+
+你可能已经在前面那段里注意到，这就是我在本章将要采用的记法。当我说到一个 C++ 字符串字面量或字符串值时，我会把它放在双引号里，像这样：\texttt{"cat"}、\texttt{"a\textbackslash\textbackslash.\allowbreak{}b"}。而当我说到一个正则表达式——就像你在电子邮件或文本编辑器里键入它、或者交给库去求值那样——我会不加引号地表示它：\texttt{cat}、\texttt{a\textbackslash.\allowbreak{}b}。只需记住：当你看到一个不带引号的字符串时，那是一段字面的字符序列；而如果你想把它放进 C++ 字符串字面量里，就需要把所有反斜杠都加倍，也就是说：\texttt{a\textbackslash.\allowbreak{}b} 在你的源码中应写作 \texttt{std::\allowbreak{}regex(\allowbreak{}"a\textbackslash\textbackslash.\allowbreak{}b")\allowbreak{}}。
+
+我听到有人问：那原始字符串字面量（raw string literal）呢？原始字符串字面量是 C++11 的一项特性，它允许你用 \texttt{R} 和一对括号把整个字符串「转义」掉，从而写出字符序列 \texttt{a\textbackslash.\allowbreak{}b}——就像这样 \texttt{R"(\allowbreak{}a\textbackslash.\allowbreak{}b)\allowbreak{}"}——而不必转义字符串里的每一个反斜杠。如果你的字符串本身含有括号，那你可以玩得更花哨：在第一个括号之前和最后一个括号之后写上任意字符串，像这样：\texttt{R"fancy(\allowbreak{}a\textbackslash.\allowbreak{}b)\allowbreak{}fancy"}。这样的原始字符串字面量可以包含任意字符——反斜杠、引号，甚至换行——只要它不包含连续序列 \texttt{)\allowbreak{}fancy"} 即可（如果你觉得它有可能包含那个序列，那就换一个任意字符串，比如 \texttt{)\allowbreak{}supercalifragilisticexpialidocious"}）。
+
+C++ 原始字符串字面量以 \texttt{R} 打头，其语法令人联想到 Python 中的原始字符串字面量语法（以 \texttt{r} 打头）。在 Python 中，\texttt{r"a\textbackslash.\allowbreak{}b"} 同样表示字面字符串 \texttt{a\textbackslash.\allowbreak{}b}；而且，即便字符串里没有任何特殊字符，用 \texttt{r"abc"} 这样的字符串来表示代码中的正则表达式也是既常见又符合习惯的做法。但请注意 \texttt{r"a\textbackslash.\allowbreak{}b"} 与 \texttt{R"(\allowbreak{}a\textbackslash.\allowbreak{}b)\allowbreak{}"} 之间那至关重要的区别——C++ 版本多了一对括号！而括号在正则文法中是有特殊含义的字符。C++ 字符串字面量 \texttt{"(\allowbreak{}cat)\allowbreak{}"} 与 \texttt{R"(\allowbreak{}cat)\allowbreak{}"} 有着天壤之别——前者表示的是五字符的正则表达式 \texttt{(\allowbreak{}cat)\allowbreak{}}，后者表示的则是三字符的正则表达式 \texttt{cat}。
+
+如果你本想写 \texttt{"(\allowbreak{}cat)\allowbreak{}"} 却不小心写成了 \texttt{R"(\allowbreak{}cat)\allowbreak{}"}（或者等价地，写成了 \texttt{R"(\allowbreak{}(\allowbreak{}cat)\allowbreak{})\allowbreak{}"}），你的程序就会潜伏一个非常隐蔽的 bug。更「残忍」的是，\texttt{R"a*(\allowbreak{}b*)\allowbreak{}a*"} 竟是一个含义出人意料的有效正则！因此，我建议你在使用原始字符串字面量来书写正则表达式时务必格外谨慎；一般来说，把所有的反斜杠都加倍，要比操心「只把最外层括号加倍」更安全、也更清晰。
+
+原始字符串字面量有用的地方，在于其他语言所谓的「heredocs」：
+
+\begin{codebox}[cpp]
+     void print_help() {
+       puts(R"(The regex special characters are:
+       \ - escaping
+       | - separating alternatives
+       . - match any character
+       [] - character class or set
+       () - capturing parentheses, or lookahead
+       ?*+ - "zero or one", "zero or more", "one or more"
+       {} - "exactly N" or "M to N" repetitions
+       ^$ - beginning and end of a "line"
+       \b - word boundary
+       \d \s \w - digit, space, and word
+       (?=foo) (?!foo) - lookahead; negative lookahead
+     )");
+\end{codebox}
+
+也就是说，原始字符串字面量是 C++ 中唯一一种无需任何转义就能编码换行符的字符串字面量。这对于向用户打印长消息，或是诸如 HTTP 头之类的事情很有用；但原始字符串在括号上的行为，使得它们在配合正则表达式使用时多少有些危险——本书中我不会使用它们。
+
+\section{把正则表达式具体化为 std::regex 对象}
+
+要在 C++ 中使用正则表达式，你不能直接使用像 \texttt{"c[a-z]*t"} 这样的字符串。相反，你必须用该字符串构造一个类型为 \texttt{std::\allowbreak{}regex} 的正则表达式对象，再把该正则对象作为匹配函数（如 \texttt{std::\allowbreak{}regex\_\allowbreak{}match}、\texttt{std::\allowbreak{}regex\_\allowbreak{}search} 或 \texttt{std::\allowbreak{}regex\_\allowbreak{}replace}）的参数之一传进去。每一个 \texttt{std::\allowbreak{}regex} 类型的对象都为给定表达式编码了一台完整的有限状态机，而构造这台有限状态机需要大量的计算与内存分配；因此，如果我们要把大量输入文本与同一个正则进行匹配，库能让我们只付出一次这种昂贵构造的代价，就十分方便了。另一方面，这也意味着 \texttt{std::\allowbreak{}regex} 对象的构造相对较慢、拷贝代价高昂；在紧凑的内层循环中构造正则，是拖垮程序性能的好办法：
+
+\begin{codebox}[cpp]
+     std::regex rx("(left|right) ([0-9]+)");
+     // 在循环之外构造正则对象 “rx”。
+     std::string line;
+     while (std::getline(std::cin, line)) {
+       // 在循环内部反复使用同一个 “rx”。
+       if (std::regex_match(line, rx)) {
+         process_command(line);
+       } else {
+         puts("Unrecognized command.");
+       }
+     }
+\end{codebox}
+
+请记住，这个正则对象具有值语义（value semantics）；当我们把一个输入字符串与某个正则「匹配」时，我们并没有修改正则对象本身。正则对自己曾经匹配过什么毫无记忆。因此，当我们想要从一次正则匹配操作中提取信息——比如「命令是要向左移动还是向右移动？我们看到的那个数字是多少？」——我们就必须引入一个新的、可被修改的实体。
+
+一个正则对象提供以下方法：
+
+\texttt{std::\allowbreak{}regex(\allowbreak{}str,\allowbreak{} flags)\allowbreak{}} 通过把给定的 \texttt{str}「编译」成一台有限状态机来构造一个新的 \texttt{std::\allowbreak{}regex} 对象。影响编译过程本身的选项可以通过位掩码（bitmask）参数 \texttt{flags} 来指定：
+
+\texttt{std::\allowbreak{}regex::\allowbreak{}icase}：把所有字母字符都视为大小写不敏感。
+
+\texttt{std::\allowbreak{}regex::\allowbreak{}nosubs}：把所有括号分组都视为非捕获。
+
+\texttt{std::\allowbreak{}regex::\allowbreak{}multiline}：让非消耗型断言 \texttt{\textasciicircum{}}（以及 \texttt{\$}）在输入中 \texttt{"\textbackslash n"} 字符之后（以及之前）立即匹配，而不只是在输入的起始（与结尾）处匹配。
+
+还有若干其他选项可供你按位或（bitwise-OR）进 \texttt{flags}；但其余选项要么会把正则语法的「风味」从 ECMAScript 转向文档更少、测试也更少的方言（\texttt{basic}、\texttt{extended}、\texttt{awk}、\texttt{grep}、\texttt{egrep}），要么会引入区域设置依赖（\texttt{collate}），要么干脆什么都不做（\texttt{optimize}）。因此，在生产代码中你应当避免使用它们全部。
+
+请注意，尽管把字符串变成正则对象的过程常被称为「编译正则」，但它仍然是一个动态过程，发生在正则构造函数被调用时的运行时，而非你的 C++ 程序编译期间。如果你在正则表达式中犯了语法错误，它不会在编译期被捕获，而是在运行时——正则构造函数会抛出一个类型为 \texttt{std::\allowbreak{}regex\_\allowbreak{}error} 的异常，它是 \texttt{std::\allowbreak{}runtime\_\allowbreak{}error} 的子类。严谨健壮的代码还应当为「正则构造函数抛出 \texttt{std::\allowbreak{}bad\_\allowbreak{}alloc}」做好准备；回想一下，\texttt{std::\allowbreak{}regex} 并不具备分配器感知能力。
+
+\texttt{rx.\allowbreak{}mark\_\allowbreak{}count(\allowbreak{})\allowbreak{}} 返回正则中带括号的捕获组（capture group）的数量。这个方法的名字来源于短语「marked subexpression」（有标记子表达式），它是「捕获组」的一个较旧的同义词。
+
+\texttt{rx.\allowbreak{}flags(\allowbreak{})\allowbreak{}} 返回当初传给构造函数的位掩码。
+
+\section{匹配与搜索}
+
+要判断某个给定的输入字符串 \texttt{haystack} 是否符合某个给定的正则 \texttt{rneedle}，你可以使用 \texttt{std::\allowbreak{}regex\_\allowbreak{}match(\allowbreak{}haystack,\allowbreak{} rneedle)\allowbreak{}}。正则总是放在最后，这令人联想到 JavaScript 的语法 \texttt{haystack.\allowbreak{}match(\allowbreak{}rneedle)\allowbreak{}} 以及 Perl 的 \texttt{haystack =~ rneedle}，而与 Python 的 \texttt{re.\allowbreak{}match(\allowbreak{}rneedle,\allowbreak{} haystack)\allowbreak{}} 相反。\texttt{std::\allowbreak{}regex\_\allowbreak{}match} 函数在正则匹配整个输入字符串时返回 \texttt{true}，否则返回 \texttt{false}：
+
+\begin{codebox}[cpp]
+     std::regex rx("(left|right) ([0-9]+)");
+     std::string line;
+     while (std::getline(std::cin, line)) {
+       if (std::regex_match(line, rx)) {
+         process_command(line);
+       } else {
+         printf("Unrecognized command '%s'.\n",
+           line.c_str());
+       }
+     }
+\end{codebox}
+
+\texttt{std::\allowbreak{}regex\_\allowbreak{}search} 函数在正则匹配输入字符串的任意部分时返回 \texttt{true}。本质上，它只是在你提供的正则两侧都加上 \texttt{.*}，然后运行 \texttt{std::\allowbreak{}regex\_\allowbreak{}match} 算法；但一般来说，实现执行 \texttt{std::\allowbreak{}regex\_\allowbreak{}search} 能比重新编译一个全新的正则更快。
+
+若只想在一块字符缓冲区（比如通过网络的批量拉取、或从文件读取时你会做的那样）的某一部分中匹配，你可以向 \texttt{std::\allowbreak{}regex\_\allowbreak{}match} 或 \texttt{std::\allowbreak{}regex\_\allowbreak{}search} 传入一个迭代器对（iterator pair），这与我们在第 3 章「迭代器对算法（The Iterator-Pair Algorithms）」中看到的非常相似。在下面的例子中，位于范围 \texttt{[p,\allowbreak{} end)\allowbreak{}} 之外的字节绝不会被考虑，而且「字符串」\texttt{p} 也无需以空字符结尾：
+
+\begin{codebox}[cpp]
+     void parse(const char *p, const char *end)
+     {
+       static std::regex rx("(left|right) ([0-9]+)");
+       if (std::regex_match(p, end, rx)) {
+         process_command(p, end);
+       } else {
+         printf("Unrecognized command '%.*s'.\n",
+           int(end - p), p);
+       }
+     }
+\end{codebox}
+
+这个接口与我们在第 9 章「I/O 流（Iostreams）」中看到的 \texttt{std::\allowbreak{}from\_\allowbreak{}chars} 类似。
+
+\subsection{从匹配中提取子匹配（submatch）}
+
+若要在输入的词法分析阶段使用正则表达式，你需要一种方法来提取出匹配了每个捕获组的输入子串。在 C++ 中做到这一点的办法，是创建一个类型为 \texttt{std::\allowbreak{}smatch} 的匹配对象。不，那不是笔误！这个匹配对象类型的名字确实就是 \texttt{smatch}，它代表 \texttt{std::\allowbreak{}string} 的匹配（match）；此外还有 \texttt{cmatch}，用于 \texttt{const char *} 的匹配。\texttt{smatch} 与 \texttt{cmatch} 的区别在于它们内部所存储的迭代器类型：\texttt{smatch} 存储的是 \texttt{string::\allowbreak{}const\_\allowbreak{}iterator}，而 \texttt{cmatch} 存储的是 \texttt{const char *}。
+
+构造出一个空的 \texttt{std::\allowbreak{}smatch} 对象之后，你会把它以引用方式作为中间参数传给 \texttt{std::\allowbreak{}regex\_\allowbreak{}match} 或 \texttt{std::\allowbreak{}regex\_\allowbreak{}search}。如果正则匹配确实成功，这些函数会把有关匹配子串的信息「填入」\texttt{smatch} 对象。如果匹配失败，那么 \texttt{smatch} 对象就会变成（或保持）为空。
+
+下面是一个使用 \texttt{std::\allowbreak{}smatch} 来提取出与方向以及整数距离相匹配的子串的例子，提取自我们的「机器人命令」：
+
+\begin{codebox}[cpp]
+     std::pair<std::string, std::string>
+     parse_command(const std::string& line)
+     {
+       static std::regex rx("(left|right) ([0-9]+)");
+       std::smatch m;
+       if (std::regex_match(line, m, rx)) {
+         return { m[1], m[2] };
+       } else {
+         throw "Unrecognized command!";
+       }
+     }
+     void test() {
+       auto [dir, dist] = parse_command("right 4");
+       assert(dir == "right" && dist == "4");
+     }
+\end{codebox}
+
+请注意，我们使用了一个 \texttt{static} 的正则对象，以避免每次进入函数时都去构造（「编译」）一个新的正则对象。下面是用 \texttt{const char *} 和 \texttt{std::\allowbreak{}cmatch} 写的相同代码，仅作对比：
+
+\begin{codebox}[cpp]
+     std::pair<std::string, std::string>
+     parse_command(const char *p, const char *end)
+     {
+       static std::regex rx("(left|right) ([0-9]+)");
+       std::cmatch m;
+       if (std::regex_match(p, end, m, rx)) {
+         return { m[1], m[2] };
+       } else {
+         throw "Unrecognized command!";
+       }
+     }
+     void test() {
+       char buf[] = "left 20";
+       auto [dir, dist] = parse_command(buf, buf + 7);
+       assert(dir == "left" && dist == "20");
+     }
+\end{codebox}
+
+在这两种情况下，\texttt{return} 所在的行上都发生了一件有趣的事情。Having
+
+成功地将输入字符串与我们的正则表达式（regular expression）匹配（match）后，我们可以查询匹配对象 \texttt{m}，以找出输入字符串中的哪些片段对应于我们正则表达式里的各个捕获组（capture group）。第一个捕获组（本例中是 \texttt{(\allowbreak{}left|right)\allowbreak{}}）对应 \texttt{m[1]}，第二个组（本例中是 \texttt{(\allowbreak{}0-9]+)\allowbreak{}}）对应 \texttt{m[2]}，依此类推。如果你试图引用正则表达式中并不存在的组（例如本例中的 \texttt{m[3]}），你会得到一个空字符串；访问匹配对象永远不会抛出异常。
+
+组 \texttt{m[0]} 是一个特例：它指向整个被匹配（match）的序列。如果该匹配是由 \texttt{std::\allowbreak{}regex\_\allowbreak{}match} 填入的，那么它始终是整个输入字符串；如果该匹配是由 \texttt{std::\allowbreak{}regex\_\allowbreak{}search} 填入的，那么它只是字符串中与正则表达式相匹配的那一部分。
+
+还有两个具名组：\texttt{m.\allowbreak{}prefix(\allowbreak{})\allowbreak{}} 和 \texttt{m.\allowbreak{}suffix(\allowbreak{})\allowbreak{}}。它们分别指向匹配子串之前与之后、不属于该匹配（match）的序列。有一个不变式：只要匹配（match）成功，\texttt{m.\allowbreak{}prefix(\allowbreak{})\allowbreak{} + m[0]} \texttt{+ m.\allowbreak{}suffix(\allowbreak{})\allowbreak{}} 就代表整个输入字符串。
+
+所有这些“组”对象都不是用 \texttt{std::\allowbreak{}string} 对象来表示的——那样开销太大——而是由轻量级的 \texttt{std::\allowbreak{}sub\_\allowbreak{}match<\allowbreak{}It>\allowbreak{}} 类型（其中 \texttt{It} 如前所述是 \texttt{std::\allowbreak{}string::\allowbreak{}const\_\allowbreak{}iterator} 或 \texttt{const char *}）的对象表示。每个子匹配（submatch）对象都能隐式转换为 \texttt{std::\allowbreak{}string}，而且在其他方面表现得非常像 \texttt{std::\allowbreak{}string\_\allowbreak{}view}：你可以把子匹配与字符串字面量比较、询问它们的长度，甚至用 \texttt{operator<<} 把它们输出到 C++ 流中，而无需先将它们转换为 \texttt{std::\allowbreak{}string}。这种轻量级高效带来的缺点，与我们每次处理指向可能并不归我们所有的容器（container）的迭代器时遇到的缺点相同：我们面临着悬垂迭代器的风险：
+
+\begin{codebox}[cpp]
+    static std::regex rx("(left|right) ([0-9]+)");
+    std::string line = "left 20";
+    std::smatch m;
+    std::regex_match(line, m, rx);
+      // m[1] 现在持有指向 line 的迭代器
+    line = "hello world";
+      // 重新分配 line 底层的缓冲区
+    std::string oops = m[1];
+      // 这会引发未定义行为，因为
+      // 迭代器失效
+\end{codebox}
+
+看完前面的代码片段，你可能会担心：某个隐式转换（比如从 \texttt{const char *} 到 \texttt{std::\allowbreak{}string}）可能会在看似无害的代码中引发迭代器失效（iterator invalidation）问题。请看下面的例子：
+
+\begin{codebox}[cpp]
+    static std::regex rx("(left|right) ([0-9]+)");
+    std::smatch m;
+    std::regex_match("left 20", m, rx);
+      // m[1] 会持有指向一个临时字符串的迭代器，
+      // 因此它们早已失效。
+      // 所幸这个重载被删除了。
+\end{codebox}
+
+所幸，标准库预见到了这个潜藏的隐患，并通过提供一个特例重载 \texttt{regex\_\allowbreak{}match(\allowbreak{}std::\allowbreak{}string\&\&,\allowbreak{} std::\allowbreak{}smatch\&,\allowbreak{} const std::\allowbreak{}regex\&)\allowbreak{}} 规避了它；该重载被显式删除（使用的 \texttt{=delete} 语法与你删除一个不想要的特化成员函数时相同）。这保证了前面那段看似无害的代码会编译失败，而不是成为迭代器失效（iterator invalidation）问题的根源。
+
+尽管如此，迭代器失效（iterator invalidation）问题仍可能发生，正如前面的例子所示；为了避免它们，你应该把 \texttt{smatch} 对象当作极度临时的事物来对待，有点像用引用捕获整个世界的 \texttt{[\&]} lambda。一旦某个 \texttt{smatch} 对象被填入，在你提取出你关心的 \texttt{smatch} 的那些部分之前，不要去碰环境中的任何其他东西！
+
+总之，\texttt{smatch} 或 \texttt{cmatch} 对象提供以下方法：
+
+\texttt{m.\allowbreak{}ready(\allowbreak{})\allowbreak{}}：若 \texttt{m} 自构造以来曾被填入过，则为 \texttt{true}。
+
+\texttt{m.\allowbreak{}empty(\allowbreak{})\allowbreak{}}：若 \texttt{m} 表示一个失败的匹配（即它最近一次是由失败的 \texttt{regex\_\allowbreak{}match} 或 \texttt{regex\_\allowbreak{}search} 填入的），则为 \texttt{true}；若 \texttt{m} 表示一个成功的匹配，则为 \texttt{false}。
+
+\texttt{m.\allowbreak{}prefix(\allowbreak{})\allowbreak{}}, \texttt{m[0]}, \texttt{m.\allowbreak{}suffix(\allowbreak{})\allowbreak{}}：表示输入字符串中未匹配的前缀（prefix）、已匹配部分、未匹配的后缀（suffix）的子匹配（submatch）对象。（如果 \texttt{m} 表示一个失败的匹配，那么这些都没有意义。）
+
+\texttt{m[k]}：表示由第 k 个捕获组匹配到的输入字符串片段的子匹配（submatch）对象。\texttt{m.\allowbreak{}str(\allowbreak{}k)\allowbreak{}} 是 \texttt{m[k].str(\allowbreak{})\allowbreak{}} 的便捷简写。
+
+\texttt{m.\allowbreak{}size(\allowbreak{})\allowbreak{}}：若 \texttt{m} 表示失败的匹配则为 0；否则比 \texttt{m} 所表示的成功匹配中捕获组的数量多 1。注意 \texttt{m.\allowbreak{}size(\allowbreak{})\allowbreak{}} 始终与 \texttt{operator[]} 一致；有意义的子匹配（submatch）对象范围始终是 \texttt{m[0]} 到 \texttt{m[m.\allowbreak{}size(\allowbreak{})\allowbreak{}-1]}。
+
+\texttt{m.\allowbreak{}begin(\allowbreak{})\allowbreak{}}, \texttt{m.\allowbreak{}end(\allowbreak{})\allowbreak{}}：支持对匹配对象使用基于范围的 for 循环语法的迭代器。
+
+而子匹配（submatch）对象提供以下方法：
+
+\texttt{sm.\allowbreak{}first}：指向被匹配输入子串起点的迭代器。
+
+\texttt{sm.\allowbreak{}second}：指向被匹配输入子串末尾的迭代器。
+
+\texttt{sm.\allowbreak{}matched}：若 \texttt{sm} 参与了成功匹配则为 \texttt{true}；若 \texttt{sm} 是某个被绕过的可选分支的一部分，则为 \texttt{false}。例如，若正则表达式为 \texttt{(\allowbreak{}a)\allowbreak{}|(\allowbreak{}b)\allowbreak{}} 且输入为 \texttt{"a"}，则我们有 \texttt{m[1].matched \&\& !m[2].matched}；而若输入为 \texttt{"b"}，则我们有 \texttt{m[2].matched \&\& !m[1].matched}。
+
+\texttt{sm.\allowbreak{}str(\allowbreak{})\allowbreak{}}：被匹配的输入子串，提取并转换为 \texttt{std::\allowbreak{}string}。
+
+\texttt{sm.\allowbreak{}length(\allowbreak{})\allowbreak{}}：被匹配输入子串的长度（\texttt{second - first}）。等价于 \texttt{sm.\allowbreak{}str(\allowbreak{})\allowbreak{}.length(\allowbreak{})\allowbreak{}}，但快得多。
+
+\texttt{sm == "foo"}：与 \texttt{std::\allowbreak{}string}、\texttt{const char *} 或单个 \texttt{char} 的比较。等价于 \texttt{sm.\allowbreak{}str(\allowbreak{})\allowbreak{} == "foo"}，但快得多。遗憾的是，C++17 标准库没有提供任何接受 \texttt{std::\allowbreak{}string\_\allowbreak{}view} 的 \texttt{operator==} 重载。
+
+尽管在真实代码中你可能永远用不上这一点，但确实可以创建一个匹配或子匹配（submatch）对象，使其存储指向 \texttt{std::\allowbreak{}string} 之外的容器（container）或 \texttt{char} 缓冲区的迭代器。例如，下面是同一个函数，但它把我们的正则表达式匹配到 \texttt{std::\allowbreak{}list<\allowbreak{}char>\allowbreak{}} 上——很傻，但能用！
+
+\begin{codebox}[cpp]
+    template<class Iter>
+    std::pair<std::string, std::string>
+    parse_command(Iter begin, Iter end)
+    {
+      static std::regex rx("(left|right) ([0-9]+)");
+      std::match_results<Iter> m;
+      if (std::regex_match(begin, end, m, rx)) {
+        return { m.str(1), m.str(2) };
+      } else {
+        throw "Unrecognized command!";
+      }
+    }
+    void test() {
+      char buf[] = "left 20";
+      std::list<char> lst(buf, buf + 7);
+      auto [dir, dist] = parse_command(lst.begin(), lst.end());
+      assert(dir == "left" && dist == "20");
+    }
+\end{codebox}
+
+\subsection{将子匹配转换为数据值}
+
+为了让解析形成一个完整的闭环，下面这个例子展示了我们如何从句子的子匹配（submatch）中解析出字符串与整数值，从而真正驱动我们的机器人移动：
+
+\begin{codebox}[cpp]
+    int main()
+    {
+      std::regex rx("(left|right) ([0-9]+)");
+      int pos = 0;
+      std::string line;
+      while (std::getline(std::cin, line)) {
+        try {
+          std::smatch m;
+          if (!std::regex_match(line, m, rx)) {
+              throw std::runtime_error("Failed to lex");
+          }
+          int how_far = std::stoi(m.str(2));
+          int direction = (m[1] == "left") ? -1 : 1;
+          pos += how_far * direction;
+          printf("Robot is now at %d.\n", pos);
+        } catch (const std::exception& e) {
+          puts(e.what());
+          printf("Robot is still at %d.\n", pos);
+        }
+      }
+    }
+\end{codebox}
+
+任何无法识别或非法的字符串输入，要么由我们自定义的 \texttt{"Failed to lex"} 异常诊断，要么由 \texttt{std::\allowbreak{}stoi(\allowbreak{})\allowbreak{}} 抛出的 \texttt{std::\allowbreak{}out\_\allowbreak{}of\_\allowbreak{}range} 异常诊断。如果我们能在修改 \texttt{pos} 之前加上整数溢出检查，就能得到一个坚如磐石的输入解析器。
+
+如果我们想处理负整数和不区分大小写的方向，下面的修改就能奏效：
+
+\begin{codebox}[cpp]
+    int main()
+    {
+      std::regex rx("((left)|right) (-?[0-9]+)", std::regex::icase);
+      int pos = 0;
+      std::string line;
+      while (std::getline(std::cin, line)) {
+        try {
+          std::smatch m;
+          if (!std::regex_match(line, m, rx)) {
+            throw std::runtime_error("Failed to lex");
+          }
+          int how_far = std::stoi(m.str(3));
+          int direction = m[2].matched ? -1 : 1;
+          pos += how_far * direction;
+          printf("Robot is now at %d.\n", pos);
+        } catch (const std::exception& e) {
+          puts(e.what());
+          printf("Robot is still at %d.\n", pos);
+        }
+      }
+    }
+\end{codebox}
+
+\section{迭代多个匹配}
+
+\texttt{(\allowbreak{}?!\\d)\allowbreak{}\\w+} 这个正则表达式匹配单个 C++ 标识符（identifier）。我们已经知道如何用 \texttt{std::\allowbreak{}regex\_\allowbreak{}match} 判断一个输入字符串是否为 C++ 标识符，以及如何用 \texttt{std::\allowbreak{}regex\_\allowbreak{}search} 找到给定输入行中的第一个 C++ 标识符。但如果我们想找到给定输入行中所有的 C++ 标识符呢？
+
+这里的基本思路是在循环中调用 \texttt{std::\allowbreak{}regex\_\allowbreak{}search}。不过，由于像 \texttt{\textasciicircum{}} 和 \texttt{\textbackslash b} 这样的“零宽”（non-consuming）“后顾”（lookbehind）锚点，事情变得复杂。要从头正确地实现基于 \texttt{std::\allowbreak{}regex\_\allowbreak{}search} 的循环，我们必须维护这些锚点的状态。\texttt{std::\allowbreak{}regex\_\allowbreak{}search}（以及 \texttt{std::\allowbreak{}regex\_\allowbreak{}match}）通过提供自己的标志来支持这一用例——这些标志决定了这一次匹配操作中有限状态机的起始状态。就我们的目的而言，唯一重要的标志是 \texttt{std::\allowbreak{}regex::\allowbreak{}match\_\allowbreak{}prev\_\allowbreak{}avail}，它告诉库：表示输入起点的迭代器 \texttt{begin} 实际上并不在输入的“开头”（也就是说它可能并不匹配 \texttt{\textasciicircum{}}），而且如果你想为了 \texttt{\textbackslash b} 的用途而知道输入的前一个字符，那么检查 \texttt{begin[-1]} 是安全的：
+
+\begin{codebox}[cpp]
+    auto get_all_matches(
+      const char *begin, const char *end,
+      const std::regex& rx,
+      bool be_correct)
+    {
+      auto flags = be_correct ?
+      std::regex_constants::match_prev_avail :
+      std::regex_constants::match_default;
+      std::vector<std::string> result;
+      std::cmatch m;
+      std::regex_search(begin, end, m, rx);
+      while (!m.empty()) {
+        result.push_back(m[0]);
+        begin = m[0].second;
+        std::regex_search(begin, end, m, rx, flags);
+      }
+      return result;
+    }
+    void test() {
+      char buf[] = "baby";
+      std::regex rx("\\bb.");
+        // 获取每个以 "b" 开头的单词的前 2 个字母
+      auto v = get_all_matches(buf, buf+4, rx, false);
+      assert(v.size() == 2);
+        // 糟糕，"by" 被视为从一个单词边界开始！
+      v = get_all_matches(buf, buf+4, rx, true);
+      assert(v.size() == 1);
+        // "by" 被正确视为单词 "baby" 的一部分
+    }
+\end{codebox}
+
+在前面的例子中，当 \texttt{!be\_\allowbreak{}correct} 时，每一次 \texttt{regex\_\allowbreak{}search} 调用都被独立对待，因此从单词 \texttt{"by"} 的首字母搜索 \texttt{\textbackslash bb.} 与从单词 \texttt{"baby"} 的第三个字母搜索没有区别。但当我们把 \texttt{match\_\allowbreak{}prev\_\allowbreak{}avail} 传给后续 \texttt{regex\_\allowbreak{}search} 调用时，它会——字面上——后退一步，去查看 \texttt{"by"} 之前的字母是不是一个“单词”字母。由于前面的 \texttt{"a"} 是一个单词字母，第二次 \texttt{regex\_\allowbreak{}search} 正确地拒绝把 \texttt{"by"} 当作一个匹配（match）。
+
+像这样在循环里使用 \texttt{regex\_\allowbreak{}search} 很容易……除非给定的正则表达式可能匹配空字符串！如果正则表达式曾返回一个成功的匹配 \texttt{m}，且 \texttt{m[0].length(\allowbreak{})\allowbreak{} == 0}，我们就会陷入无限循环。所以我们 \texttt{get\_\allowbreak{}all\_\allowbreak{}matches(\allowbreak{})\allowbreak{}} 的内层循环其实应该更像下面这样：
+
+\begin{codebox}[cpp]
+    while (!m.empty()) {
+      result.push_back(m[0]);
+      begin = m[0].second;
+      if (begin == end) break;
+      if (m[0].length() == 0) ++begin;
+      if (begin == end) break;
+      std::regex_search(begin, end, m, rx, flags);
+    }
+\end{codebox}
+
+标准库提供了一个名为 \texttt{std::\allowbreak{}regex\_\allowbreak{}iterator} 的“便利”类型，它会把前面代码片段的逻辑封装起来；使用 \texttt{regex\_\allowbreak{}iterator} 或许能帮你避免一些与零长度匹配（match）有关的微妙 bug。可惜它并不能帮你少打字，而且还略微增加了悬垂迭代器陷阱出现的概率。\texttt{regex\_\allowbreak{}iterator} 和它的底层迭代器类型之间的模板关系，与 \texttt{match\_\allowbreak{}results} 相同：所以如果你匹配的是 \texttt{std::\allowbreak{}string} 输入，你就需要 \texttt{std::\allowbreak{}sregex\_\allowbreak{}iterator}；如果你匹配的是 \texttt{const char *} 输入，你就需要 \texttt{std::\allowbreak{}cregex\_\allowbreak{}iterator}。下面是把前面的例子改用 \texttt{sregex\_\allowbreak{}iterator} 重写的版本：
+
+\begin{codebox}[cpp]
+    auto get_all_matches(
+      const char *begin, const char *end,
+      const std::regex& rx)
+    {
+      std::vector<std::string> result;
+      using It = std::cregex_iterator;
+      for (It it(begin, end, rx); it != It{}; ++it) {
+        auto m = *it;
+        result.push_back(m[0]);
+      }
+      return result;
+    }
+\end{codebox}
+
+不妨想想这个笨拙的 for 循环能如何从辅助类中获益，思路类似于第 9 章（Iostreams）末尾例子中的 \texttt{streamer<\allowbreak{}T>\allowbreak{}}。
+
+你也可以遍历每次匹配（match）内部的各个子匹配（submatch），既可以手动，也可以使用一个“便利”库类型。手动的话，大致像下面这样：
+
+\begin{codebox}[cpp]
+    auto get_tokens(const char *begin, const char *end,
+      const std::regex& rx)
+    {
+      std::vector<std::string> result;
+      using It = std::cregex_iterator;
+      std::optional<std::csub_match> opt_suffix;
+      for (It it(begin, end, rx); it != It{}; ++it) {
+        auto m = *it;
+        std::csub_match nonmatching_part = m.prefix();
+        result.push_back(nonmatching_part);
+        std::csub_match matching_part = m[0];
+        result.push_back(matching_part);
+        opt_suffix = m.suffix();
+      }
+      if (opt_suffix.has_value()) {
+        result.push_back(opt_suffix.value());
+      }
+      return result;
+    }
+\end{codebox}
+
+回想一下，\texttt{regex\_\allowbreak{}iterator} 只是 \texttt{regex\_\allowbreak{}search} 的一层包装，因此本例中的 \texttt{m.\allowbreak{}prefix(\allowbreak{})\allowbreak{}} 保证保存着一整段非匹配部分，一直回溯到上一次匹配的末尾。通过交替地压入非匹配的前缀与匹配（match）本身，并以针对非匹配后缀（suffix）的特殊情形收尾，我们把输入字符串拆分成一个“单词”与“单词分隔符”交替出现的 \texttt{std::\allowbreak{}vector}。如果只需其一，很容易修改这段代码，使之只保存“单词”或只保存“分隔符”；甚至可以只保存 \texttt{m[1]} 而不是 \texttt{m[0]}，诸如此类。
+
+库类型 \texttt{std::\allowbreak{}sregex\_\allowbreak{}token\_\allowbreak{}iterator} 非常直接地封装了上述全部逻辑，不过如果你还不熟悉前面的手动代码，它的构造函数接口会相当令人困惑。\texttt{sregex\_\allowbreak{}token\_\allowbreak{}iterator} 的构造函数接受一个输入迭代器对、一个正则表达式，以及一个子匹配（submatch）索引的向量，其中索引 \texttt{-1} 是一个特例，表示“前缀（以及后缀）”。
+
+\begin{codebox}[cpp]
+    auto get_tokens(const char *begin, const char *end,
+      const std::regex& rx)
+    {
+      std::vector<std::string> result;
+      using TokIt = std::cregex_token_iterator;
+      for (TokIt it(begin, end, rx, {-1, 0}); it != TokIt{}; ++it) {
+        std::csub_match some_part = *it;
+        result.push_back(some_part);
+      }
+      return result;
+    }
+\end{codebox}
+
+如果我们把数组 \texttt{\{-1,\allowbreak{} 0\}} 改为仅 \texttt{\{0\}}，那么得到的向量将只包含输入字符串中匹配 \texttt{rx} 的那些片段。如果改为 \texttt{\{1,\allowbreak{} 2,\allowbreak{} 3\}}，我们的循环就只会看到每次匹配（match） \texttt{m} 中的那些子匹配（\texttt{m[1]}、\texttt{m[2]} 和 \texttt{m[3]}）。回想一下，由于 \texttt{|} 运算符的缘故，子匹配（submatch）可能被绕过，导致 \texttt{m[k].matched} 为 \texttt{false}。
+
+\texttt{regex\_\allowbreak{}token\_\allowbreak{}iterator} 不会跳过那些匹配（match）。例如：
+
+\begin{codebox}[cpp]
+    std::string input = "abc123...456...";
+    std::vector<std::ssub_match> v;
+    std::regex rx("([0-9]+)|([a-z]+)");
+    using TokIt = std::sregex_token_iterator;
+    std::copy(
+      TokIt(input.begin(), input.end(), rx, {1, 2}),
+      TokIt(),
+      std::back_inserter(v)
+    );
+    assert(!v[0].matched); assert(v[1] == "abc");
+    assert(v[2] == "123"); assert(!v[3].matched);
+    assert(v[4] == "456"); assert(!v[5].matched);
+\end{codebox}
+
+\texttt{regex\_\allowbreak{}token\_\allowbreak{}iterator} 最吸引人的用途，或许是在空白边界处把一个字符串拆分成“单词”。遗憾的是，它用起来——或者调试起来——并不比老派方法（比如 \texttt{istream\_\allowbreak{}iterator<\allowbreak{}string>\allowbreak{}}（见第 9 章，Iostreams）或 \texttt{strtok\_\allowbreak{}r}）明显更简单。
+
+\section{用正则表达式做字符串替换}
+
+如果你来自 Perl，或者经常使用命令行工具 \texttt{sed}，你大概主要把正则表达式当成修改字符串的一种方式——例如“删除所有匹配该正则表达式的子串”，或者“把这个单词的所有出现都替换成另一个单词”。C++ 标准库确实提供了一类按正则表达式替换的功能，名为 \texttt{std::\allowbreak{}regex\_\allowbreak{}replace}。它基于 JavaScript 的 \texttt{String.\allowbreak{}prototype.\allowbreak{}replace} 方法，这意味着它自带一套独特的格式化小语言。
+
+\texttt{std::\allowbreak{}regex\_\allowbreak{}replace(\allowbreak{}str,\allowbreak{} rx,\allowbreak{} "replacement")\allowbreak{}} 返回一个 \texttt{std::\allowbreak{}string}，它是通过遍历 \texttt{str}、寻找每个匹配正则表达式 \texttt{rx} 的子串、并把每个这样的子串替换成字面值字符串 \texttt{"replacement"} 而构造出来的。例如：
+
+\begin{codebox}[cpp]
+    std::string s = "apples and bananas";
+    std::string t = std::regex_replace(s, std::regex("a"), "e");
+    assert(t == "epples end benenes");
+    std::string u = std::regex_replace(s, std::regex("[ae]"), "u");
+    assert(u == "upplus und bununus");
+\end{codebox}
+
+不过，如果 \texttt{"replacement"} 中包含任何 \texttt{'\$'} 字符，就会发生特殊的事情！
+
+\texttt{"\$\&"} 会被替换为整个匹配到的子串，即 \texttt{m[0]}。libstdc++ 与 libc++ 都支持用 \texttt{"\$0"} 作为 \texttt{"\$\&"} 的非标准同义写法。\texttt{"\$1"} 会被替换为第一个子匹配（submatch）\texttt{m[1]}；\texttt{"\$2"} 会被替换为 \texttt{m[2]}；依此类推，一直可以写到 \texttt{"\$99"}。没有办法引用第 100 个子匹配。\texttt{"\$100"} 表示的是“\texttt{m[10]} 后面紧跟一个字面量 \texttt{'0'}”。要表达“\texttt{m[1]} 后面紧跟一个字面量 \texttt{'0'}”，应当写成 \texttt{"\$010"}。
+
+\texttt{"\$`"}（注意是反引号）会被替换为 \texttt{m.\allowbreak{}prefix(\allowbreak{})\allowbreak{}}。\texttt{"\$'"}（注意是单引号）会被替换为 \texttt{m.\allowbreak{}suffix(\allowbreak{})\allowbreak{}}。\texttt{"\$\$"} 会被替换为一个字面量的美元符号。
+
+注意，\texttt{"\$`"} 和 \texttt{"\$'"} 远不对称，因为 \texttt{m.\allowbreak{}prefix(\allowbreak{})\allowbreak{}} 永远指向上一次匹配结束到当前匹配开始之间的那部分字符串，而 \texttt{m.\allowbreak{}suffix(\allowbreak{})\allowbreak{}} 永远指当前匹配结束到字符串末尾之间的那部分字符串！在真实代码中你永远也用不到 \texttt{"\$`"} 或 \texttt{"\$'"} 中的任何一个。
+
+下面这个例子用 \texttt{regex\_\allowbreak{}replace} 把一段代码中所有的 \texttt{std::\allowbreak{}} 都去掉，或者把它们全都改成 \texttt{my::\allowbreak{}}：
+
+\begin{codebox}[cpp]
+    auto s = "std::sort(std::begin(v), std::end(v))";
+    auto t = std::regex_replace(s, std::regex("\\bstd::(\\w+)"), "$1");
+    assert(t == "sort(begin(v), end(v))");
+    auto u = std::regex_replace(s, std::regex("\\bstd::(\\w+)"), "my::$1");
+    assert(u == "my::sort(my::begin(v), my::end(v))");
+\end{codebox}
+
+JavaScript 的 \texttt{String.\allowbreak{}prototype.\allowbreak{}replace} 允许你传入一个任意函数，而不是那种塞满美元符号的格式字符串。C++ 的 \texttt{regex\_\allowbreak{}replace} 目前还不支持任意函数，不过自己写一个支持函数的版本很容易：
+
+\begin{codebox}[cpp]
+    template<class F>
+    std::string regex_replace(std::string_view haystack,
+      const std::regex& rx, const F& f)
+    {
+      std::string result;
+      const char *begin = haystack.data();
+      const char *end = begin + haystack.size();
+      std::cmatch m, lastm;
+      if (!std::regex_search(begin, end, m, rx)) {
+        return std::string(haystack);
+      }
+      do {
+        lastm = m;
+        result.append(m.prefix());
+        result.append(f(m));
+        begin = m[0].second;
+        begin += (begin != end && m[0].length() == 0);
+        if (begin == end) break;
+      } while (std::regex_search(begin, end, m, rx,
+        std::regex_constants::match_prev_avail));
+      result.append(lastm.suffix());
+      return result;
+    }
+    void test()
+    {
+      auto s = "std::sort(std::begin(v), std::end(v))";
+      auto t = regex_replace(s, std::regex("\\bstd::(\\w+)"),
+        [](auto&& m) {
+          std::string result = m[1].str();
+          std::transform(m[1].first, m[1].second,
+          begin(result), ::toupper);
+          return result;
+        });
+      assert(t == "SORT(BEGIN(v), END(v))");
+    }
+\end{codebox}
+
+有了这个增强版的 \texttt{regex\_\allowbreak{}replace}，你就可以轻松地执行诸如“把每个标识符从 \texttt{snake\_\allowbreak{}case} 改成 \texttt{Camel\allowbreak{}Case}”之类的复杂操作。
+
+至此，我们对 C++ 的 \texttt{<regex>\allowbreak{}} 头文件所提供的设施做了一个旋风式的巡览。本章的剩余部分是对 ECMAScript 正则表达式记法的详尽介绍。我希望它能对之前没接触过正则表达式的读者有所助益，也能作为用过之人的复习资料与参考手册。
+
+\section{ECMAScript 正则表达式语法入门}
+
+阅读和书写 ECMAScript 方言的正则表达式规则很简单。正则表达式不过是一个字符序列（例如 \texttt{a[bc].d*e}），你从左往右读它。绝大多数字符只代表它们自身，因此 \texttt{cat} 是一个合法的正则表达式，并且只匹配字面量字符串 \texttt{"cat"}。唯一不代表自身的字符——因而也是构建出比 \texttt{"cat"} 更有趣的语言的唯一手段——就是下面这些标点符号：
+
+\begin{codebox}[cpp]
+    ^ $ \ . * + ? ( ) [ ] { } |
+\end{codebox}
+
+\texttt{\textbackslash{}}——如果你要用正则表达式去描述一个包含上述标点字符的字符串集合，可以用反斜杠来转义这些特殊字符。例如，\texttt{\$42\textbackslash{}.00} 是一个正则表达式，它对应的语言只含有一个成员，即字符串 \texttt{"\$42.00"}。也许会让人困惑的是，反斜杠还被用来把某些普通字符变成特殊字符！\texttt{n} 是一个匹配字母“n”的正则表达式，但 \texttt{\textbackslash{}n} 却是匹配换行符的正则表达式。\texttt{d} 是匹配字母“d”的正则表达式，但 \texttt{\textbackslash{}d} 却等同于 \texttt{[0-9]}。
+
+C++ 的正则表达式语法所识别的反斜杠转义字符的完整列表如下：\texttt{\textbackslash{}1}、\texttt{\textbackslash{}2}、……、\texttt{\textbackslash{}10}、…… 表示反向引用（backreference，应尽量避免）；\texttt{\textbackslash{}b} 表示单词边界，\texttt{\textbackslash{}B} 表示 \texttt{(?!\textbackslash{}b)}。
+
+\begin{codebox}[cpp]
+\d for [[:digit:]] and \D for [^[:digit:]]
+\s for [[:space:]] and \S for [^[:space:]]
+\w for [0-9A-Za-z_] and \W for [^0-9A-Za-z_]
+\end{codebox}
+
+\texttt{\textbackslash{}cX} 表示各类“控制字符”（应避免使用）；\texttt{\textbackslash{}xXX} 表示十六进制字符，含义同常规用法；\texttt{\textbackslash{}u00XX} 表示 Unicode 字符，含义同常规用法；\texttt{\textbackslash{}0}、\texttt{\textbackslash{}f}、\texttt{\textbackslash{}n}、\texttt{\textbackslash{}r}、\texttt{\textbackslash{}t}、\texttt{\textbackslash{}v} 含义同常规。
+
+\texttt{.}——这个特殊字符表示“恰好一个字符”，几乎没有其他限制。例如，\texttt{a.\allowbreak{}c} 是一个合法的正则表达式，能匹配 \texttt{"aac"}、\texttt{"a!c"} 以及 \texttt{"a\textbackslash{}0c"} 这样的输入。不过，\texttt{.} 永远不会匹配换行符或回车符；而且，由于 C++ 的正则表达式是在字节层面、而非 Unicode 层面工作的，\texttt{.} 会匹配任意一个单字节（\texttt{'\\n'} 和 \texttt{'\\r'} 除外），但绝不会匹配由多个字节组成的序列，即便它们恰好构成一个合法的 UTF-8 码点也不会。
+
+\texttt{[]}——用方括号括起来的一组字符表示“恰好是此集合中的一个字符”，因此 \texttt{c[aou]t} 是一个合法的正则表达式，能匹配字符串 \texttt{"cat"}、\texttt{"cot"} 和 \texttt{"cut"}。你可以利用方括号语法来“转义”大多数字符；例如，\texttt{[\$][.][*][+][?][(\allowbreak{}][)\allowbreak{}][[][\{][\}]\textbar} 是一个正则表达式，它对应的语言只含有一个成员，即字符串 \texttt{"\$.*+?()[{}]\textbar"}。不过，你无法用方括号来转义 \texttt{]}、\texttt{\textbackslash{}} 或 \texttt{\textasciicircum{}}。
+
+\texttt{[{\textasciicircum{}}]}——用方括号括起来、且以 \texttt{\textasciicircum{}} 打头的一组字符表示“恰好一个、不在该集合中的字符”，因此 \texttt{c[{\textasciicircum{}}aou]t} 能匹配 \texttt{"cbt"} 或 \texttt{"c\textasciicircum{}t"}，但不能匹配 \texttt{"cat"}。ECMAScript 方言并不对平凡情形 \texttt{[]} 或 \texttt{[{\textasciicircum{}}]} 作特殊处理：\texttt{[]} 表示“恰好一个来自空集的字符”（也就是说它永远不会匹配任何东西），而 \texttt{[{\textasciicircum{}}]} 表示“恰好一个不在空集中的字符”（也就是说它匹配任意单个字符——就像 \texttt{.} 一样，但更好，因为它会匹配换行符和回车符）。
+
+\texttt{[]} 语法还会对另外几个字符作特殊对待：如果 \texttt{-} 出现在方括号内、且既不是第一个也不是最后一个字符，它就表示以其左右邻居为端点的“范围”。所以 \texttt{ro[s-v]e} 是一个正则表达式，对应的语言由四个字符串 \texttt{"rose"}、\texttt{"rote"}、\texttt{"roue"} 和 \texttt{"rove"} 组成。通过 \texttt{<ctype.\allowbreak{}h>\allowbreak{}} 头文件暴露出来的几个常用范围，可以用方括号内的 \texttt{[:foo:]} 语法内建：\texttt{[[:digit:]]} 等同于 \texttt{[0-9]}，\texttt{[[:upper:][:lower:]]} 等同于 \texttt{[[:alpha:]]}，也等同于 \texttt{[A-Za-z]}，依此类推。
+
+此外还有一些内建语法，形如 \texttt{[[.x.]]} 与 \texttt{[[=x=]]}；它们处理与区域设置（locale）相关的比较，你永远都不必用到它们。只需知道：如果你需要在方括号字符类里包含字符 \texttt{[}，那么对它做反斜杠转义会对你最有利：\texttt{foo[=(\allowbreak{}[;]} 和 \texttt{foo[(\textbackslash{}[;]} 都能匹配字符串 \texttt{"foo="}、\texttt{"foo(\allowbreak{}"}、\texttt{"foo["} 和 \texttt{"foo;"}，但 \texttt{foo[(\allowbreak{}[=;]} 是一个无效的正则表达式，当你试图用它构造一个 \texttt{std::\allowbreak{}regex} 对象时会在运行时抛出异常。
+
+\texttt{+}——一个表达式或单个字符紧跟一个 \texttt{+} 时，会匹配前面的表达式或字符任意正次数。例如，正则表达式 \texttt{ba+} 能匹配字符串 \texttt{"ba"}、\texttt{"baa"}、\texttt{"baaa"} 等等。
+
+\texttt{*}——一个表达式或单个字符紧跟一个 \texttt{*} 时，会匹配前面的表达式或字符任意次数——甚至可以零次！所以正则表达式 \texttt{ba*} 能匹配 \texttt{"ba"}、\texttt{"baa"}、\texttt{"baaa"}，也能单独匹配 \texttt{"b"}。
+
+\texttt{?}——一个表达式或单个字符紧跟一个 \texttt{?} 时，会匹配前面的表达式或字符恰好零次或一次。例如，\texttt{coo?t} 是一个只匹配 \texttt{"cot"} 和 \texttt{"coot"} 的正则表达式。
+
+\texttt{\{n\}}——一个表达式或单个字符紧跟一个花括号包裹的整数时，会匹配前面的表达式或字符恰好该整数次。例如，\texttt{b(\allowbreak{}an)\allowbreak{}\{2\}a} 是一个匹配 \texttt{"banana"} 的正则表达式；\texttt{b(\allowbreak{}an)\allowbreak{}\{3\}a} 是一个匹配 \texttt{"bananana"} 的正则表达式。
+
+\texttt{\{m,\allowbreak{}n\}}——当花括号构造的形式是用逗号隔开的两个整数 m 和 n 时，该构造会匹配前面的表达式或字符 m 到 n 次（含端点）。所以 \texttt{b(\allowbreak{}an)\allowbreak{}\{2,\allowbreak{}3\}a} 是一个只匹配 \texttt{"banana"} 和 \texttt{"bananana"} 的正则表达式。
+
+\texttt{\{m,\allowbreak{}\}}——把 n 留空实际上等于让它变成无穷大；因此 \texttt{x\{42,\allowbreak{}\}} 表示“匹配 \texttt{x} 42 次或更多”，并且等同于 \texttt{x\{42\}x*}。ECMAScript 方言不允许把 m 留空。
+
+\texttt{\textbar}——两个正则表达式可以用 \texttt{\textbar}“粘”在一起，表达“二者之一”的意思。例如，\texttt{cat\textbar dog} 是一个只匹配 \texttt{"cat"} 和 \texttt{"dog"} 的正则表达式；而 \texttt{(\allowbreak{}tor\textbar shark)\allowbreak{}nado} 能匹配 \texttt{"tornado"} 或 \texttt{"sharknado"}。\texttt{\textbar} 运算符在正则表达式里的优先级非常低，就像它在 C++ 表达式里一样。
+
+\texttt{(\allowbreak{})\allowbreak{}}——圆括号的运作方式和数学里一样，用来把一个你想要紧密绑定、作为一个整体对待的子表达式括起来。例如，\texttt{ba*} 表示“字符 \texttt{b}，然后零个或多个 \texttt{a}”；而 \texttt{(\allowbreak{}ba)\allowbreak{}*} 表示“零个或多个 \texttt{ba}”。所以前者能匹配 \texttt{"b"}、\texttt{"ba"}、\texttt{"baa"} 等等；而带圆括号的版本能匹配 \texttt{""}、\texttt{"ba"}、\texttt{"baba"} 等等。
+
+圆括号还有第二个用途——它们不仅用于分组，也用于捕获匹配结果的一部分以便后续处理。正则表达式中每出现一个左圆括号 \texttt{(\allowbreak{}}，生成的 \texttt{std::\allowbreak{}smatch} 对象里就会多出一个子匹配。
+
+如果你想把某个子表达式紧密地绑在一起，却又不想产生一个子匹配，可以使用非捕获组，语法为 \texttt{(\allowbreak{}?:foo)\allowbreak{}}：
+
+\begin{codebox}[cpp]
+    std::string s = "abcde";
+    std::smatch m;
+    std::regex_match(s, m, std::regex("(a|b)*(.*)e"));
+    assert(m.size() == 3 && m[2] == "cd");
+    std::regex_match(s, m, std::regex("(?:a|b)*(.*)e"));
+    assert(m.size() == 2 && m[1] == "cd");
+\end{codebox}
+
+非捕获在某些偏僻的语境下也许有用；但一般来说，如果你只管使用普通的捕获组 \texttt{(\allowbreak{})\allowbreak{}} 并忽略那些你不关心的子匹配，而不是在你的代码库里到处散布 \texttt{(\allowbreak{}?:)\allowbreak{}} 来强行压掉所有未使用的子匹配，对阅读代码的人会更清晰。未使用的子匹配在性能上相当廉价。
+
+\subsection{不消耗字符的构造}
+
+\texttt{(\allowbreak{}?=foo)\allowbreak{}} 会把模式 \texttt{foo} 与输入进行匹配，然后“回退”到匹配之前的位置，使得实际上没有任何输入被消耗掉。这被称为前瞻（lookahead）。例如，\texttt{c(\allowbreak{}?=a)\allowbreak{}(\allowbreak{}?=a)\allowbreak{}(\allowbreak{}?=a)\allowbreak{}at} 能匹配 \texttt{"cat"}；而 \texttt{(\allowbreak{}?=.*[A-Za-z])\allowbreak{}(\allowbreak{}?=.*[0-9])\allowbreak{}.*} 能匹配任何至少包含一个字母和一个数字的字符串。
+
+\texttt{(\allowbreak{}?!foo)\allowbreak{}} 是“负向前瞻（negative lookahead）”；它会向前看，把模式 \texttt{foo} 与输入匹配，但如果 \texttt{foo} 本可接受该匹配，它就拒绝；如果 \texttt{foo} 本应拒绝，它就接受。举例来说，\texttt{(?!\textbackslash{}d)\textbackslash{}w+} 能匹配任何 C++ 标识符或关键字——也就是说，任何不以数字开头的字母数字序列。注意，第一个字符不能匹配 \texttt{\textbackslash{}d}，但它也不会被 \texttt{(?!\textbackslash{}d)} 构造消耗掉；它仍须被 \texttt{\textbackslash{}w} 接受。看起来很像的 \texttt{[{\textasciicircum{}}0-9]\textbackslash{}w+} 会“错误地”接受诸如 \texttt{"\#xyzzy"} 这样并非有效标识符的字符串。
+
+\texttt{(\allowbreak{}?=)\allowbreak{}} 和 \texttt{(\allowbreak{}?!)\allowbreak{}} 不仅不消耗字符，而且像 \texttt{(\allowbreak{}?:)\allowbreak{}} 一样也不捕获；不过，写成 \texttt{(\allowbreak{}?=(\allowbreak{}foo)\allowbreak{})\allowbreak{}} 来捕获“被前瞻”部分的全部或一部分是完全可以的。
+
+\texttt{\textasciicircum{}} 和 \texttt{\$}——单独一个脱字符 \texttt{\textasciicircum{}}（不在方括号内）只匹配待匹配字符串的开头；而 \texttt{\$} 只匹配结尾。在 \texttt{std::\allowbreak{}regex\_\allowbreak{}search} 的语境下，这很适合把正则表达式锚定（anchor）到输入字符串的开头或结尾。在 \texttt{std::\allowbreak{}regex::\allowbreak{}multiline} 正则表达式中，\texttt{\textasciicircum{}} 和 \texttt{\$} 分别扮演“后顾（lookbehind）”与“前瞻（lookahead）”断言的角色：
+
+\begin{codebox}[cpp]
+    std::string s = "ab\ncd";
+    std::regex rx("^ab$[^]^cd$", std::regex::multiline);
+    assert(std::regex_match(s, rx));
+\end{codebox}
+
+把以上所有内容结合起来，我们可以写出正则表达式 \texttt{foo[a-z\_\allowbreak{}]+(\textbackslash{}d\textbar\$)},用来匹配“字母 \texttt{foo}，后面跟一个或多个其他字母和/或下划线；再后面跟一个数字或行尾”。
+
+如果你需要更深入地了解正则表达式语法，可以查阅 \texttt{cppreference.\allowbreak{}com}。如果这还不够——C++ 采纳 ECMAScript 风格的正则表达式，最大的好处之一就是任何讲解 JavaScript 正则表达式的教程也同样适用于 C++！你甚至可以在浏览器的控制台里试验正则表达式。C++ 正则表达式与 JavaScript 正则表达式唯一的区别在于：C++ 支持双方括号形式的字符类（character class）语法，例如 \texttt{[[:digit:]]}、\texttt{[[.x.]]} 和 \texttt{[[=x=]]}，而 JavaScript 不支持。JavaScript 把那些正则表达式分别当作 \texttt{[\textbackslash{}[:digt\textbackslash{}]]}、\texttt{[\textbackslash{}[.x.\textbackslash{}]]} 和 \texttt{[\textbackslash{}[=x=\textbackslash{}]]} 来对待。
+
+\subsection{ECMAScript 中冷僻的特性与陷阱}
+
+在本章前面我曾提到 \texttt{std::\allowbreak{}regex} 中几个你最好避而远之的特性，例如 \texttt{std::\allowbreak{}regex::\allowbreak{}collate}、\texttt{std::\allowbreak{}regex::\allowbreak{}optimize}，以及那些会把方言从 ECMAScript 切换走的各种标志。ECMAScript 正则语法本身也包含一些冷僻、值得回避的特性。
+
+一个反斜杠后跟一位或多位数字（\texttt{\textbackslash{}0} 除外）会创建一个反向引用（backreference）。反向引用 \texttt{\textbackslash{}1} 匹配“我的第一个捕获组（capture group）所匹配到的同一段字符序列”；例如，正则表达式 \texttt{(cat\textbar dog)\textbackslash{}1} 能匹配字符串 \texttt{"catcat"} 与 \texttt{"dogdog"}，但不能匹配 \texttt{"catdog"}，而 \texttt{(a*)(b*)c\textbackslash{}2\textbackslash{}1} 能匹配 \texttt{"aabbbcbbbaa"}，却不能匹配 \texttt{"aabbbcbbba"}。反向引用在语义上可能有些出人意料的怪异，尤其是与 \texttt{(\allowbreak{}?=foo)\allowbreak{}} 这类不消耗字符的构造组合使用时；我建议尽可能避开它们。
+
+如果你在使用反向引用时遇到问题，首先要检查的就是反斜杠转义。请记住，\texttt{std::regex("\textbackslash{}1")} 是一个匹配 ASCII 控制字符 1 号的正则表达式。你真正想输入的其实是 \texttt{std::regex("\textbackslash{}\textbackslash{}1")}。
+
+使用反向引用会把你带离正则语言的世界，进入更广阔的上下文敏感语言的世界，这意味着库必须舍弃它那极其高效的、基于有限状态机的匹配算法，转而采用更强大但更昂贵也更慢的“回溯（backtracking）”算法。这似乎是另一个避开反向引用、除非绝对必要的好理由。
+
+然而，截至 2017 年，大多数实现厂商实际上并不会因为正则表达式中出现了反向引用就切换算法；它们会仅仅因为 ECMAScript 正则表达式方言中存在反向引用的可能性，就去使用更慢的回溯算法。而且，由于没有厂商愿意为了 \texttt{std::\allowbreak{}regex::\allowbreak{}awk} 和 \texttt{std::\allowbreak{}regex::\allowbreak{}extended} 这些没有反向引用的方言专门再实现一整套第二种算法，它们甚至对这些方言也使用回溯算法！类似地，大多数厂商会把 \texttt{regex\_\allowbreak{}match(\allowbreak{}s,\allowbreak{} rx)\allowbreak{}} 实现为基于 \texttt{regex\_\allowbreak{}match(\allowbreak{}s,\allowbreak{} m,\allowbreak{} rx)\allowbreak{}}，然后再把昂贵计算出来的 \texttt{m} 丢弃，而不是为 \texttt{regex\_\allowbreak{}match(\allowbreak{}s,\allowbreak{} rx)\allowbreak{}} 使用一种可能更快的算法。这样的优化也许会在未来 10 年内的某个时候出现在你身边的某个库里，但我可不会屏住呼吸等它们。
+
+另一个冷僻的怪癖是，\texttt{*}、\texttt{+} 和 \texttt{?} 这几个量词默认都是贪婪（greedy）的，也就是说，例如 \texttt{(\allowbreak{}a*)\allowbreak{}} 会倾向于匹配尽可能多的 \texttt{a} 字符。你可以给量词再追加一个 \texttt{?} 把它变成非贪婪（non-greedy）的；例如 \texttt{(\allowbreak{}a*?)\allowbreak{}} 会匹配尽可能少的 \texttt{a} 字符。除非你使用了捕获组，否则这完全没有任何区别。下面是一个例子：
+
+\begin{codebox}[cpp]
+    std::string s = "abcde";
+    std::smatch m;
+    std::regex_match(s, m, std::regex(".*([bcd].*)e"));
+    assert(m[1] == "d");
+    std::regex_match(s, m, std::regex(".*?([bcd].*)e"));
+    assert(m[1] == "bcd");
+\end{codebox}
+
+在第一种情况中，\texttt{.*} 贪婪地匹配了 \texttt{abc}，只留下 \texttt{d} 给捕获组去匹配。在第二种情况中，\texttt{.*?} 非贪婪地只匹配了 \texttt{a}，把 \texttt{bcd} 留给了捕获组。（实际上，\texttt{.*?} 本更愿意匹配空字符串；但那样做会导致整体匹配被拒绝，所以它做不到。）
+
+请注意，非贪婪的语法并不遵循运算符组合的“常规”规则。根据我们对 C++ 运算符语法的了解，我们会预期 \texttt{a+*} 表示 \texttt{(\allowbreak{}a+)\allowbreak{}*}（它确实如此），而 \texttt{a+?} 表示 \texttt{(\allowbreak{}a+)\allowbreak{}?}（但它并非如此）。所以，如果你在正则表达式中看到连续的标点符号，可得当心——它的意思可能和你直觉告诉你的不一样！
+
+\section{小结}
+
+正则表达式（regex）是在输入字符串被进一步处理之前，将其中的各个片段切分（lex）出来的好办法。
+
+解析它们。C++ 中默认的正则表达式方言与 JavaScript 相同。请善加利用这一点。
+
+在额外的括号对可能造成混淆的场合，最好避免使用原始字符串字面量（raw string literal）。只要可能，就优先用方括号来转义特殊字符，从而减少正则表达式中需要转义的反斜杠的数量。
+
+\texttt{std::\allowbreak{}regex rx} 基本上不可变，表示一个有限状态机。\texttt{std::\allowbreak{}smatch m} 是可变的，保存了关于 haystack（被搜索的文本）字符串中某次特定匹配的信息。
+
+子匹配（submatch）\texttt{m[0]} 表示整个被匹配的子串；\texttt{m[k]} 表示第 k 个捕获组（capture group）。
+
+\texttt{std::\allowbreak{}regex\_\allowbreak{}match(\allowbreak{}s,\allowbreak{} m,\allowbreak{} rx)\allowbreak{}} 将 needle（要查找的模式）与整个 haystack 字符串进行匹配；\texttt{std::\allowbreak{}regex\_\allowbreak{}search(\allowbreak{}s,\allowbreak{} m,\allowbreak{} rx)\allowbreak{}} 在 haystack 中查找 needle。请记住，haystack 在前、needle 在后，这与 JavaScript 和 Perl 中的顺序一致。
+
+\texttt{std::\allowbreak{}regex\_\allowbreak{}iterator}、\texttt{std::\allowbreak{}regex\_\allowbreak{}token\_\allowbreak{}iterator} 与 \texttt{std::\allowbreak{}regex\_\allowbreak{}replace} 都是构建在 \texttt{regex\_\allowbreak{}search} 之上的、颇为不便的“便利”函数。在操心这些包装器之前，请先熟悉 \texttt{regex\_\allowbreak{}search}。
+
+当心悬垂迭代器（dangling iterator）bug！绝不要修改或销毁仍被 \texttt{regex\_\allowbreak{}iterator} 引用的 \texttt{regex}；也绝不要修改或销毁仍被 \texttt{smatch} 引用的 \texttt{string}。

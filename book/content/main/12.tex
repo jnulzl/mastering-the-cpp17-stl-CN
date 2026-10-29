@@ -1,0 +1,706 @@
+C++17 最重大的新特性之一，便是其文件系统（filesystem）库，即 \texttt{<filesystem>\allowbreak{}}。与现代 C++ 的许多其他重要特性一样，这个库最早起源于 Boost 项目。2015 年，它进入了一份标准技术规范以收集反馈；最终，在根据该反馈做出修改后，被并入 C++17 标准。
+
+在本章中，你将学到以下内容：
+
+\begin{itemize}
+\item 文件系统（filesystem）如何在不大规模抛出异常的情况下返回动态类型化的错误，以及你该如何做到这一点
+\item 路径（path）的格式，以及 POSIX 与 Windows 在这一话题上根本对立的立场
+\item 如何使用可移植的 C++17 来 stat 文件并遍历目录（directory）
+\item 如何创建、复制、重命名以及删除文件和目录（directory）
+\item 如何获取文件系统（filesystem）的空闲空间
+\end{itemize}
+
+\section{关于命名空间的一点说明}
+
+C++17 的标准文件系统设施全部由单一头文件 \texttt{<filesystem>\allowbreak{}} 提供，该头文件中的一切都被置于其专属的命名空间（namespace）中：\texttt{namespace std::\allowbreak{}filesystem}。这遵循了 C++11 的 \texttt{<chrono>\allowbreak{}} 头文件及其 \texttt{namespace std::\allowbreak{}chrono} 所树立的先例。（本书不对 \texttt{<chrono>\allowbreak{}} 做全面讲解。它与 \texttt{std::\allowbreak{}thread} 和 \texttt{std::\allowbreak{}timed\_\allowbreak{}mutex} 的交互在第 7 章「并发」中略有提及。）
+
+这种命名空间策略意味着，当你使用 \texttt{<filesystem>\allowbreak{}} 的设施时，你会用到诸如 \texttt{std::\allowbreak{}filesystem::\allowbreak{}directory\_\allowbreak{}iterator} 和 \texttt{std::\allowbreak{}filesystem::\allowbreak{}temp\_\allowbreak{}directory\_\allowbreak{}path(\allowbreak{})\allowbreak{}} 这样的标识符。这些完全限定名相当笨拙！但若用 \texttt{using} 声明把整个命名空间拉入当前作用域，恐怕又太过（尤其是不得不在文件作用域这么做时）。过去十年里我们都被教导绝不要写 \texttt{using namespace std}，而无论标准库把命名空间嵌套得多深，这条建议都不会改变。请考虑以下代码：
+
+\begin{codebox}[cpp]
+    using namespace std::filesystem;
+    void foo(path p)
+    {
+      remove(p); // 这调用的是哪个函数？
+    }
+\end{codebox}
+
+日常开发中更好的做法，是在文件作用域（\texttt{.cc} 文件中）或命名空间作用域（\texttt{.h} 文件中）定义一个命名空间别名（namespace alias）。命名空间别名允许你用一个新名字来指代一个已有的命名空间，如下例所示：
+
+\begin{codebox}[cpp]
+    namespace fs = std::filesystem;
+    void foo(fs::path p)
+    {
+      fs::remove(p); // 清楚多了！
+    }
+\end{codebox}
+
+在本章余下部分，我将使用命名空间别名 \texttt{fs} 来指代 \texttt{namespace std::\allowbreak{}filesystem}。
+
+当我说 \texttt{fs::\allowbreak{}path} 时，指的是 \texttt{std::\allowbreak{}filesystem::\allowbreak{}path}。
+
+当我说 \texttt{fs::\allowbreak{}remove} 时，指的是 \texttt{std::\allowbreak{}filesystem::\allowbreak{}remove}。
+
+在全局某处定义命名空间别名 \texttt{fs}，还有另一个务实的好处。在本书写作之时，各大主流库厂商中，只有 Microsoft Visual Studio 宣称实现了 C++17 的 \texttt{<filesystem>\allowbreak{}} 头文件。然而，\texttt{<filesystem>\allowbreak{}} 的设施与 libstdc++ 和 libc++ 在 \texttt{<experimental/\allowbreak{}filesystem>\allowbreak{}} 中提供的设施、以及 Boost 在 \texttt{<boost/\allowbreak{}filesystem.\allowbreak{}hpp>\allowbreak{}} 中提供的设施非常相似。因此，如果你始终用自定义的命名空间别名（例如 \texttt{fs}）来指代这些设施，就只需更改该别名所指向的目标，便能在不同厂商的实现之间切换——这只需改动一行，而不必对整个代码库做大规模且易出错的搜索替换。可见下例：
+
+\begin{codebox}[cpp]
+    #if USE_CXX17
+     #include <filesystem>
+     namespace fs = std::filesystem;
+    #elif USE_FILESYSTEM_TS
+     #include <experimental/filesystem>
+     namespace fs = std::experimental::filesystem;
+    #elif USE_BOOST
+     #include <boost/filesystem.hpp>
+     namespace fs = boost::filesystem;
+    #endif
+\end{codebox}
+
+\section{关于错误报告的一份长篇说明}
+
+C++ 与错误报告（error-reporting）之间有着爱恨交织的关系。此处所谓“错误报告”，我指的是“当你无法完成被要求做的事时，该怎么办”。在 C++ 中，报告这类“不如意”的经典、典型，且至今仍是最佳实践的方式，便是抛出异常。在前面的章节中我们已看到，有时抛出异常是唯一合理的做法，因为你根本没有办法返回到调用者。例如，如果你的任务是构造一个对象，而构造失败，你就无法返回；当构造函数失败时，唯一稳妥的做法就是抛出。然而，我们也已看到（在第 9 章「I/O 流」中），C++ 自己的 \texttt{<iostream>\allowbreak{}} 库却并未采取这种合理的做法！如果 \texttt{std::\allowbreak{}fstream} 对象的构造失败（因为无法打开指定的文件），你得到的将是一个异常；你会得到一个已完整构造的 \texttt{fstream} 对象，其中 \texttt{f.\allowbreak{}fail(\allowbreak{})\allowbreak{} \&\& !f.\allowbreak{}is\_\allowbreak{}open(\allowbreak{})\allowbreak{}}。
+
+我们在第 9 章「I/O 流」中为 \texttt{fstream} 的“不良”行为给出的理由，是名为的文件很可能无法打开这一相对较高的概率。每次文件无法打开都抛出异常，已经非常接近于把异常用于流程控制（control flow），而这一点我们一直被（正确地）告诫要避免。因此，库选择假装操作成功而返回，而不是强迫程序员到处编写 \texttt{try} 和 \texttt{catch} 块；它允许用户用普通的 \texttt{if}（而非 \texttt{catch}）来检查操作究竟是否真的成功。
+
+也就是说，我们可以避免写出下面这段繁琐的代码：
+
+\begin{codebox}[cpp]
+    try {
+      f.open("hello.txt");
+      // 打开成功。
+    } catch (const std::ios_base::failure&) {
+      // 打开失败。
+    }
+\end{codebox}
+
+\begin{codebox}[cpp]
+    f.open("hello.txt");
+    if (f.is_open()) {
+      // 打开成功。
+    } else {
+      // 打开失败。
+    }
+\end{codebox}
+
+I/O 流的做法在以下情形下相当有效：操作结果由一个带有自然失败状态的重量级对象（例如 \texttt{fstream}）描述，或在设计阶段就能加入这样的失败状态。
+
+然而，它也有一些缺点，而且若不涉及重量级类型，它就完全无法使用。我们在第 9 章「I/O 流」末尾考察从字符串解析整数的各种方式时，就遇到了这种情形。
+
+如果不期望失败，或者不介意“把异常用于流程控制”带来的性能损耗，那么我们就使用 \texttt{std::\allowbreak{}stoi}：
+
+\begin{codebox}[cpp]
+    // 抛出异常的做法。
+    try {
+      int i = std::stoi(s);
+      // 解析成功。
+    } catch (...) {
+      // 解析失败。
+    }
+\end{codebox}
+
+如果需要兼容 C++03，我们就使用 \texttt{strtol}，它通过线程局部的全局变量 \texttt{errno} 来报告错误，如下面的代码所示：
+
+\begin{codebox}[cpp]
+    char *endptr = nullptr;
+    errno = 0;
+    long i = strtol(s, &endptr, 10);
+    if (endptr != s && !errno) {
+      // 解析成功。
+    } else {
+      // 解析失败。
+    }
+\end{codebox}
+
+而在前沿的 C++17 风格中，我们使用 \texttt{std::\allowbreak{}from\_\allowbreak{}chars}，它返回一个轻量级结构体，其中包含字符串末尾指针，以及一个用于指示成功或失败的强枚举类型 \texttt{std::\allowbreak{}errc} 的取值，如下所示：
+
+\begin{codebox}[cpp]
+    int i = 0;
+    auto [ptr, ec] = std::from_chars(s, end(s), i);
+    if (ec != std::errc{}) {
+      // 解析成功。
+    } else {
+      // 解析失败。
+    }
+\end{codebox}
+
+\texttt{<filesystem>\allowbreak{}} 库所需的错误报告能力，与 \texttt{std::\allowbreak{}from\_\allowbreak{}chars} 大致相当。你在文件系统（filesystem）上执行的几乎所有操作，都可能因为系统上其他进程的行为而失败；因此，每次失败都抛出异常（像 \texttt{std::\allowbreak{}stoi} 那样）也让人不适地接近于把异常用于流程控制。但是，让像 \texttt{ec} 这样的“错误结果”贯穿整个代码库，同样既繁琐又（无意玩梗）容易出错。所以，标准库决定两全其美：为 \texttt{<filesystem>\allowbreak{}} 头文件中几乎每个函数都提供两套接口！
+
+例如，以下是用于确定磁盘上文件大小的两个 \texttt{<filesystem>\allowbreak{}} 函数：
+
+\begin{codebox}[cpp]
+    uintmax_t file_size(const fs::path& p);
+    uintmax_t file_size(const fs::path& p,
+       std::error_code& ec) noexcept;
+\end{codebox}
+
+上述两个函数都接受一个 \texttt{fs::\allowbreak{}path}（我们将在本章后面详细讨论），并返回一个 \texttt{uintmax\_\allowbreak{}t}，表示指定文件的字节大小。但如果文件不存在，或者文件存在但当前用户账户无权查询其大小，又当如何？此时，第一个重载会直接抛出一个 \texttt{fs::\allowbreak{}filesystem\_\allowbreak{}error} 类型的异常，指出出了什么问题。而第二个重载永远不会抛出（事实上它被标记为 \texttt{noexcept}）。它改为接受一个 \texttt{std::\allowbreak{}error\_\allowbreak{}code}（错误码（error\_\allowbreak{}code））类型的输出参数，库会填入指示出错原因的信息（若一切正常则将其清除）。
+
+对比 \texttt{fs::\allowbreak{}file\_\allowbreak{}size} 与 \texttt{std::\allowbreak{}from\_\allowbreak{}chars} 的签名，你或许会注意到，\texttt{from\_\allowbreak{}chars} 处理的是 \texttt{std::\allowbreak{}errc}，而 \texttt{file\_\allowbreak{}size} 处理的是 \texttt{std::\allowbreak{}error\_\allowbreak{}code}。这两个类型虽然相关，却并不相同！要理解其中的差异——以及非抛出版本 \texttt{<filesystem>\allowbreak{}} API 的整体设计——我们得先绕个小弯，去了解一下 C++11 标准库的另一部分。
+
+\subsection{使用 \texttt{<system\_\allowbreak{}error>\allowbreak{}}}
+
+\texttt{std::\allowbreak{}from\_\allowbreak{}chars} 与 \texttt{fs::\allowbreak{}file\_\allowbreak{}size} 两者的错误报告机制之间的差异，在于其内在复杂度的不同。\texttt{from\_\allowbreak{}chars} 只会以恰好两种方式失败——要么给定的字符串开头根本没有任何数字串，要么数字过多，以至于读取它们会导致溢出。在前一种情况下，一种经典（但低效且通常危险）的报告错误方式是将 \texttt{errno} 设为 \texttt{EINVAL}（并返回一个诸如 \texttt{0} 这样的无用值）。在后一种情况下，经典做法是将 \texttt{errno} 设为 \texttt{ERANGE}（同样返回一个无用值）。这多少（但其实更像“少”而非“多”）是 \texttt{strtol} 所采用的手法。
+
+关键点在于，对于 \texttt{from\_\allowbreak{}chars} 而言，可能出错的恰好只有两种情况，而且它们完全可以用 POSIX \texttt{<errno.\allowbreak{}h>\allowbreak{}} 所提供的那一组错误码来描述。因此，要把 1980 年代的 \texttt{strtol} 带入二十一世纪，我们所需修正的只是让它把错误码直接返回给调用者，而非通过线程局部的 \texttt{errno} 间接返回。而标准库所做的也就仅此而已。经典的 POSIX \texttt{<errno.\allowbreak{}h>\allowbreak{}} 取值仍作为宏经由 \texttt{<cerrno>\allowbreak{}} 提供，但自 C++11 起，它们也通过 \texttt{<system\_\allowbreak{}error>\allowbreak{}} 中的一个强类型枚举来提供，如下面的代码所示：
+
+\begin{codebox}[cpp]
+  namespace std {
+    enum class errc {
+      // 隐式地，"0" 表示"无错误"
+      operation_not_permitted = EPERM,
+      no_such_file_or_directory = ENOENT,
+      no_such_process = ESRCH,
+      // ...
+      value_too_large = EOVERFLOW
+    };
+  } // namespace std
+\end{codebox}
+
+\texttt{std::\allowbreak{}from\_\allowbreak{}chars} 通过返回一个结构体（\texttt{struct from\_\allowbreak{}chars\_\allowbreak{}result}）来报告错误，该结构体含有一个类型为枚举 \texttt{std::\allowbreak{}errc} 的成员变量；该变量在无错误时为 \texttt{0}，否则为两个可能指示错误的值之一。
+
+那么，\texttt{fs::\allowbreak{}file\_\allowbreak{}size} 又如何呢？\texttt{file\_\allowbreak{}size} 可能遇到的错误集合要大得多——事实上，当你想到现存操作系统的数量、每个操作系统所支持的不同文件系统的数量，以及某些文件系统（如 NFS）分布在各类网络之上这一事实时，可能的错误集合看起来极像一个开放集合。或许可以把它们全部归结到那 78 个标准 \texttt{sys::\allowbreak{}errc} 枚举值上（POSIX 的每个 \texttt{errno} 取值对应一个，但 \texttt{EDQUOT}、\texttt{EMULTIHOP} 和 \texttt{ESTALE} 除外），但那样会丢失大量信息。说真的，缺失的 POSIX 枚举值中至少有一个（\texttt{ESTALE}）就是 \texttt{fs::\allowbreak{}file\_\allowbreak{}size} 的一种合法失败模式！当然，底层的文件系统可能还想报告它自己特有的文件系统错误；例如，虽然对于“名字过长”存在标准的 POSIX 错误码，但对于“名字含有不允许的字符”却没有任何 POSIX 错误码（原因我们将在本章下一节看到）。文件系统或许正想精确地报告这一错误，而不必担心 \texttt{fs::\allowbreak{}file\_\allowbreak{}size} 会把它压扁到某个固定的枚举类型上。
+
+这里的核心问题是，\texttt{fs::\allowbreak{}file\_\allowbreak{}size} 报告的这些错误未必都来自同一领域，因此它们无法用一个固定不变的类型（例如 \texttt{std::\allowbreak{}errc}）来表示。C++ 的异常处理优雅地解决了这个问题；程序的不同层级抛出不同类型的异常，既自然又合理。如果程序的底层抛出了 \texttt{myfs::\allowbreak{}Disallowed\allowbreak{}Character\allowbreak{}In\allowbreak{}Name}，最顶层仍可以用名字、用基类，或者用 \texttt{...} 捕获它。若我们遵循一条通用规则——程序中抛出的所有东西都应派生自 \texttt{std::\allowbreak{}exception}——那么任何 \texttt{catch} 块都能使用 \texttt{e.\allowbreak{}what(\allowbreak{})\allowbreak{}}，从而至少让用户得到某种大致可读的问题提示，无论问题究竟是什么。
+
+标准库把“多个错误领域”这一思想具体化为基类 \texttt{std::\allowbreak{}error\_\allowbreak{}category}，如下面的代码所示：
+
+\begin{codebox}[cpp]
+  namespace std {
+  class error_category {
+  public:
+    virtual const char *name() const noexcept = 0;
+    virtual std::string message(int err) const = 0;
+    // 其他虚方法未列出
+    bool operator==(const std::error_category& rhs) const {
+      return this == &rhs;
+    }
+  };
+  } // namespace std
+\end{codebox}
+
+\texttt{error\_\allowbreak{}category} 的行为与第 8 章「分配器」中的 \texttt{memory\_\allowbreak{}resource} 非常相似；它定义了一个典型的古典多态（classical polymorphism）接口，并且某些类别的库应当继承它。对于 \texttt{memory\_\allowbreak{}resource}，我们曾看到有些子类是全局单例，有些则不是。而对于 \texttt{error\_\allowbreak{}category}，每个子类都必须是全局单例，否则就无法工作。
+
+为了让内存资源有用，库为我们提供了容器（见第 4 章「容器动物园」）。在最基础的层面上，一个容器是一个代表某些已分配内存的指针，外加一个能释放该指针的内存资源的句柄。（回想一下，内存资源的句柄被称为分配器（allocator）。）
+
+为了让 \texttt{error\_\allowbreak{}category} 的子类有用，库为我们提供了 \texttt{std::\allowbreak{}error\_\allowbreak{}code}。在最基础的层面上（在此例中这也是唯一的层面），一个 \texttt{error\_\allowbreak{}code} 就是一个 \texttt{int}，它代表一个错误枚举值，外加一个能解释该枚举值的 \texttt{error\_\allowbreak{}category} 的句柄。它看起来像这样：
+
+\begin{codebox}[cpp]
+    namespace std {
+    class error_code {
+      const std::error_category *m_cat;
+      int m_err;
+    public:
+      const auto& category() const { return m_cat; }
+      int value() const { return m_err; }
+      std::string message() const { return m_cat->message(m_err); }
+      explicit operator bool() const { return m_err != 0; }
+      // 其他便捷方法未列出
+    };
+    } // namespace std
+\end{codebox}
+
+那么，要创建一个挑剔的文件系统（filesystem）库子系统，我们可以编写如下代码：
+
+\begin{codebox}[cpp]
+     namespace FinickyFS {
+     enum class Error : int {
+       success = 0,
+       forbidden_character = 1,
+       forbidden_word = 2,
+       too_many_characters = 3,
+     };
+     struct ErrorCategory : std::error_category
+     {
+       const char *name() const noexcept override {
+         return "finicky filesystem";
+       }
+       std::string message(int err) const override {
+         switch (err) {
+           case 0: return "Success";
+           case 1: return "Invalid filename";
+           case 2: return "Bad word in filename";
+           case 3: return "Filename too long";
+         }
+       }
+       static ErrorCategory& instance() {
+         static ErrorCategory instance;
+         return instance;
+       }
+     };
+     std::error_code make_error_code(Error err) noexcept
+    {
+       return std::error_code(int(err), ErrorCategory::instance());
+     }
+     } // namespace FinickyFS
+\end{codebox}
+
+上述代码定义了一个新的错误领域，即 \texttt{Finicky\allowbreak{}FS::\allowbreak{}Error} 领域，它具体化为 \texttt{Finicky\allowbreak{}FS::\allowbreak{}Error\allowbreak{}Category::\allowbreak{}instance(\allowbreak{})\allowbreak{}}。它允许我们通过诸如 \texttt{make\_\allowbreak{}error\_\allowbreak{}code(\allowbreak{}Finicky\allowbreak{}FS::\allowbreak{}Error::\allowbreak{}forbidden\_\allowbreak{}word)\allowbreak{}} 这样的表达式来创建 \texttt{std::\allowbreak{}error\_\allowbreak{}code} 类型的对象。
+
+注意，实参依赖查找（ADL）会在没有任何帮助的情况下，找到 \texttt{make\_\allowbreak{}error\_\allowbreak{}code} 的正确重载。
+
+\texttt{make\_\allowbreak{}error\_\allowbreak{}code} 是一个定制点（customization point），其方式与 \texttt{swap} 完全相同：只需在你的枚举所在的命名空间中定义一个同名函数，它就能无需额外工作而生效。
+
+\begin{codebox}[cpp]
+     // 一个错误可以舒适地放进静态类型化、
+     // 且具值语义的 std::error_code 对象中……
+     std::error_code ec =
+       make_error_code(FinickyFS::Error::forbidden_word);
+     // ……然而它的“what 字符串”依然同样
+     // 易于获取，仿佛它是一个动态类型化的
+     // 异常！
+     assert(ec.message() == "Bad word in filename");
+\end{codebox}
+
+我们现在有办法让 \texttt{Finicky\allowbreak{}FS::\allowbreak{}Error} 的错误码无损地穿过整个系统——把它们包裹进可平凡拷贝的 \texttt{std::\allowbreak{}error\_\allowbreak{}code} 对象中，并在最顶层取回原始错误。当我这样表述时，它听起来几乎像魔法——像没有异常的异常处理！但正如我们刚刚看到的，它的实现其实非常简单。
+
+\subsection{错误码与 \texttt{error\_\allowbreak{}condition}}
+
+注意，\texttt{Finicky\allowbreak{}FS::\allowbreak{}Error} 并不会隐式转换为 \texttt{std::\allowbreak{}error\_\allowbreak{}code}；在上例中，我们使用的语法是 \texttt{make\_\allowbreak{}error\_\allowbreak{}code(\allowbreak{}Finicky\allowbreak{}FS::\allowbreak{}Error::\allowbreak{}forbidden\_\allowbreak{}word)\allowbreak{}}，以此来构造我们最初的 \texttt{error\_\allowbreak{}code} 对象。
+
+我们可以让 \texttt{Finicky\allowbreak{}FS::\allowbreak{}Error} 更加便于
+
+如果我们让 \texttt{<system\_\allowbreak{}error>\allowbreak{}} 启用从 \texttt{Finicky\allowbreak{}FS::\allowbreak{}Error} 到错误码（error\_\allowbreak{}code）\texttt{std::\allowbreak{}error\_\allowbreak{}code} 的隐式转换，如下所示：
+
+\begin{codebox}[cpp]
+     namespace std {
+     template<>
+     struct is_error_code_enum<::FinickyFS::Error> : true_type {};
+     } // std 命名空间
+\end{codebox}
+
+重新打开 \texttt{std} 命名空间时要小心——记住，这么做时你必须处于任何其他命名空间之外！否则，你创建出来的将是一个嵌套命名空间，比如 \texttt{Finicky\allowbreak{}FS::\allowbreak{}std}。在这种特定情况下，如果你搞错了，编译器会在你试图特化并不存在的 \texttt{Finicky\allowbreak{}FS::\allowbreak{}std::\allowbreak{}is\_\allowbreak{}error\_\allowbreak{}code\_\allowbreak{}enum} 时报错，帮了你一个大忙。只要重新打开 \texttt{std} 命名空间仅仅是为了特化模板（并且你没有把模板特化的语法搞砸），就不必太担心会有什么东西悄无声息地失败。
+
+一旦你为自己的枚举类型特化了 \texttt{std::\allowbreak{}is\_\allowbreak{}error\_\allowbreak{}code\_\allowbreak{}enum}，标准库就会接管其余的工作，如下面这段代码所示：
+
+\begin{codebox}[cpp]
+     class error_code {
+       // ……（其余成员已省略）
+       template<
+         class E,
+         class = enable_if_t<is_error_code_enum_v<E>>
+       >
+       error_code(E err) noexcept {
+         *this = make_error_code(err);
+       }
+     };
+\end{codebox}
+
+前面那段代码中的隐式转换带来了便捷的语法，比如通过 \texttt{==} 直接比较；但由于每个 \texttt{std::\allowbreak{}error\_\allowbreak{}code} 对象都携带着自己的错误域，比较是强类型的。\texttt{error\_\allowbreak{}code} 对象的值相等性不仅取决于它们的整数取值，还取决于其关联的错误类别单例的地址。
+
+\begin{codebox}[cpp]
+     std::error_code ec = FinickyFS::Error::forbidden_character;
+       // 比较是强类型的。
+     assert(ec == FinickyFS::Error::forbidden_character);
+     assert(ec != std::io_errc::stream);
+\end{codebox}
+
+如果你经常要把某个 \texttt{X} 赋给 \texttt{std::\allowbreak{}error\_\allowbreak{}code} 类型的变量，或者从返回 \texttt{std::\allowbreak{}error\_\allowbreak{}code} 的函数中返回它，那么特化 \texttt{is\_\allowbreak{}error\_\allowbreak{}code\_\allowbreak{}enum<\allowbreak{}X>\allowbreak{}} 就很有帮助。换句话说，当你的类型 \texttt{X} 确实代表错误的来源——也就是所谓「抛出的一侧」——时，它才有用。那么，捕获的一侧又如何呢？
+
+假设你注意到，你已经写下了这个函数，以及几个与之类似的函数：
+
+\begin{codebox}[cpp]
+     bool is_malformed_name(std::error_code ec) {
+       return (
+         ec == FinickyFS::Error::forbidden_character ||
+         ec == FinickyFS::Error::forbidden_word ||
+         ec == std::errc::illegal_byte_sequence);
+     }
+\end{codebox}
+
+前面这个函数定义了一个针对整个错误码宇宙的一元谓词；只要某个错误码与「畸形文件名」这一概念相关（就我们的 \texttt{Finicky\allowbreak{}FS} 库而言），它就返回 \texttt{true}。我们可以直接把这个函数作为 \texttt{Finicky\allowbreak{}FS::\allowbreak{}is\_\allowbreak{}malformed\_\allowbreak{}name(\allowbreak{})\allowbreak{}} 塞进我们的库里——事实上，这也是我个人推荐的做法——但标准库还提供了另一种可能的方案。你可以定义的不是一个 \texttt{error\_\allowbreak{}code}，而是一个 \texttt{error\_\allowbreak{}condition}，如下所示：
+
+\begin{codebox}[cpp]
+     namespace FinickyFS {
+     enum class Condition : int {
+       success = 0,
+       malformed_name = 1,
+     };
+     struct ConditionCategory : std::error_category {
+       const char *name() const noexcept override {
+         return "finicky filesystem";
+       }
+       std::string message(int cond) const override {
+         switch (cond) {
+           case 0: return "Success";
+           case 1: return "Malformed name";
+         }
+         throw Unreachable();
+       }
+       bool equivalent(const std::error_code& ec, int cond) const
+       noexcept override {
+         switch (cond) {
+           case 0: return !ec;
+           case 1: return is_malformed_name(ec);
+         }
+         throw Unreachable();
+       }
+       static ConditionCategory& instance() {
+         static ConditionCategory instance;
+         return instance;
+       }
+     };
+     std::error_condition make_error_condition(Condition cond) noexcept
+     {
+       return std::error_condition(int(cond),
+       ConditionCategory::instance());
+     }
+     } // FinickyFS 命名空间
+     namespace std {
+     template<>
+     struct is_error_condition_enum<::FinickyFS::Condition> : true_type
+     {};
+     } // std 命名空间
+\end{codebox}
+
+完成上述定义之后，你就可以通过写出比较 \texttt{(\allowbreak{}ec == Finicky\allowbreak{}FS::\allowbreak{}Condition::\allowbreak{}malformed\_\allowbreak{}name)\allowbreak{}} 来获得调用 \texttt{Finicky\allowbreak{}FS::\allowbreak{}is\_\allowbreak{}malformed\_\allowbreak{}name(\allowbreak{}ec)\allowbreak{}} 的效果，就像这样：
+
+\begin{codebox}[cpp]
+     std::error_code ec = FinickyFS::Error::forbidden_word;
+       // 右侧被隐式转换为 error_code
+     assert(ec == FinickyFS::Error::forbidden_word);
+       // 右侧被隐式转换为 error_condition
+     assert(ec == FinickyFS::Condition::malformed_name);
+\end{codebox}
+
+然而，因为我们没有提供 \texttt{make\_\allowbreak{}error\_\allowbreak{}code(\allowbreak{}Finicky\allowbreak{}FS::\allowbreak{}Condition)\allowbreak{}} 这个函数，所以就没有简便的办法去构造一个持有这些条件的 \texttt{std::\allowbreak{}error\_\allowbreak{}code} 对象。这是恰当的；条件枚举用于捕获一侧的测试，而不是用于在抛出一侧转换为 \texttt{error\_\allowbreak{}code}。
+
+标准库提供了两个「码枚举」类型（\texttt{std::\allowbreak{}future\_\allowbreak{}errc} 和 \texttt{std::\allowbreak{}io\_\allowbreak{}errc}），以及一个条件枚举类型（\texttt{std::\allowbreak{}errc}）。没错——POSIX 的错误枚举 \texttt{std::\allowbreak{}errc} 实际枚举的是条件，而不是码！这意味着，如果你试图把 POSIX 错误码塞进一个 \texttt{std::\allowbreak{}error\_\allowbreak{}code} 对象里，那你就做错了；它们是条件，也就是说，它们用于在捕获一侧做测试，而不是用于抛出。
+
+遗憾的是，标准库至少在两个方面把这个搞错了。首先，正如我们见过的，\texttt{std::\allowbreak{}from\_\allowbreak{}chars} 确实会抛出一个 \texttt{std::\allowbreak{}errc} 类型的值（这就双重地不方便了；如果它抛出的是 \texttt{std::\allowbreak{}error\_\allowbreak{}code} 会更一致些）。其次，\texttt{std::\allowbreak{}make\_\allowbreak{}error\_\allowbreak{}code(\allowbreak{}std::\allowbreak{}errc)\allowbreak{}} 这个函数存在，污染了语义空间，而实际上只应该（也确实）存在 \texttt{std::\allowbreak{}make\_\allowbreak{}error\_\allowbreak{}condition(\allowbreak{}std::\allowbreak{}errc)\allowbreak{}}。
+
+\subsection{用 \texttt{std::\allowbreak{}system\_\allowbreak{}error} 抛出异常}
+
+到目前为止，我们已经考察了 \texttt{std::\allowbreak{}error\_\allowbreak{}code}，它是 C++ 异常处理机制一个巧妙的非抛出替代方案。但有时候，你需要在系统的不同层级上把「非抛出」和「抛出」两类库混在一起用。标准库替你撑腰——至少在这个问题的一半上如此。\texttt{std::\allowbreak{}system\_\allowbreak{}error} 是一个具体的异常类型，派生自 \texttt{std::\allowbreak{}runtime\_\allowbreak{}error}，它刚好有足够的空间存放一个单独的 \texttt{error\_\allowbreak{}code}。因此，如果你正在编写一个基于抛出（而非基于 \texttt{error\_\allowbreak{}code}）的库 API，并且从系统的更低层级收到了一个表明失败的 \texttt{error\_\allowbreak{}code}，那么把这个 \texttt{error\_\allowbreak{}code} 包进一个 \texttt{system\_\allowbreak{}error} 对象里并向上 \texttt{throw}，是再恰当不过的了。
+
+\begin{codebox}[cpp]
+     // 较低层级基于 error_code。
+     uintmax_t file_size(const fs::path& p,
+         std::error_code& ec) noexcept;
+     // 我的这一层基于抛出。
+     uintmax_t file_size(const fs::path& p)
+     {
+       std::error_code ec;
+       uintmax_t size = file_size(p, ec);
+       if (ec) {
+         throw std::system_error(ec);
+       }
+       return size;
+     }
+\end{codebox}
+
+在相反的情形下——你把自己的库 API 写成非抛出的，却调用了可能抛出的更低层级——标准库基本上帮不上忙。但你可以相当容易地自己动手写一个 \texttt{error\_\allowbreak{}code} 解包器：
+
+\begin{codebox}[cpp]
+     // 较低层级基于抛出。
+     uintmax_t file_size(const fs::path& p);
+     // 我的这一层基于 error_code。
+     uintmax_t file_size(const fs::path& p,
+         std::error_code& ec) noexcept
+     {
+       uintmax_t size = -1;
+       try {
+         size = file_size(p);
+       } catch (...) {
+         ec = current_exception_to_error_code();
+       }
+       return size;
+     }
+\end{codebox}
+
+前面这段代码调用了 \texttt{current\_\allowbreak{}exception\_\allowbreak{}to\_\allowbreak{}error\_\allowbreak{}code(\allowbreak{})\allowbreak{}}，这是一个非标准的、你可以自己动手写的函数。我建议照下面这个思路来写：
+
+\begin{codebox}[cpp]
+  namespace detail {
+  enum Error : int {
+     success = 0,
+     bad_alloc_thrown = 1,
+     unknown_exception_thrown = 2,
+  };
+  struct ErrorCategory : std::error_category {
+     const char *name() const noexcept override;
+     std::string message(int err) const override;
+     static ErrorCategory& instance();
+  };
+  std::error_code make_error_code(Error err) noexcept {
+     return std::error_code(int(err), ErrorCategory::instance());
+  }
+  } // detail 命名空间
+  std::error_code current_exception_to_error_code()
+  {
+     try {
+         throw;
+     } catch (const std::system_error& e) {
+         // 同样捕获 std::ios_base::failure
+         // 以及 fs::filesystem_error
+         return e.code();
+     } catch (const std::future_error& e) {
+         // 捕获那个特殊的
+         return e.code();
+     } catch (const std::bad_alloc&) {
+         // bad_alloc 常常有特殊意义
+         return detail::bad_alloc_thrown;
+     } catch (...) {
+         return detail::unknown_exception_thrown;
+     }
+  }
+\end{codebox}
+
+至此，我们对令人困惑的 \texttt{<system\_\allowbreak{}error>\allowbreak{}} 世界的插曲式讲解就到此为止。现在，我们让你回到原本就在进行中的 \texttt{<filesystem>\allowbreak{}} 正题。
+
+\section{文件系统与路径}
+
+在第 9 章「Iostreams」中，我们讨论过 POSIX 的文件描述符（file descriptor）概念。一个文件描述符代表一个数据源或数据汇，可以被 \texttt{read} 和/或 \texttt{write} 作为目标；它通常（但不总是）对应于磁盘上的一个文件。（回想一下，文件描述符编号 \texttt{1} 指向 \texttt{stdout}，而它通常连接到人类用户的屏幕。文件描述符也可以指向网络套接字、诸如 \texttt{/\allowbreak{}dev/\allowbreak{}random} 这样的设备，等等。）
+
+此外，POSIX 的文件描述符、\texttt{<stdio.\allowbreak{}h>\allowbreak{}} 和 \texttt{<iostream>\allowbreak{}} 都明确地只关心磁盘上（或任何地方）某个文件的内容——即构成文件内容的那串字节。而在文件系统（filesystem）意义上，一个文件还有许多更显著的属性，是这些读写文件的 API 所没有暴露出来的。我们无法使用第 9 章「Iostreams」的 API 去确定一个文件的所有权，或是它的最后修改日期；我们也无法确定一个给定目录（directory）中有多少个文件。\texttt{<filesystem>\allowbreak{}} 的目的，就是让我们的 C++ 程序以一种可移植的、跨平台的方式，与这些文件系统属性交互。
+
+我们重新从头说起。什么是文件系统？文件系统是一种从路径（path）到文件的抽象映射，通过目录项（directory entry）来实现。也许一张示意图能有所帮助——不过你大可不必太当真：
+
+\myGraphic{0.9}{images/fig_p364_1.png}{}
+
+在前面的示意图顶部，是那个多少有点抽象的世界——「名字」。我们有一个从这些名字（比如 \texttt{speech.\allowbreak{}txt}）到一些具体结构的映射，而 POSIX 称之为 inode（索引节点）。C++ 标准并不使用「inode」这个术语——它用的是更通用的术语「file」——但当我想要精确表达时，我会尽量使用 inode 这个术语。每个 inode 都包含一整套描述磁盘上单个文件的属性：它的所有者、最后修改日期、类型，等等。最重要的是，inode 还确切地告诉我们文件有多大，并给出一个指向其实际内容的指针（这类似于 \texttt{std::\allowbreak{}vector} 或 \texttt{std::\allowbreak{}list} 持有一个指向其内容的指针）。inode 与数据块在磁盘上的具体表示方式，取决于你所运行的文件系统种类；一些常见文件系统的名字包括 ext4（在 Linux 上常见）、HFS+（在 OS X 上）以及 NTFS（在 Windows 上）。
+
+注意，示意图中有几个数据块所保存的数据，只不过是名字到 inode 编号的一张表格式映射。这就让我们绕回到原点了！目录（directory）不过是一个带有某种类型的 inode，其内容就是一张从名字到 inode 编号的表格式映射。每个文件系统都有一个特殊的、众所周知的 inode，叫做它的根目录。
+
+假设我们示意图中标号为「2」的 inode 就是根目录。那么，我们就可以通过一条从根目录一路通向该文件的名字路径，无歧义地标识出含有「Now is the time...」的那个文件。举例来说，\texttt{/\allowbreak{}My Documents/\allowbreak{}speech.\allowbreak{}txt} 就是这样一条路径：从根目录出发，\texttt{My Documents} 映射到 inode 42，那是一个目录，其中 \texttt{speech.\allowbreak{}txt} 映射到 inode 17，而那是一个普通文件，它在磁盘上的内容正是「Now is the time...」。我们使用斜杠把这些单独的名字组合成一条单一的路径，并且在最前面放一个单独的斜杠，以表明我们是从根目录开始的。（在 Windows 中，每个分区或驱动器都有各自独立的根目录。因此，与其只写 \texttt{/\allowbreak{}My Documents/\allowbreak{}speech.\allowbreak{}txt}，我们可能会写成 \texttt{c:/\allowbreak{}My Documents/\allowbreak{}speech.\allowbreak{}txt}，以表明我们是从 C 盘的根目录开始的。）
+
+另一种选择，\texttt{/\allowbreak{}alices-speech.\allowbreak{}txt} 是一条从根目录直指 inode 17 的路径。我们说，这两条路径（\texttt{/\allowbreak{}My Documents/\allowbreak{}speech.\allowbreak{}txt} 和 \texttt{/\allowbreak{}alices-speech.\allowbreak{}txt}）都是同一个底层 inode——也就是说，同一个底层文件——的硬链接。有些文件系统（比如许多 U 盘所使用的 FAT 文件系统）并不支持同一个文件拥有多个硬链接。当支持多个硬链接时，文件系统就必须统计指向每个 inode 的引用数量，这样它才能知道何时可以安全地删除并释放一个 inode——这个过程，与我们在第 6 章「Smart Pointers」中见过的 \texttt{shared\_\allowbreak{}ptr} 引用计数完全类似。
+
+当我们要求像 \texttt{open} 或 \texttt{fopen} 这样的库函数去「打开一个文件」时，它深入文件系统内部所经历的过程，正是上述这一过程。它会拿你给它的文件名，把它当作一条路径来处理——在斜杠处把它拆开，然后深入文件系统的目录结构，直到最终抵达你所请求的那个文件的 inode（或者直到它撞上死胡同）。注意，一旦我们抵达了 inode，再问「这个文件的名字是什么？」就毫无意义了，因为它至少拥有和它硬链接数量一样多的名字。
+
+\subsection{在 C++ 中表示路径}
+
+在第 9 章「Iostreams」中，每一个期望以「文件名」（也就是路径）作为参数的函数，都很乐于把这个路径接受为一个简单的 \texttt{const char *}。但在 \texttt{<filesystem>\allowbreak{}} 库中，我们要把这幅图景复杂化，而这全是因为 Windows。
+
+所有 POSIX 文件系统都把名字（比如 \texttt{speech.\allowbreak{}txt}）存储为简单的原始字节串。POSIX 中唯一的规则是：你的名字不能包含 \texttt{'\textbackslash 0'}，也不能包含 \texttt{'/\allowbreak{}'}（因为那正是我们要用来切分的字符）。在 POSIX 上，\texttt{"\textbackslash x\allowbreak{}C1.h"} 是一个完全合法的文件名，尽管它既不是合法的 UTF-8，也不是合法的 ASCII；而当你执行 \texttt{ls .} 时它在你屏幕上的显示方式，完全取决于你当前的区域设置和代码页。毕竟，它不过是一串三个字节组成的字符串，其中没有一个是 \texttt{'/\allowbreak{}'}。
+
+另一方面，Windows 的原生文件 API（比如 \texttt{Create\allowbreak{}File\allowbreak{}W}）总是把名字存储为 UTF-16。这意味着，按定义，Windows 中的路径永远都是合法的 Unicode 字符串。这是 POSIX 与 NTFS 之间一个重大的哲学差异！让我再慢慢地说一遍：在 POSIX 中，文件名是字节串。在 Windows 中，文件名是字符串。
+
+如果你遵循第 9 章「Iostreams」中那条普适原则——世界上的一切都应该用 UTF-8 编码——那么 POSIX 与 Windows 之间的差异将是可以应付的，甚至可能是可以忽略的。但如果你某天需要去调试某个系统上那些名字古怪的文件所引发的问题，请记住：在 POSIX 中，文件名是字节串。在 Windows 中，文件名是字符串。
+
+由于 Windows 的 API 期望 UTF-16 字符串（\texttt{std::\allowbreak{}u16string}），而 POSIX 的 API 期望字节串（\texttt{std::\allowbreak{}string}），这两种表示方式都并不完全适合一个跨平台库。于是，\texttt{<filesystem>\allowbreak{}} 发明了一个新类型：\texttt{fs::\allowbreak{}path}。（回想一下，我们在本章中一直使用自己的命名空间别名。实际上那就是 \texttt{std::\allowbreak{}filesystem::\allowbreak{}path}。）
+
+\texttt{fs::\allowbreak{}path} 大致长这样：
+
+\begin{codebox}[cpp]
+     class path {
+     public:
+       using value_type = std::conditional_t<
+         IsWindows, wchar_t, char
+       >;
+       using string_type = std::basic_string<value_type>;
+       const auto& native() const { return m_path; }
+       operator string_type() const { return m_path; }
+       auto c_str() const { return m_path.c_str(); }
+       // 许多构造函数和访问器已省略
+     private:
+       string_type m_path;
+     };
+\end{codebox}
+
+注意，\texttt{fs::\allowbreak{}path::\allowbreak{}value\_\allowbreak{}type} 在 Windows 上是 \texttt{wchar\_\allowbreak{}t}，尽管 C++11 的 UTF-16 字符类型 \texttt{char16\_\allowbreak{}t} 会更加合适。这不过是该库历史上植根于 Boost 的一个遗留产物，而 Boost 可追溯到 C++11 之前。在本章中，每当我们谈到 \texttt{wchar\_\allowbreak{}t}，你都可以假定我们谈的是 UTF-16，反之亦然。
+
+要写出可移植的代码，请注意你用来把 \texttt{fs::\allowbreak{}path} 转换成字符串的任何函数的返回类型。例如，注意 \texttt{path.\allowbreak{}c\_\allowbreak{}str(\allowbreak{})\allowbreak{}} 的返回类型并不是 \texttt{const char *}——而是 \texttt{const value\_\allowbreak{}type *}！
+
+\begin{codebox}[cpp]
+     fs::path p("/foo/bar");
+     const fs::path::value_type *a = p.c_str();
+       // 可移植，虽说这意义也不大。
+     const char *b = p.c_str();
+       // 在 POSIX 上可行；在 Windows 上编译报错。
+     std::string s = p.u8string();
+     const char *c = s.c_str();
+       // 在 POSIX 和 Windows 上都可行。
+       // 在 Windows 上执行 16 到 8 的转换。
+\end{codebox}
+
+前面的例子，情况 c，保证能够编译，但它在两个平台上的行为不同：在 POSIX 平台上，它会给出你想要的原始字节串；而在 Windows 上，它会付出不小代价地把 \texttt{path.\allowbreak{}native(\allowbreak{})\allowbreak{}} 从 UTF-16 转换成 UTF-8（这恰恰是你所要求的——但如果你能想办法避免提出这个要求，你的程序也许会更快些）。
+
+\texttt{fs::\allowbreak{}path} 有一个模板化的构造函数，能够从几乎任何
+
+实参。该实参可以是任意字符类型（\texttt{char}、\texttt{wchar\_\allowbreak{}t}、\texttt{char16\_\allowbreak{}t} 或 \texttt{char32\_\allowbreak{}t}）的序列，而这个序列可以用指向以 null 结尾的字符串的指针、指向以 null 结尾的字符串的迭代器、一个 \texttt{basic\_\allowbreak{}string}、一个 \texttt{basic\_\allowbreak{}string\_\allowbreak{}view}，或一对迭代器来表示。像往常一样，我之所以列出这么多重载，并不是因为你想在基础用法之外用到其中任何一个，而是为了让读者知道该如何避开它们。标准还提供了一个自由函数 \texttt{fs::\allowbreak{}u8path(\allowbreak{}"path")\allowbreak{}}，它只是 \texttt{fs::\allowbreak{}path(\allowbreak{}"path")\allowbreak{}} 的同义词，不过可以提醒你：传入的字符串应当是 UTF-8 编码的。我建议忽略 \texttt{u8path}。这一切听起来可能比实际更吓人。请记住，如果你坚持使用 ASCII 文件名，就无需担心编码问题；而且如果你记得避开那些“native”访问器方法——\texttt{path.\allowbreak{}native(\allowbreak{})\allowbreak{}} 和 \texttt{path.\allowbreak{}c\_\allowbreak{}str(\allowbreak{})\allowbreak{}}，并避免向 \texttt{fs::\allowbreak{}path::\allowbreak{}string\_\allowbreak{}type} 的隐式转换——那么你大可不必太担心可移植性。
+
+\subsection{对路径的操作}
+
+一旦我们有了一个 \texttt{path} 对象，就可以查询它那些由斜杠分隔的组成部分的诸多有用组合。在下面的代码片段里，每个标识符 \texttt{x}（\texttt{path} 本身除外）都代表成员函数 \texttt{path.\allowbreak{}x(\allowbreak{})\allowbreak{}} 的返回值：
+
+\begin{codebox}[cpp]
+    assert(root_path == root_name / root_directory);
+    assert(path == root_name / root_directory / relative_path);
+    assert(path == root_path / relative_path);
+    assert(path == parent_path / filename);
+    assert(filename == stem + extension);
+    assert(is_absolute == !is_relative);
+    if (IsWindows) {
+      assert(is_relative == (root_name.empty() ||
+    root_directory.empty()));
+    } else {
+      assert(is_relative == (root_name.empty() &&
+    root_directory.empty()));
+    }
+\end{codebox}
+
+例如，给定路径 \texttt{p = "c:/\allowbreak{}foo/\allowbreak{}hello.\allowbreak{}txt"}，我们有 \texttt{p.\allowbreak{}root\_\allowbreak{}name(\allowbreak{})\allowbreak{} == "c:"}、\texttt{p.\allowbreak{}root\_\allowbreak{}directory(\allowbreak{})\allowbreak{} == "/\allowbreak{}"}、\texttt{p.\allowbreak{}relative\_\allowbreak{}path(\allowbreak{})\allowbreak{} == "foo/\allowbreak{}hello.\allowbreak{}txt"}、\texttt{p.\allowbreak{}stem(\allowbreak{})\allowbreak{} == "hello"}，以及 \texttt{p.\allowbreak{}extension(\allowbreak{})\allowbreak{} == ".txt"}。至少，在 Windows 下会是这样！注意，在 Windows 中，一个绝对路径同时需要一个根名（root name）和一个根目录（root directory）（“\texttt{c:foo/\allowbreak{}hello.\allowbreak{}txt}”和“\texttt{/\allowbreak{}foo/\allowbreak{}hello.\allowbreak{}txt}”都不是绝对路径）；而在 POSIX 里，由于不存在根名，一个绝对路径只需要一个根目录（“\texttt{/\allowbreak{}foo/\allowbreak{}hello.\allowbreak{}txt}”是绝对路径，而“\texttt{c:foo/\allowbreak{}hello.\allowbreak{}txt}”则是一个以看起来很怪的目录名“\texttt{c:foo}”开头的相对路径）。
+
+在上面的代码片段中，我们用 \texttt{operator/\allowbreak{}} 来拼接路径。\texttt{fs::\allowbreak{}path} 同时支持 \texttt{operator/\allowbreak{}} 和 \texttt{operator/\allowbreak{}=} 来做这件事，它们的行为几乎完全符合你的预期——用斜杠把路径的两段连接起来。如果你想拼接路径的若干段而不添加斜杠，请使用 \texttt{operator+=}。遗憾的是，C++17 标准库缺少针对路径的 \texttt{operator+}，不过很容易把它作为一个自由函数加上去，如下所示：
+
+\begin{codebox}[cpp]
+    static fs::path operator+(fs::path a, const fs::path& b)
+    {
+      a += b;
+      return a;
+    }
+\end{codebox}
+
+路径还在两个令人困惑的成员函数名下支持带斜杠或不带斜杠的拼接：\texttt{path.\allowbreak{}concat(\allowbreak{}"foo")\allowbreak{}}（不带斜杠）和 \texttt{path.\allowbreak{}append(\allowbreak{}"foo")\allowbreak{}}（带斜杠）。当心，这正好与你的预期相反！因此，我强烈建议永远不要使用这些带名字的成员函数；始终使用运算符（或许再加上你在前面代码里自定义的 \texttt{operator+}）。
+
+关于 \texttt{fs::\allowbreak{}path} 最后一件可能令人困惑的事是，它提供了 \texttt{begin} 和 \texttt{end} 方法，就像 \texttt{std::\allowbreak{}string} 一样。但与 \texttt{std::\allowbreak{}string} 不同的是，迭代的单位并不是单个字符——迭代的单位是“名字”！这一点可以从下面的例子看出：
+
+\begin{codebox}[cpp]
+    fs::path p = "/foo/bar/baz.txt";
+    std::vector<fs::path> v(p.begin(), p.end());
+    assert((v == std::vector<fs::path>{
+      "/", "foo", "bar", "baz.txt"
+    }));
+\end{codebox}
+
+在真正的代码里，你永远没有理由去迭代一个绝对的 \texttt{fs::\allowbreak{}path}。迭代 \texttt{p.\allowbreak{}relative\_\allowbreak{}path(\allowbreak{})\allowbreak{}.parent\_\allowbreak{}path(\allowbreak{})\allowbreak{}}——其中每个被迭代出来的元素都保证是一个目录名——在罕见的情况下或许有点价值。
+
+\section{使用 \texttt{directory\_\allowbreak{}entry} 获取文件状态}
+
+当心！\texttt{directory\_\allowbreak{}entry} 是 C++17 \texttt{<filesystem>\allowbreak{}} 库中最尖端的部分。我接下来要描述的内容，Boost 没有实现，\texttt{<experimental/\allowbreak{}filesystem>\allowbreak{}} 也没有实现。
+
+从文件的 inode 获取其元数据，是通过查询一个 \texttt{fs::\allowbreak{}directory\_\allowbreak{}entry} 类型的对象来完成的。如果你熟悉用 POSIX 方式获取元数据，可以想象 \texttt{fs::\allowbreak{}directory\_\allowbreak{}entry} 内部含有一个 \texttt{fs::\allowbreak{}path} 类型的成员和一个 \texttt{std::\allowbreak{}optional<\allowbreak{}struct stat>\allowbreak{}} 类型的成员。调用 \texttt{entry.\allowbreak{}refresh(\allowbreak{})\allowbreak{}} 基本上等同于调用 POSIX 函数 \texttt{stat(\allowbreak{})\allowbreak{}}；而调用任何访问器方法，例如 \texttt{entry.\allowbreak{}file\_\allowbreak{}size(\allowbreak{})\allowbreak{}}，当且仅当那个 optional 成员仍处于未接合（disengaged）状态时，才会隐式调用 \texttt{stat(\allowbreak{})\allowbreak{}}。仅仅构造一个 \texttt{fs::\allowbreak{}directory\_\allowbreak{}entry} 实例并不会去查询文件系统；库会一直等到你提出一个具体的问题，才真正采取行动。
+
+提出一个具体问题，例如 \texttt{entry.\allowbreak{}file\_\allowbreak{}size(\allowbreak{})\allowbreak{}}，可能会让库去查询文件系统；或者（如果那个 optional 成员已经接合）它可能只是使用上一次查询时缓存的值。
+
+\begin{codebox}[cpp]
+    fs::path p = "/tmp/foo/bar.txt";
+    fs::directory_entry entry(p);
+      // 到这里，我们还没有接触过文件系统。
+    while (!entry.exists()) {
+       std::cout << entry.path() << " does not exist yet\n";
+       std::this_thread::sleep_for(100ms);
+       entry.refresh();
+         // 如果没有 refresh()，会永远循环下去。
+    }
+      // 如果文件此刻被删除，下面这行
+      // 可能打印过期的缓存值，或者
+      // 尝试刷新缓存并抛出异常。
+    std::cout << entry.path() << " has size "
+          << entry.file_size() << "\n";
+\end{codebox}
+
+实现同一个目标的另一种较老的办法，是使用 \texttt{fs::\allowbreak{}status(\allowbreak{}"path")\allowbreak{}} 或 \texttt{fs::\allowbreak{}symlink\_\allowbreak{}status(\allowbreak{}"path")\allowbreak{}} 来获取一个 \texttt{fs::\allowbreak{}file\_\allowbreak{}status} 类的实例，然后再通过诸如 \texttt{status.\allowbreak{}type(\allowbreak{})\allowbreak{} == fs::\allowbreak{}file\_\allowbreak{}type::\allowbreak{}directory} 这样笨拙的操作，从 \texttt{file\_\allowbreak{}status} 对象里取出信息。我建议你不要去尝试使用 \texttt{fs::\allowbreak{}file\_\allowbreak{}status}；最好还是使用 \texttt{entry.\allowbreak{}is\_\allowbreak{}directory(\allowbreak{})\allowbreak{}} 之类的方法。而对于那些自虐者，你仍然可以直接从一个 \texttt{directory\_\allowbreak{}entry} 获取 \texttt{fs::\allowbreak{}file\_\allowbreak{}status} 实例：\texttt{entry.\allowbreak{}status(\allowbreak{})\allowbreak{}} 等价于 \texttt{fs::\allowbreak{}status(\allowbreak{}entry.\allowbreak{}path(\allowbreak{})\allowbreak{})\allowbreak{}}，而 \texttt{entry.\allowbreak{}symlink\_\allowbreak{}status(\allowbreak{})\allowbreak{}} 等价于 \texttt{fs::\allowbreak{}symlink\_\allowbreak{}status(\allowbreak{}entry.\allowbreak{}path(\allowbreak{})\allowbreak{})\allowbreak{}}，后者进而又等价于（且略快一些）\texttt{fs::\allowbreak{}status(\allowbreak{}entry.\allowbreak{}is\_\allowbreak{}symlink(\allowbreak{})\allowbreak{} ? fs::\allowbreak{}read\_\allowbreak{}symlink(\allowbreak{}entry.\allowbreak{}path(\allowbreak{})\allowbreak{})\allowbreak{} : entry.\allowbreak{}path(\allowbreak{})\allowbreak{})\allowbreak{}}。
+
+顺带一提，自由函数 \texttt{fs::\allowbreak{}equivalent(\allowbreak{}p,\allowbreak{} q)\allowbreak{}} 可以告诉你两个路径是否都被硬链接到了同一个 inode；而 \texttt{entry.\allowbreak{}hard\_\allowbreak{}link\_\allowbreak{}count(\allowbreak{})\allowbreak{}} 可以告诉你指向这个特定 inode 的硬链接总数。（要确定那些硬链接的名字，唯一的办法是遍历整个文件系统；即便如此，你当前的用户账户也可能没有权限去 stat 那些路径。）
+
+\section{使用 \texttt{directory\_\allowbreak{}iterator} 遍历目录}
+
+\texttt{fs::\allowbreak{}directory\_\allowbreak{}iterator} 名副其实。这种类型的对象让你可以逐个条目地遍历单个目录的内容：
+
+\begin{codebox}[cpp]
+    fs::path p = fs::current_path();
+      // 列出当前目录。
+    for (fs::directory_entry entry : fs::directory_iterator(p)) {
+      std::cout << entry.path().string() << ": "
+      << entry.file_size() << " bytes\n";
+    }
+\end{codebox}
+
+顺带一提，请注意前面代码里对 \texttt{entry.\allowbreak{}path(\allowbreak{})\allowbreak{}.string(\allowbreak{})\allowbreak{}} 的使用。这是必需的，因为 \texttt{operator<<} 作用在 path 对象上时行为极其怪异——它总是像你写了 \texttt{std::\allowbreak{}quoted(\allowbreak{}path.\allowbreak{}string(\allowbreak{})\allowbreak{})\allowbreak{}} 那样输出。如果你想要路径本身、不带多余的引号，就总得在输出前先转换成 \texttt{std::\allowbreak{}string}。（类似地，\texttt{std::\allowbreak{}cin >> path} 也无法用来从用户那里读取一个路径，不过这还没那么讨厌，因为你本来就不该使用 \texttt{operator>\allowbreak{}>}。关于从用户处词法分析和解析输入的更多信息，参见第 9 章「I/O 流」与第 10 章「正则表达式」。）
+
+\subsection{递归遍历目录}
+
+要像 Python 的 \texttt{os.\allowbreak{}walk(\allowbreak{})\allowbreak{}} 那样递归地走完整棵目录树，你可以使用这个基于前面代码片段改写而成的递归函数：
+
+\begin{codebox}[cpp]
+    template<class F>
+    void walk_down(const fs::path& p, const F& callback)
+    {
+      for (auto entry : fs::directory_iterator(p)) {
+        if (entry.is_directory()) {
+          walk_down(entry.path(), callback);
+        } else {
+          callback(entry);
+        }
+      }
+    }
+\end{codebox}
+
+或者，你也可以简单地使用一个 \texttt{fs::\allowbreak{}recursive\_\allowbreak{}directory\_\allowbreak{}iterator}：
+
+\begin{codebox}[cpp]
+    template<class F>
+    void walk_down(const fs::path& p, const F& callback)
+    {
+      for (auto entry : fs::recursive_directory_iterator(p)) {
+        callback(entry);
+      }
+    }
+\end{codebox}
+
+\texttt{fs::\allowbreak{}recursive\_\allowbreak{}directory\_\allowbreak{}iterator} 的构造函数可以接受一个额外的 \texttt{fs::\allowbreak{}directory\_\allowbreak{}options} 类型参数，用以修改递归的具体行为。例如，你可以传入 \texttt{fs::\allowbreak{}directory\_\allowbreak{}options::\allowbreak{}follow\_\allowbreak{}directory\_\allowbreak{}symlink} 来跟随符号链接，不过如果恶意用户创建了一个指回自己父目录的符号链接，这很容易让你陷入无限循环。
+
+\section{修改文件系统}
+
+\texttt{<filesystem>\allowbreak{}} 头文件里的大部分设施关注的都是检查文件系统，而非修改它。但在这些瓦砾中也藏着几颗宝石。这些函数中有很多似乎是为了把经典 POSIX 命令行工具的效果搬到可移植的 C++ 中：
+
+\texttt{fs::\allowbreak{}copy\_\allowbreak{}file(\allowbreak{}old\_\allowbreak{}path,\allowbreak{} new\_\allowbreak{}path)\allowbreak{}}：将 \texttt{old\_\allowbreak{}path} 处的文件拷贝到一个新的文件（即一个新的 inode），位置在 \texttt{new\_\allowbreak{}path}，相当于 \texttt{cp -n}。如果 \texttt{new\_\allowbreak{}path} 已经存在则报错。
+
+\texttt{fs::\allowbreak{}copy\_\allowbreak{}file(\allowbreak{}old\_\allowbreak{}path,\allowbreak{} new\_\allowbreak{}path,\allowbreak{}} \texttt{fs::\allowbreak{}copy\_\allowbreak{}options::\allowbreak{}overwrite\_\allowbreak{}existing)\allowbreak{}}：将 \texttt{old\_\allowbreak{}path} 拷贝到 \texttt{new\_\allowbreak{}path}。如果可能就覆盖 \texttt{new\_\allowbreak{}path}。如果 \texttt{new\_\allowbreak{}path} 已存在且不是普通文件，或者它与 \texttt{old\_\allowbreak{}path} 相同，则报错。
+
+\begin{codebox}[cpp]
+ fs::copy_file(old_path, new_path,
+ fs::copy_options::update_existing): Copy old_path to new_path.
+ Overwrite new_path if and only if it's older than the file at old_path.
+ fs::copy(old_path, new_path, fs::copy_options::recursive |
+ fs::copy_options::copy_symlinks): Copy an entire directory from
+ old_path to new_path as if by cp -R.
+ fs::create_directory(new_path): Create a directory as if by mkdir.
+\end{codebox}
+
+\texttt{fs::\allowbreak{}create\_\allowbreak{}directories(\allowbreak{}new\_\allowbreak{}path)\allowbreak{}}：创建一个目录，相当于 \texttt{mkdir -p}。
+
+\texttt{fs::\allowbreak{}create\_\allowbreak{}directory(\allowbreak{}new\_\allowbreak{}path,\allowbreak{} old\_\allowbreak{}path)\allowbreak{}}（注意参数顺序反了！）：创建一个目录，但将其属性从 \texttt{old\_\allowbreak{}path} 处那个目录的属性复制过来。
+
+\begin{codebox}[cpp]
+ fs::create_symlink(old_path, new_path): Create a symlink from
+ new_path to old_path.
+\end{codebox}
+
+\texttt{fs::\allowbreak{}remove(\allowbreak{}path)\allowbreak{}}：移除一个文件或空目录，相当于 \texttt{rm}。
+
+\texttt{fs::\allowbreak{}remove\_\allowbreak{}all(\allowbreak{}path)\allowbreak{}}：移除一个文件或目录，相当于 \texttt{rm -r}。
+
+\texttt{fs::\allowbreak{}rename(\allowbreak{}old\_\allowbreak{}path,\allowbreak{} new\_\allowbreak{}path)\allowbreak{}}：重命名一个文件或目录，相当于 \texttt{mv}。
+
+\texttt{fs::\allowbreak{}resize\_\allowbreak{}file(\allowbreak{}path,\allowbreak{} new\_\allowbreak{}size)\allowbreak{}}：扩展（补零）或截断一个普通文件。
+
+\section{报告磁盘使用量}
+
+说到经典的命令行工具，我们可能想对文件系统做的最后一件事，就是询问它有多满。这正是命令行工具 \texttt{df -h} 或 POSIX 库函数 \texttt{statvfs} 的领域。在 C++17 中，我们可以用 \texttt{fs::\allowbreak{}space(\allowbreak{}"path")\allowbreak{}} 来完成，它（按值）返回一个 \texttt{fs::\allowbreak{}space\_\allowbreak{}info} 类型的结构体：
+
+\begin{codebox}[cpp]
+ struct space_info {
+    uintmax_t capacity;
+    uintmax_t free;
+    uintmax_t available;
+ };
+\end{codebox}
+
+上述每个字段都以字节为单位，并且我们应当有 \texttt{available <= free <= capacity}。\texttt{available} 与 \texttt{free} 的区别在于用户限制：在某些文件系统上，一部分空闲空间可能被保留给 root 用户；而在另一些文件系统上，可能存在按用户账户的磁盘配额。
+
+\section{小结}
+
+使用命名空间别名（namespace alias）来节省打字，并便于临时换入某个库命名空间的替代实现，例如 Boost。
+
+\texttt{std::\allowbreak{}error\_\allowbreak{}code}（错误码）提供了一种非常简洁的方式，让你无需异常处理就能把整数错误码沿着调用栈向上传递；如果你所在的领域不待见异常处理，可以考虑使用它。（若是如此，这大概就是你能从本章带走的全部了！\texttt{<filesystem>\allowbreak{}} 库同时提供了抛异常与不抛异常的 API；然而，两类 API 都用到了会在堆上分配内存（并且可能抛异常）的 \texttt{fs::\allowbreak{}path} 作为词汇类型（vocabulary type）。使用不抛异常的 API 的唯一理由，是它能消除“把异常用于流程控制”的情形。）
+
+\texttt{std::\allowbreak{}error\_\allowbreak{}condition}（错误条件）只不过是为“捕获”错误码提供的语法糖；对它要像避瘟疫一样避开。
+
+一个路径（path）由一个 \texttt{root\_\allowbreak{}name}、一个 \texttt{root\_\allowbreak{}directory} 和一个 \texttt{relative\_\allowbreak{}path} 组成；其中最后一项由以斜杠分隔的名字构成。对 POSIX 而言，一个名字是一串原始字节；对 Windows 而言，一个名字是一串 Unicode 字符。\texttt{fs::\allowbreak{}path} 类型试图为每种平台使用恰当种类的字符串。为避免可移植性问题，要当心 \texttt{path.\allowbreak{}c\_\allowbreak{}str(\allowbreak{})\allowbreak{}} 以及向 \texttt{fs::\allowbreak{}path::\allowbreak{}string\_\allowbreak{}type} 的隐式转换。
+
+目录存储的是从名字到 inode（C++ 标准干脆称之为“files”）的映射。在 C++ 中，你可以遍历一个 \texttt{fs::\allowbreak{}directory\_\allowbreak{}iterator} 来获取 \texttt{fs::\allowbreak{}directory\_\allowbreak{}entry} 对象；\texttt{fs::\allowbreak{}directory\_\allowbreak{}entry} 上的方法让你可以查询对应的 inode。重新 stat 一个 inode 就像调用 \texttt{entry.\allowbreak{}refresh(\allowbreak{})\allowbreak{}} 一样简单。
+
+\texttt{<filesystem>\allowbreak{}} 提供了一大堆自由函数，用于创建、拷贝、重命名、移除以及调整文件和目录的大小，还有一个用于获取文件系统总容量的函数。
+
+本章讨论的许多内容（至少其中的 \texttt{<filesystem>\allowbreak{}} 部分）是尖端的 C++17 特性，截至本书付印之时，还没有任何编译器厂商实现它。使用这类新特性时要谨慎。

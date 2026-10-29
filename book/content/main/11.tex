@@ -1,0 +1,440 @@
+在上一章中，我们学习了正则表达式（regular expression），这项特性自 C++11 起就成为 C++ 标准库的一部分，但许多程序员仍对它不甚了解。我们看到，正则表达式在 C++ 光谱两端的两个场景中都很实用——一端是需要稳健解析复杂输入格式的复杂程序，另一端是可读性与发展速度最为重要的轻量脚本。
+
+另一项同时落在这两类场景中的库特性，便是随机数（random number）生成。许多脚本程序时不时需要一点随机性，但数十年来 C++ 程序员都被教导说，经典的 libc \texttt{rand(\allowbreak{})\allowbreak{}} 函数已经过时。而在光谱的另一端，\texttt{rand(\allowbreak{})\allowbreak{}} 又极其不合适，无论用于加密还是复杂的数值模拟都不行。然而，C++11 的 \texttt{<random>\allowbreak{}} 库却能够同时命中上述三个目标。
+
+本章我们将涵盖以下主题：
+
+真随机数（random number）与伪随机数（pseudo-random number）序列之间的区别
+
+产生随机位的生成器（generator）与产生数据值的分布（distribution）之间的区别
+
+为随机数生成器播种的三种策略
+
+若干标准库生成器与分布，以及它们的适用场景
+
+如何在 C++17 中洗一副牌
+
+\section{真随机数与伪随机数}
+
+在讨论计算机编程中的随机数时，我们必须谨慎区分两类：一类是真正随机数，它来自物理上非确定性的源；另一类是伪随机数，它来自某个以确定性方式产生一串「看似随机」的数的算法。这样的算法被称为伪随机数生成器（PRNG）。每个 PRNG 在概念上的运作方式都相同——它拥有某种内部状态，并且为用户提供了索取下一个输出的途径。每当我们索取下一个输出时，PRNG 就会依据某个确定性算法打乱其内部状态，并返回该状态的一部分。示例如下：
+
+\begin{codebox}[cpp]
+     template<class T>
+     class SimplePRNG {
+       uint32_t state = 1;
+     public:
+       static constexpr T min() { return 0; }
+       static constexpr T max() { return 0x7FFF; }
+       T operator()() {
+         state = state * 1103515245 + 12345;
+         return (state >> 16) & 0x7FFF;
+       }
+     };
+\end{codebox}
+
+这个 \texttt{Simple\allowbreak{}PRNG} 类实现了一个线性同余生成器（linear congruential generator），它很可能与你标准库中 \texttt{rand(\allowbreak{})\allowbreak{}} 的实现非常相似。注意，\texttt{Simple\allowbreak{}PRNG::\allowbreak{}operator(\allowbreak{})\allowbreak{}} 产生的是 \texttt{[0,\allowbreak{} 32767]} 这个 15 位范围内的整数，但其内部 \texttt{state} 却是 32 位范围。真实世界中的 PRNG 也遵循这一模式。例如，标准的 Mersenne Twister 算法保留了将近 20 KB 的状态！保留如此庞大的内部状态，意味着有大量位可供打乱，而每次生成时只有极小一部分 PRNG 内部状态会泄漏出来。这使得仅凭少量先前的输出，人类（或计算机）都难以预测 PRNG 的下一个输出。正因其输出难以预测，我们才称之为伪随机数生成器。倘若它的输出充满明显的规律、极易预测，我们大概会叫它「非随机数生成器」了！
+
+尽管具有伪随机的特性，PRNG 的行为却始终是完全确定性的；它严格遵循代码所写的算法。如果我们拿一个使用 PRNG 的程序连续运行数次，每次都会得到完全相同的伪随机数序列。正是这种严格的确定性，让我们将它称为伪随机数生成器。
+
+伪随机数生成器的另一个特点是：两个运行完全相同算法、但初始状态仅有微小差异的生成器，会迅速放大这些差异、彼此分道扬镳，并产生截然不同的输出序列——这就如同手背上两滴落在略微不同位置的水，会朝完全不同的方向流走。这意味着，如果我们希望每次运行程序都得到不同的伪随机数序列，只需确保为 PRNG 使用不同的初始状态即可。设定 PRNG 的初始状态，就称为为 PRNG 播种（seeding）。
+
+我们至少有三种为 PRNG 播种的策略：
+
+使用外部提供的种子——来自调用者或最终用户。这最适用于任何需要可复现性的情形，例如蒙特卡洛（Monte Carlo）模拟，或任何需要单元测试的东西。
+
+使用可预测但可变的种子，例如当前时间戳。在 C++11 之前，这是最常见的策略，因为 C 标准库提供了可移植且方便的 \texttt{time} 函数，却没有提供任何可移植的真随机位来源。基于像 \texttt{time} 这样可预测之物来播种，不适合任何与安全相关的场景。自 C++11 起，你绝不该再使用这种策略。
+
+使用直接从某种平台特定的「真随机」位源获取的真随机种子。
+
+操作系统基于各种各样的随机事件来收集真随机位；一种经典做法是，每次系统调用都收集硬件周期计数器的低位，并将其异或进操作系统的熵池（entropy pool）。内核深处的一个 PRNG 会周期性地用熵池中的位重新播种；该 PRNG 的输出序列则向应用程序员开放。在 Linux 上，原始熵池以 \texttt{/\allowbreak{}dev/\allowbreak{}random} 的形式暴露，而该 PRNG 的输出序列则以 \texttt{/\allowbreak{}dev/\allowbreak{}urandom} 的形式暴露。所幸，你永远不需要直接和这两个设备打交道；C++ 标准库已经替你考虑周全了。继续往下读吧。
+
+\section{\texttt{rand(\allowbreak{})\allowbreak{}} 的问题}
+
+生成随机数的老式 C 语言做法，是调用 \texttt{rand(\allowbreak{})\allowbreak{}}。\texttt{rand(\allowbreak{})\allowbreak{}} 函数如今仍是 C++ 的一部分，它不接受任何参数，并产生一个在 \texttt{[0,\allowbreak{} RAND\_\allowbreak{}MAX]} 范围内均匀分布的单个整数。其内部状态可以通过调用库函数 \texttt{srand(\allowbreak{}seed\_\allowbreak{}value)\allowbreak{}} 来播种。
+
+生成 \texttt{[0,\allowbreak{} x)\allowbreak{}} 范围内随机数的经典代码，自 20 世纪 80 年代以来就没有变过，如下所示：
+
+\begin{codebox}[cpp]
+     #include <stdlib.h>
+     int randint0(int x) {
+       return rand() % x;
+     }
+\end{codebox}
+
+然而，这段代码有几个问题。第一个也是最为明显的问题是，它并不能让所有 \texttt{x} 个输出具有相等的概率。假设（姑且这么说）\texttt{rand(\allowbreak{})\allowbreak{}} 返回的是 \texttt{[0,\allowbreak{} 32767]} 范围内均匀分布的值，那么 \texttt{randint0(\allowbreak{}10)\allowbreak{}} 返回 \texttt{[0,\allowbreak{} 7]} 范围内每个值的频率，会比返回 \texttt{8} 或 \texttt{9} 高出 1/3276。
+
+第二个问题是，\texttt{rand(\allowbreak{})\allowbreak{}} 会访问全局状态；同一个随机数生成器被 C++ 程序中每个线程所共享。这倒不是线程安全方面的问题——自 C++11 起，\texttt{rand(\allowbreak{})\allowbreak{}} 已被保证是线程安全的。然而，这对性能是个问题（因为每次调用 \texttt{rand(\allowbreak{})\allowbreak{}} 都必须获取一个全局互斥锁），对可复现性也是个问题（因为如果你从多个线程并发使用 \texttt{rand(\allowbreak{})\allowbreak{}}，程序不同次运行可能会得出不同答案）。
+
+\texttt{rand(\allowbreak{})\allowbreak{}} 全局状态性的第三个（也与之相关的）问题是：程序中任何位置的任何函数，只要调用 \texttt{rand(\allowbreak{})\allowbreak{}} 就能修改该状态。这使得在单元测试驱动的环境中实际上无法使用 \texttt{rand(\allowbreak{})\allowbreak{}}。请看下面这段代码片段：
+
+\begin{codebox}[cpp]
+     int heads(int n) {
+       DEBUG_LOG("heads");
+       int result = 0;
+       for (int i = 0; i < n; ++i) {
+         result += (rand() % 2);
+       }
+       return result;
+     }
+     void test_heads() {
+       srand(17); // nail down the seed
+       int result = heads(42);
+       assert(result == 27);
+     }
+\end{codebox}
+
+显然，一旦我们开始将单元测试并行化，单元测试 \texttt{test\_\allowbreak{}heads} 就会崩溃（因为来自其他线程的对 \texttt{rand(\allowbreak{})\allowbreak{}} 的调用，会干扰该测试脆弱的运行过程）。然而更微妙的是，它也可能仅仅因为有人修改了 \texttt{DEBUG\_\allowbreak{}LOG} 的实现、增减了对 \texttt{rand(\allowbreak{})\allowbreak{}} 的调用而崩溃！这种「隔空施法」般的行为，只要你的架构依赖全局变量，就是个问题。我们在第 8 章「分配器」中 \texttt{std::\allowbreak{}pmr::\allowbreak{}get\_\allowbreak{}default\_\allowbreak{}resource(\allowbreak{})\allowbreak{}} 处，就见过类似的危险。在每一种情形下，我强烈推荐的补救办法都相同——不要使用全局变量，不要使用全局状态。
+
+所以，C 语言库有两个问题——它无法生成真正均匀的伪随机数分布，而且从根本上依赖全局变量。下面我们看看 C++ 标准库的 \texttt{<random>\allowbreak{}} 头文件是如何把这两个问题都解决的。
+
+\section{用 \texttt{<random>\allowbreak{}} 解决问题}
+
+\texttt{<random>\allowbreak{}} 头文件提供了两个核心概念——生成器（generator）与分布（distribution）。生成器（一个建模 \texttt{Uniform\allowbreak{}Random\allowbreak{}Bit\allowbreak{}Generator} 概念的类）将 PRNG 的内部状态封装进一个 C++ 对象，并以函数调用运算符 \texttt{operator(\allowbreak{})\allowbreak{}(\allowbreak{}void)\allowbreak{}} 的形式提供一个索取下一个输出的成员函数。分布（一个建模 \texttt{Random\allowbreak{}Number\allowbreak{}Distribution} 的类）是一种可以置于生成器输出之上的过滤器，使得你拿到的不再是像 \texttt{rand(\allowbreak{})\allowbreak{}} 那样均匀分布的随机位，而是依据某个指定的数学分布、约束在特定范围内（例如 \texttt{rand(\allowbreak{})\allowbreak{} \% n}）的实际数据值，而且它在数学上更为恰当、灵活得多。
+
+\texttt{<random>\allowbreak{}} 头文件共包含七种生成器类型与二十种分布类型。其中大多数是需要大量参数的模板。这些生成器绝大多数只有历史意义、并无多少实用价值，而这些分布中的绝大多数也只有数学家才会感兴趣。因此，在本章中我们只会聚焦于少数几个标准生成器和分布，它们各自都能阐明标准库的某些有趣之处。
+
+\section{处理生成器}
+
+给定任意一个生成器对象 \texttt{g}，你可以对它执行以下操作：
+
+\texttt{g(\allowbreak{})\allowbreak{}}：打乱生成器的内部状态，并产生它的下一个输出。
+
+\texttt{g.\allowbreak{}min(\allowbreak{})\allowbreak{}}：告诉你 \texttt{g(\allowbreak{})\allowbreak{}} 可能的最小输出（通常是 \texttt{0}）。
+
+\texttt{g.\allowbreak{}max(\allowbreak{})\allowbreak{}}：告诉你 \texttt{g(\allowbreak{})\allowbreak{}} 可能的最大输出。也就是说，\texttt{g(\allowbreak{})\allowbreak{}} 可能输出的范围是 \texttt{g.\allowbreak{}min(\allowbreak{})\allowbreak{}} 到 \texttt{g.\allowbreak{}max(\allowbreak{})\allowbreak{}}（含两端）。
+
+\texttt{g.\allowbreak{}discard(\allowbreak{}n)\allowbreak{}}：这等效于调用 \texttt{g(\allowbreak{})\allowbreak{}} 共 \texttt{n} 次，并丢弃结果。在一个良好的库实现中，你只需付出将生成器内部状态打乱 \texttt{n} 次的代价，却省下了从状态计算下一个输出的任何开销。
+
+\subsection{用 std::random\_\allowbreak{}device 产生真随机位}
+
+\texttt{std::\allowbreak{}random\_\allowbreak{}device} 是一个生成器。它的接口极其简单；它甚至不是一个类模板，而只是一个普通的旧式类。一旦你用默认构造函数构造出一个 \texttt{std::\allowbreak{}random\_\allowbreak{}device} 实例，就可以使用它重载的调用运算符，来获取类型为 \texttt{unsigned int}、在闭区间 \texttt{[rd.\allowbreak{}min(\allowbreak{})\allowbreak{},\allowbreak{} rd.\allowbreak{}max(\allowbreak{})\allowbreak{}]} 内均匀分布的值。
+
+有一点要注意——\texttt{std::\allowbreak{}random\_\allowbreak{}device} 并未完全建模 \texttt{Uniform\allowbreak{}Random\allowbreak{}Bit\allowbreak{}Generator} 概念。最重要的是，它既不可拷贝，也不可移动。这在实践中算不上什么问题，因为你通常不会长时间保留一个真随机生成器。相反，你会用一个生命期极短的 \texttt{std::\allowbreak{}random\_\allowbreak{}device} 实例，来为某个其他类型的、生命期较长的伪随机生成器生成种子，就像这样：
+
+\begin{codebox}[cpp]
+     std::random_device rd;
+     unsigned int seed = rd();
+     assert(rd.min() <= seed && seed <= rd.max());
+\end{codebox}
+
+现在，我们来看看你唯一需要了解的伪随机生成器。
+
+\subsection{用 std::mt19937 产生伪随机位}
+
+你唯一需要了解的伪随机生成器名为梅森旋转（Mersenne Twister）算法。该算法自 1997 年便已为人所知，而且用任何编程语言都能轻易找到高质量的实现。严格来说，梅森旋转算法定义了一整个相关的 PRNG 家族——它等价于 C++ 模板在算法层面的对应物——但该家族中最常用的成员被称为 MT19937。这串数字看上去像时间戳，其实不是；它是 Twister 内部状态的位数。由于梅森旋转的下一个输出函数对其状态的打乱极其彻底，以至于它在循环回到起点之前，终将遍历每一个可能的状态（除一个之外）——因此 MT19937 生成器的周期为 $2^{19937}-1$。相比之下，本章开头那个 \texttt{Simple\allowbreak{}PRNG} 的内部状态只有 32 位，周期为 $2^{31}$。（我们的 \texttt{Simple\allowbreak{}PRNG} 生成器有 $2^{32}$ 种可能的内部状态，但在循环回来之前只会遍历其中一半。例如，从初始的 \texttt{state=1} 无法到达 \texttt{state=3}。）
+
+理论说得够多了。让我们看看梅森旋转的实际表现吧！与梅森旋转算法模板相对应的 C++ 类模板是 \texttt{std::\allowbreak{}mersenne\_\allowbreak{}twister\_\allowbreak{}engine<...>}，但你不会直接使用它；你会使用那个方便的 typedef \texttt{std::\allowbreak{}mt19937}，如下所示：
+
+\begin{codebox}[cpp]
+     std::mt19937 g;
+     assert(g.min() == 0 && g.max() == 4294967295);
+     assert(g() == 3499211612);
+     assert(g() == 581869302);
+     assert(g() == 3890346734);
+\end{codebox}
+
+\texttt{std::\allowbreak{}mt19937} 的默认构造函数会将其内部状态设为一个众所周知的标定值。这保证了你从默认构造的 \texttt{mt19937} 对象得到的输出序列，在所有平台上都完全一致——这与 \texttt{rand(\allowbreak{})\allowbreak{}} 相反，后者在不同平台上往往给出不同的输出序列。
+
+要得到不同的输出序列，你需要向 \texttt{std::\allowbreak{}mt19937} 的构造函数提供一个种子。在 C++17 中有两种方式做到这一点——繁琐的方式与简单的方式。繁琐的方式是：构造一个真正随机的 19937 位种子，并通过一个种子序列（seed sequence）把它拷贝进 \texttt{std::\allowbreak{}mt19937} 对象，如下所示：
+
+\begin{codebox}[cpp]
+     std::random_device rd;
+     uint32_t numbers[624];
+     std::generate(numbers, std::end(numbers), std::ref(rd));
+       // Generate initial state.
+     SeedSeq sseq(numbers, std::end(numbers));
+       // Copy our state into a heap-allocated "seed sequence".
+     std::mt19937 g(sseq);
+       // Initialize a mt19937 generator with our state.
+\end{codebox}
+
+这里，\texttt{Seed\allowbreak{}Seq} 类型既可以是 \texttt{std::\allowbreak{}seed\_\allowbreak{}seq}（一个被包装过的 \texttt{std::\allowbreak{}vector}；它会使用堆分配），也可以是一个手写得当的「种子序列」类，例如下面这段代码：
+
+\begin{codebox}[cpp]
+     template<class It>
+     struct SeedSeq {
+       It begin_;
+       It end_;
+     public:
+       SeedSeq(It begin, It end) : begin_(begin), end_(end) {}
+       template<class It2>
+       void generate(It2 b, It2 e) {
+         assert((e - b) <= (end_ - begin_));
+         std::copy(begin_, begin_ + (e - b), b);
+       }
+     };
+\end{codebox}
+
+当然，仅仅为了构造一个 PRNG 对象就要写这么多代码！（我早就说过，这是繁琐的方式。）
+
+简单的方式——也是你在实践中会看到的方式——是用一个真正随机的 32 位整数来为 MT19937 播种，如下所示：
+
+\begin{codebox}[cpp]
+     std::random_device rd;
+     std::mt19937 g(rd());
+       // 32 bits of randomness ought to be enough for anyone!
+       // ...Right?
+\end{codebox}
+
+当心！32 是一个比 19937 小得多的数！这种简单的播种方式，终其一生也只能产生四十亿种不同的输出序列；这意味着，如果你用随机种子一遍又一遍地运行程序，只需几十万次运行后就会看到某些重复。（这正是著名的生日悖论（Birthday Paradox）的一个应用。）然而，如果这种程度的可预测性对你很重要，你可能也该意识到，梅森旋转在密码学上并不安全。这意味着，即便你用一个真正随机的 19937 位种子序列来初始化它，恶意攻击者也能在只看了一小段（几百项）输出序列之后，反推出你最初种子的全部 19937 位，并以完全准确的精度预测此后每一个输出。如果你需要一个密码学安全的伪随机数生成器（CSPRNG），你应该使用类似 AES-CTR 或 ISAAC 这样的东西，而这两者都不由 C++ 标准库提供。你仍应将自己的 CSPRNG 实现封装进一个建模 \texttt{Uniform\allowbreak{}Random\allowbreak{}Bit\allowbreak{}Generator} 的类中，这样它才能与标准算法一起使用——这一点我们会在本章末尾讲到。
+
+\subsection{用适配器过滤生成器输出}
+
+我们提到过，生成器的原始输出通常会经过单个分布过滤，以将生成器的原始位转换成可用的数据值。有趣的是，也可以让生成器的输出经过一个生成器适配器（generator adaptor），它以种种或许有用的方式重新格式化那些原始位。标准库提供了三种适配器——\texttt{std::\allowbreak{}discard\_\allowbreak{}block\_\allowbreak{}engine}、\texttt{std::\allowbreak{}shuffle\_\allowbreak{}order\_\allowbreak{}engine} 与 \texttt{std::\allowbreak{}independent\_\allowbreak{}bits\_\allowbreak{}engine}。这些适配器类型的工作方式，与我们第 4 章「容器动物园（The Container Zoo）」中讨论过的容器适配器（例如 \texttt{std::\allowbreak{}stack}）完全一样——它们提供某种接口，却把大部分实现细节委托给另一个类。
+
+\texttt{std::\allowbreak{}discard\_\allowbreak{}block\_\allowbreak{}engine<\allowbreak{}Gen,\allowbreak{} p,\allowbreak{} r>\allowbreak{}} 的一个实例会保留一个类型为 \texttt{Gen} 的底层生成器，并将其所有操作都委托给那个底层生成器，唯一的例外是：\texttt{discard\_\allowbreak{}block\_\allowbreak{}engine::\allowbreak{}operator(\allowbreak{})\allowbreak{}} 只会返回底层生成器每 \texttt{p} 个输出中的前 \texttt{r} 个。例如，考虑下面的例子：
+
+\begin{codebox}[cpp]
+     std::vector<uint32_t> raw(10), filtered(10);
+     std::discard_block_engine<std::mt19937, 3, 2> g2;
+     std::mt19937 g1 = g2.base();
+     std::generate(raw.begin(), raw.end(), g1);
+     std::generate(filtered.begin(), filtered.end(), g2);
+     assert(raw[0] == filtered[0]);
+     assert(raw[1] == filtered[1]);
+       // raw[2] doesn't appear in filtered[]
+     assert(raw[3] == filtered[2]);
+     assert(raw[4] == filtered[3]);
+       // raw[5] doesn't appear in filtered[]
+\end{codebox}
+
+注意，可以通过 \texttt{g2.base(\allowbreak{})\allowbreak{}} 获取对底层生成器的引用。在
+
+在前面的例子中，\texttt{g1} 被初始化为 \texttt{g2.base(\allowbreak{})\allowbreak{}} 的副本；这就解释了为何调用 \texttt{g1(\allowbreak{})\allowbreak{}} 不会影响 \texttt{g2} 的状态，反之亦然。
+
+\texttt{std::\allowbreak{}shuffle\_\allowbreak{}order\_\allowbreak{}engine<\allowbreak{}Gen,\allowbreak{} k>\allowbreak{}} 的一个实例会保存其底层生成器最近 k 次输出的一个缓冲区，以及一个额外的整数 \texttt{Y}。每次调用 \texttt{shuffle\_\allowbreak{}order\_\allowbreak{}engine::\allowbreak{}operator(\allowbreak{})\allowbreak{}} 都会先置 \texttt{Y = buffer[Y \% k]}，再置 \texttt{buffer[Y] = base(\allowbreak{})\allowbreak{}(\allowbreak{})\allowbreak{}}。（根据 \texttt{Y} 计算缓冲区下标的公式，实际上比简单的取模要复杂一些，但基本效果是等价的。）值得注意的是，\texttt{std::\allowbreak{}shuffle\_\allowbreak{}order\_\allowbreak{}engine} 并没有使用 \texttt{std::\allowbreak{}uniform\_\allowbreak{}int\_\allowbreak{}distribution} 来把 \texttt{Y} 映射到 \texttt{[0,\allowbreak{} k)\allowbreak{}} 范围上。这不会影响生成器（generator）输出的随机性——如果底层生成器本身已经是伪随机的，那么无论我们用什么算法去打乱其输出，都不会让它们变得更随机或更不随机。
+
+因此，\texttt{shuffle\_\allowbreak{}order\_\allowbreak{}engine} 所使用的算法之所以被选中，纯粹是出于其历史趣味——它是唐纳德·克努斯（Donald Knuth）的《The Art of Computer Programming》中所描述的一个经典算法的基石：
+
+\begin{codebox}[cpp]
+    using knuth_b = std::shuffle_order_engine<
+      std::linear_congruential_engine<
+        uint_fast32_t, 16807, 0, 2147483647
+      >,
+      256
+    >;
+\end{codebox}
+
+\texttt{std::\allowbreak{}independent\_\allowbreak{}bits\_\allowbreak{}engine<\allowbreak{}Gen,\allowbreak{} w,\allowbreak{} T>\allowbreak{}} 的一个实例，除了类型为 \texttt{Gen} 的底层生成器之外不保存任何状态。\texttt{independent\_\allowbreak{}bits\_\allowbreak{}engine::\allowbreak{}operator(\allowbreak{})\allowbreak{}} 函数会恰好调用足够多次的 \texttt{base(\allowbreak{})\allowbreak{}(\allowbreak{})\allowbreak{}}，以算出至少 \texttt{w} 个随机位；接着，它把其中恰好 \texttt{w} 个位拼接起来（通过一个更具历史意义而非实际意义的算法），并以类型 \texttt{T} 的无符号整数形式提供给你。（如果 \texttt{T} 不是无符号整数类型，或者 \texttt{T} 的位数少于 \texttt{w}，那就是错误的。）
+
+下面是一个 \texttt{independent\_\allowbreak{}bits\_\allowbreak{}engine} 从多次 \texttt{base(\allowbreak{})\allowbreak{}(\allowbreak{})\allowbreak{}} 调用中拼接位的例子：
+
+\begin{codebox}[cpp]
+    std::independent_bits_engine<std::mt19937, 40, uint64_t> g2;
+    std::mt19937 g1 = g2.base();
+    assert(g1() == 0xd09'1bb5c); // 取 "1bb5c"...
+    assert(g1() == 0x22a'e9ef6); // 以及 "e9ef6"...
+    assert(g2() == 0x1bb5c'e9ef6); // 拼接并输出！
+\end{codebox}
+
+下面再给出一个例子：用 \texttt{independent\_\allowbreak{}bits\_\allowbreak{}engine} 把 \texttt{mt19937} 输出中除了最低有效位以外的所有位都砍掉（从而造出一个抛硬币式的生成器），然后再把该生成器 32 次输出的结果拼接起来，重新构建出一个 32 位生成器：
+
+\begin{codebox}[cpp]
+    using coinflipper = std::independent_bits_engine<
+      std::mt19937, 1, uint8_t>;
+    coinflipper onecoin;
+    std::array<int, 64> results;
+    std::generate(results.begin(), results.end(), onecoin);
+    assert((results == std::array<int, 64>{{
+      0,0,0,1, 0,1,1,1, 0,1,1,1, 0,0,1,0,
+      1,0,1,0, 1,1,1,1, 0,0,0,1, 0,1,0,1,
+      1,0,0,1, 1,1,1,0, 0,0,1,0, 1,0,1,0,
+      1,0,0,1, 0,0,0,0, 0,1,0,0, 1,1,0,0,
+    }}));
+    std::independent_bits_engine<coinflipper, 32, uint32_t> manycoins;
+    assert(manycoins() == 0x1772af15);
+    assert(manycoins() == 0x9e2a904c);
+\end{codebox}
+
+请注意，\texttt{independent\_\allowbreak{}bits\_\allowbreak{}engine} 并不会对其底层生成器的位执行任何复杂操作；特别是，它假设其底层生成器没有偏差。如果 \texttt{Weighted\allowbreak{}Coin} 生成器存在偏向偶数的偏差，你也会看到这种偏差出现在 \texttt{independent\_\allowbreak{}bits\_\allowbreak{}engine<\allowbreak{}Weighted\allowbreak{}Coin,\allowbreak{} w,\allowbreak{} T>\allowbreak{}} 的输出中。
+
+尽管我们花了好几页讨论这些生成器，但请记住：在自己的代码中，你没有任何理由去使用这些冷门的类！如果你需要一个伪随机数生成器（PRNG），就用 \texttt{std::\allowbreak{}mt19937}；如果你需要一个加密安全的 PRNG，就用类似 AES-CTR 或 ISAAC 这样的东西；而如果你需要数量相对较少的真随机位来为自己的 PRNG 播种，就用 \texttt{std::\allowbreak{}random\_\allowbreak{}device}。这些就是你在实践中唯一会用到的生成器。
+
+\section{处理分布}
+
+既然我们已经知道如何按需生成随机位，就来看看如何把这些随机位转换成符合某个特定分布（distribution）的数值吧。这个两步过程——先生成原始位，再将其格式化为数据值——与我们曾在第 9 章「I/O 流（Iostreams）」中讲过的缓冲与解析两步过程非常相似。先拿到原始的位与字节，再执行某种操作，把那些位和字节转换成带类型的数据值。
+
+给定任意一个分布对象 \texttt{dist}，你可以对它执行以下操作：
+
+\texttt{dist(\allowbreak{}g)\allowbreak{}}：这会按照相应的数学分布给出下一个输出。它可能需要多次调用 \texttt{g(\allowbreak{})\allowbreak{}}，也可能完全不需要，具体取决于 \texttt{dist} 对象的内部状态。
+
+\texttt{dist.\allowbreak{}reset(\allowbreak{})\allowbreak{}}：这会清除 \texttt{dist} 对象的内部状态（如果有的话）。你永远都不需要用这个成员函数。
+
+\texttt{dist.\allowbreak{}min(\allowbreak{})\allowbreak{}} 与 \texttt{dist.\allowbreak{}max(\allowbreak{})\allowbreak{}}：这两个函数告诉你，对于任意随机位生成器 \texttt{g}，\texttt{dist(\allowbreak{}g)\allowbreak{}} 可能输出的最小值与最大值。一般来讲，这些值要么不言自明，要么毫无意义；例如，\texttt{std::\allowbreak{}normal\_\allowbreak{}distribution<\allowbreak{}float>\allowbreak{}(\allowbreak{})\allowbreak{}.max(\allowbreak{})\allowbreak{}} 就是 \texttt{INFINITY}。
+
+我们来看看几种分布类型的实际用法。
+
+\subsection{用 \texttt{uniform\_\allowbreak{}int\_\allowbreak{}distribution} 掷骰子}
+
+\texttt{std::\allowbreak{}uniform\_\allowbreak{}int\_\allowbreak{}distribution} 是标准库中最简单的分布类型。它执行的操作，与我们本章前面曾用 \texttt{randint0} 尝试做的操作相同——把一个随机的无符号整数映射到一个给定范围——但它不会引入任何偏差。\texttt{uniform\_\allowbreak{}int\_\allowbreak{}distribution} 最朴素的一种实现大致如下：
+
+\begin{codebox}[cpp]
+    template<class Int>
+    class uniform_int_distribution {
+      using UInt = std::make_unsigned_t<Int>;
+      UInt m_min, m_max;
+    public:
+      uniform_int_distribution(Int a, Int b) :
+        m_min(a), m_max(b) {}
+      template<class Gen>
+      Int operator()(Gen& g) {
+        UInt range = (m_max - m_min);
+        assert(g.max() - g.min() >= range);
+        while (true) {
+          UInt r = g() - g.min();
+          if (r <= range) {
+            return Int(m_min + r);
+          }
+        }
+      }
+    };
+\end{codebox}
+
+标准库的真实实现必须做点什么来摆脱那个 \texttt{assert}。通常，它们会使用类似 \texttt{independent\_\allowbreak{}bits\_\allowbreak{}engine} 的东西，一次性恰好生成 \texttt{ceil(\allowbreak{}log2(\allowbreak{}range)\allowbreak{})\allowbreak{}} 个随机位，从而把 \texttt{while} 循环需要运行的次数降到最少。
+
+正如前面例子所暗示的，\texttt{uniform\_\allowbreak{}int\_\allowbreak{}distribution} 是无状态的（尽管严格来说这一点并未被保证），因此最常见的用法是：每当你要生成一个数字时，就新建一个分布对象。于是，我们可以像下面这样实现自己的 \texttt{randint0} 函数：
+
+\begin{codebox}[cpp]
+    int randint0(int x) {
+      static std::mt19937 g;
+      return std::uniform_int_distribution<int>(0, x-1)(g);
+    }
+\end{codebox}
+
+现在也许是时候谈一谈 \texttt{<random>\allowbreak{}} 设施的一个怪异之处了。作为一条通用规则，每当你向这些函数或构造函数提供一个整数数值范围时，它都会被当作一个闭区间来处理。这与 C 和 C++ 中范围通常的工作方式形成了鲜明对比；我们甚至在 3 章「迭代器对算法（The Iterator-Pair Algorithms）」中见过，偏离半开区间规则通常是代码有 bug 的标志。然而，在 C++ 的随机数设施这里，却有一条新规则——闭区间规则。这是为什么呢？
+
+嗯，半开区间的关键优势在于它能轻松表示一个空区间。另一方面，半开区间却无法表示一个完全填满的区间，也就是覆盖整个定义域的区间。（我们曾在第 4 章「容器动物园（The Container Zoo）」中，于 \texttt{std::\allowbreak{}list<\allowbreak{}T>\allowbreak{}::\allowbreak{}end(\allowbreak{})\allowbreak{}} 的实现里碰到过这个难题。）假设我们想表达在 \texttt{long long} 的整个取值范围上做均匀分布这个概念。我们无法把它表达为半开区间 \texttt{[LLONG\_\allowbreak{}MIN,\allowbreak{} LLONG\_\allowbreak{}MAX+1)\allowbreak{}}，因为 \texttt{LLONG\_\allowbreak{}MAX+1} 会溢出。不过，我们可以把它表达为闭区间 \texttt{[LLONG\_\allowbreak{}MIN,\allowbreak{} LLONG\_\allowbreak{}MAX]}——而这正是 \texttt{<random>\allowbreak{}} 库的函数与类（例如 \texttt{uniform\_\allowbreak{}int\_\allowbreak{}distribution}）所做的。\texttt{uniform\_\allowbreak{}int\_\allowbreak{}distribution<\allowbreak{}int>\allowbreak{}(\allowbreak{}0,\allowbreak{}6)\allowbreak{}} 是在七个数组成的区间 \texttt{[0,\allowbreak{}6]} 上的分布，而 \texttt{uniform\_\allowbreak{}int\_\allowbreak{}distribution<\allowbreak{}int>\allowbreak{}(\allowbreak{}42,\allowbreak{}42)\allowbreak{}} 则是一个完全合法的分布，它总是返回 \texttt{42}。
+
+另一方面，\texttt{std::\allowbreak{}uniform\_\allowbreak{}real\_\allowbreak{}distribution<\allowbreak{}double>\allowbreak{}(\allowbreak{}a,\allowbreak{} b)\allowbreak{}} 确实是在一个半开区间上运作的！\texttt{std::\allowbreak{}uniform\_\allowbreak{}real\_\allowbreak{}distribution<\allowbreak{}double>\allowbreak{}(\allowbreak{}0,\allowbreak{} 1)\allowbreak{}} 产生的是 \texttt{double} 类型的值，在 \texttt{[0,\allowbreak{} 1)\allowbreak{}} 范围内均匀分布。在浮点领域，溢出不是问题——半开区间 \texttt{[0,\allowbreak{} INFINITY)\allowbreak{}} 实际上是可以表示的，尽管当然不存在什么在无限范围上的均匀分布。浮点数还让区分半开区间与闭区间变得困难；例如，\texttt{std::\allowbreak{}uniform\_\allowbreak{}real\_\allowbreak{}distribution<\allowbreak{}float>\allowbreak{}(\allowbreak{}0,\allowbreak{} 1)\allowbreak{}(\allowbreak{}g)\allowbreak{}} 合法地返回 \texttt{float(\allowbreak{}1.0)\allowbreak{}}，只要它生成的随机实数足够接近 1、以至于会向上舍入，这种情况大约每 $2^{25}$ 次结果中会出现一次。（在本书写作时，\texttt{libc++} 的行为如上所述。GNU 的 \texttt{libstdc++} 打了一个补丁，让接近 1 的实数向下舍入而非向上舍入，从而让刚好低于 1.0 的那个浮点数出现的概率比随机预期略高一些。）
+
+\subsection{用 \texttt{normal\_\allowbreak{}distribution} 生成总体}
+
+实值分布中最有用的例子大概就是正态分布（normal distribution）了，它也叫钟形曲线（bell curve）。在现实世界中，正态分布随处可见，尤其是在一个群体（population）的各项生理特征的分布上。例如，成年人身高的直方图往往会呈现为正态分布——大量个体聚集在平均身高附近，其余的则向两侧逐渐稀少。反过来想，这意味着你可能会想用正态分布，来给游戏中的模拟个体分配身高、体重等等属性。
+
+\texttt{std::\allowbreak{}normal\_\allowbreak{}distribution<\allowbreak{}double>\allowbreak{}(\allowbreak{}m,\allowbreak{} sd)\allowbreak{}} 构造出一个 \texttt{normal\_\allowbreak{}distribution<\allowbreak{}double>\allowbreak{}} 的实例，其均值（\texttt{m}）与标准差（\texttt{sd}）由参数指定。（如果你不提供这些参数，它们默认取 \texttt{m=0} 和 \texttt{sd=1}，所以要小心别打错字！）
+
+下面这个例子用 \texttt{normal\_\allowbreak{}distribution} 创建了一个由 10000 个正态分布样本组成的「群体」，然后从数学上验证其分布：
+
+\begin{codebox}[cpp]
+    double mean = 161.8;
+    double stddev = 6.8;
+    std::normal_distribution<double> dist(mean, stddev);
+      // 初始化我们的生成器。
+    std::mt19937 g(std::random_device{}());
+      // 用 10000 个样本填充向量。
+    std::vector<double> v;
+    for (int i=0; i < 10000; ++i) {
+      v.push_back( dist(g) );
+    }
+    std::sort(v.begin(), v.end());
+      // 将期望与现实进行比较。
+    auto square = [](auto x) { return x*x; };
+    double mean_of_values = std::accumulate(
+      v.begin(), v.end(), 0.0) / v.size();
+    double mean_of_squares = std::inner_product(
+      v.begin(), v.end(), v.begin(), 0.0) / v.size();
+    double actual_stddev =
+      std::sqrt(mean_of_squares - square(mean_of_values));
+    printf("Expected mean and stddev: %g, %g\n", mean, stddev);
+    printf("Actual mean and stddev: %g, %g\n",
+           mean_of_values, actual_stddev);
+\end{codebox}
+
+与我们在本章（或将在本章）见到的其他分布不同，\texttt{std::\allowbreak{}normal\_\allowbreak{}distribution} 是有状态的。虽然为每一个生成的值都新建一个 \texttt{std::\allowbreak{}normal\_\allowbreak{}distribution} 实例并无不可，但如果你真这么做，就相当于把程序的效率砍掉了一半。这是因为，生成正态分布值最常用的算法每一步会产生两个独立的值；\texttt{std::\allowbreak{}normal\_\allowbreak{}distribution} 无法一次性把两个值都给你，所以它把一个值保存在成员变量里，留到你下次请求时再给你。\texttt{dist.\allowbreak{}reset(\allowbreak{})\allowbreak{}} 成员函数可以用来清除这个保存下来的状态——尽管你大概永远都不想这么做。
+
+\subsection{用 \texttt{discrete\_\allowbreak{}distribution} 做加权选择}
+
+\texttt{std::\allowbreak{}discrete\_\allowbreak{}distribution<\allowbreak{}int>\allowbreak{}(\allowbreak{}wbegin,\allowbreak{} wend)\allowbreak{}} 构造出一个离散的、或者说加权的分布，覆盖半开区间 \texttt{[0,\allowbreak{} wend - wbegin)\allowbreak{}} 上的整数。这一点用下面的例子最容易说清：
+
+\begin{codebox}[cpp]
+    template<class Values, class Weights, class Gen>
+    auto weighted_choice(const Values& v, const Weights& w, Gen& g)
+    {
+      auto dist = std::discrete_distribution<int>(
+        std::begin(w), std::end(w));
+      int index = dist(g);
+      return v[index];
+    }
+    void test() {
+      auto g = std::mt19937(std::random_device{}());
+      std::vector<std::string> choices =
+        { "quick", "brown", "fox" };
+      std::vector<int> weights = { 1, 7, 2 };
+      std::string word = weighted_choice(choices, weights, g);
+        // 有 7/10 的概率，我们期望 word=="brown"。
+    }
+\end{codebox}
+
+\texttt{std::\allowbreak{}discrete\_\allowbreak{}distribution<\allowbreak{}int>\allowbreak{}} 会把传入的权重在自己内部做一份拷贝，存放在一个类型为 \texttt{std::\allowbreak{}vector<\allowbreak{}double>\allowbreak{}} 的私有成员变量中（并且和 \texttt{<random>\allowbreak{}} 中常见的情形一样，它并不感知分配器）。你可以通过调用 \texttt{dist.\allowbreak{}probabilities(\allowbreak{})\allowbreak{}} 来获取这个向量的拷贝，如下所示：
+
+\begin{codebox}[cpp]
+    int w[] = { 1, 0, 2, 1 };
+    std::discrete_distribution<int> dist(w, w+4);
+    std::vector<double> v = dist.probabilities();
+    assert((v == std::vector{ 0.25, 0.0, 0.50, 0.25 }));
+\end{codebox}
+
+你大概并不想在自己的代码中直接使用 \texttt{discrete\_\allowbreak{}distribution}；往好了说，你也只会想把它封装在类似前面 \texttt{weighted\_\allowbreak{}choice} 函数那样的东西里。不过，如果你需要避免堆分配或浮点运算，那么用一个更简单的、不分配内存的函数（比如下面这个）或许更划算：
+
+\begin{codebox}[cpp]
+    template<class Values, class Gen>
+    auto weighted_choice(
+      const Values& v, const std::vector<int>& w,
+      Gen& g)
+    {
+      int sum = std::accumulate(w.begin(), w.end(), 0);
+      int cutoff = std::uniform_int_distribution<int>(0, sum - 1)(g);
+      auto vi = v.begin();
+      auto wi = w.begin();
+      while (cutoff > *wi) {
+        cutoff -= *wi++;
+        ++vi;
+      }
+      return *vi;
+    }
+\end{codebox}
+
+不过，\texttt{discrete\_\allowbreak{}distribution} 的默认库实现之所以把所有数学运算都用浮点来做，是有原因的：它能让你不必担心整数溢出。如果 \texttt{sum} 超出了 \texttt{int} 的取值范围，前面的代码就会出现不良行为。
+
+\subsection{用 \texttt{std::\allowbreak{}shuffle} 洗牌}
+
+让我们通过 \texttt{std::\allowbreak{}shuffle(\allowbreak{}a,\allowbreak{}b,\allowbreak{}g)\allowbreak{}} 来结束本章，它是唯一一个以随机数生成器作为输入的标准算法（algorithm）。按照第 3 章「迭代器对算法（The Iterator-Pair Algorithms）」的定义，它是一个重排算法（permutative algorithm）——它接受一个元素范围 \texttt{[a,\allowbreak{}b)\allowbreak{}}，把其中的元素打乱重排，保留它们的值但不保留位置。
+
+\texttt{std::\allowbreak{}shuffle(\allowbreak{}a,\allowbreak{}b,\allowbreak{}g)\allowbreak{}} 是在 C++11 中引入、用来取代更早期的 \texttt{std::\allowbreak{}random\_\allowbreak{}shuffle(\allowbreak{}a,\allowbreak{}b)\allowbreak{}} 算法的。那个旧算法会「随机」地打乱 \texttt{[a,\allowbreak{}b)\allowbreak{}} 范围，却没有指明随机性的来源；在实践中，这意味着它会使用全局 C 库的 \texttt{rand(\allowbreak{})\allowbreak{}}，连同它那一堆随之而来的问题。一旦 C++11 通过 \texttt{<random>\allowbreak{}} 提供了一种谈论随机数生成器的标准化方式，淘汰掉基于旧 \texttt{rand(\allowbreak{})\allowbreak{}} 的 \texttt{random\_\allowbreak{}shuffle} 的时机就成熟了；而到了 C++17，\texttt{std::\allowbreak{}random\_\allowbreak{}shuffle(\allowbreak{}a,\allowbreak{}b)\allowbreak{}} 已不再是 C++ 标准库的一部分。
+
+下面来看看我们如何用 C++11 的 \texttt{std::\allowbreak{}shuffle} 来洗一副扑克牌：
+
+\begin{codebox}[cpp]
+    std::vector<int> deck(52);
+    std::iota(deck.begin(), deck.end(), 1);
+      // 此时 deck 包含从 1 到 52 的整数。
+    std::mt19937 g(std::random_device{}());
+    std::shuffle(deck.begin(), deck.end(), g);
+      // 此时牌堆已被随机洗过。
+\end{codebox}
+
+请回想一下：\texttt{<random>\allowbreak{}} 中的每一个生成器都是被完全规定的，因此举例来说，一个用固定值播种的 \texttt{std::\allowbreak{}mt19937} 实例，在每个平台上都会产生完全相同的输出。但对于像 \texttt{uniform\_\allowbreak{}real\_\allowbreak{}distribution} 这样的分布，或者对于 \texttt{shuffle} 算法，情况就不一样了。从 \texttt{libc++} 切换到 \texttt{libstdc++}，甚至仅仅是升级你的编译器，都可能改变 \texttt{std::\allowbreak{}shuffle} 的行为。
+
+请注意，前面的代码片段用的是为其梅森旋转算法（Mersenne Twister）播种的「简单」方法，这意味着它最多只能产生大约 $4 \times 10^{9}$ 种不同的洗牌结果——而一副牌用手工洗牌，共有 $8 \times 10^{67}$ 种方式！
+
+如果你是要为真赌场游戏洗牌，你肯定想用本章前面讲过的「繁琐」播种方法，或者——如果不在乎性能的话，更简单些——就直接使用 \texttt{std::\allowbreak{}random\_\allowbreak{}device}：
+
+\begin{codebox}[cpp]
+    std::random_device rd;
+    std::shuffle(deck.begin(), deck.end(), rd);
+    // 此时牌堆已被真正随机地洗过。
+\end{codebox}
+
+无论你用什么生成器和播种方法，都能直接插进 \texttt{std::\allowbreak{}shuffle} 里。这正是标准库在随机数生成上所采用的、可组合（composable）的设计思路带来的好处。
+
+\section{小结}
+
+标准库提供了两个与随机数相关的概念——生成器（generator）与分布（distribution）。生成器是有状态的，必须先播种（seed），并通过 \texttt{operator(\allowbreak{})\allowbreak{}(\allowbreak{}void)\allowbreak{}} 产生无符号整数输出（原始位）。两种重要的生成器类型是 \texttt{std::\allowbreak{}random\_\allowbreak{}device}（它产生真正的随机位）和 \texttt{std::\allowbreak{}mt19937}（它产生伪随机位）。
+
+分布通常是无状态的，并通过 \texttt{operator(\allowbreak{})\allowbreak{}(\allowbreak{}Gen\&)\allowbreak{}} 产生数值型数据。对大多数程序员而言，最重要的分布类型是 \texttt{std::\allowbreak{}uniform\_\allowbreak{}int\_\allowbreak{}distribution<\allowbreak{}int>\allowbreak{}(\allowbreak{}a,\allowbreak{}b)\allowbreak{}}，它产生闭区间 \texttt{[a,\allowbreak{}b]} 上的整数。标准库还提供了其他分布，例如
+
+\texttt{std::\allowbreak{}uniform\_\allowbreak{}real\_\allowbreak{}distribution}、\texttt{std::\allowbreak{}normal\_\allowbreak{}distribution} 与 \texttt{std::\allowbreak{}discrete\_\allowbreak{}distribution}，以及许多对数学家和统计学家有用的冷门分布。
+
+唯一使用随机性的标准算法是 \texttt{std::\allowbreak{}shuffle}，它取代了旧式的 \texttt{std::\allowbreak{}random\_\allowbreak{}shuffle}。在新代码中不要使用 \texttt{random\_\allowbreak{}shuffle}。
+
+要注意，\texttt{std::\allowbreak{}mt19937} 在每个平台上的行为都完全一致，但任何分布类型以及 \texttt{std::\allowbreak{}shuffle} 都不保证如此。

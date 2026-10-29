@@ -1,0 +1,895 @@
+在过去十年里，人们越来越认识到，标准语言或标准库的一项重要职责，就是提供词汇类型（vocabulary type）。所谓“词汇（vocabulary）”类型，指的是一种旨在为其所属领域提供单一“通用语（lingua franca）”、一种共同语言的类型。
+
+注意，甚至在 C++ 出现之前，C 语言就已经在若干领域的词汇方面做出了不错的尝试，它为整数运算（\texttt{int}）、浮点运算（\texttt{double}）、以 Unix 纪元表示的时间点（\texttt{time\_\allowbreak{}t}），以及字节计数（\texttt{size\_\allowbreak{}t}）提供了标准类型或类型别名。
+
+本章我们将学习：
+
+\begin{itemize}
+\item C++ 中词汇类型的历史，从 \texttt{std::\allowbreak{}string} 到 \texttt{std::\allowbreak{}any}。
+\item 代数类型（algebraic type）、积类型（product type）与和类型（sum type）的定义。
+\item 如何操作元组（tuple）并访问变体（variant）。
+\item \texttt{std::\allowbreak{}optional<\allowbreak{}T>\allowbreak{}} 的角色：它可以表示“可能是一个 \texttt{T}”或“尚不是一个 \texttt{T}”。
+\item \texttt{std::\allowbreak{}any} 作为代数数据类型的“无穷大”对应物。
+\item 如何实现类型擦除（type erasure），它如何在 \texttt{std::\allowbreak{}any} 与 \texttt{std::\allowbreak{}function} 中得以运用，以及它固有的局限性。
+\item \texttt{std::\allowbreak{}function} 的一些陷阱，以及修复这些陷阱的第三方库。
+\end{itemize}
+
+\section{\texttt{std::\allowbreak{}string} 的故事}
+
+考虑字符串（character string）这个领域；例如 \texttt{hello world} 这个短语。在 C 语言中，处理字符串的通用语是 \texttt{char *}：
+
+\begin{codebox}[cpp]
+    char *greet(const char *name) {
+      char buffer[100];
+      snprintf(buffer, 100, "hello %s", name);
+      return strdup(buffer);
+    }
+    void test() {
+      const char *who = "world";
+      char *hw = greet(who);
+      assert(strcmp(hw, "hello world") == 0);
+      free(hw);
+    }
+\end{codebox}
+
+这在一段时间内还算可行，但处理裸 \texttt{char *} 给语言的使用者以及第三方库和例程的编写者带来了一些问题。其一，C 语言太过古老，以至于 \texttt{const} 在一开始并不存在，这意味着某些老例程期望以 \texttt{char *} 的形式接收字符串，而某些较新的例程则期望 \texttt{const char *}。其二，\texttt{char *} 本身并不携带长度；因此有些函数既需要一个指针也需要一个长度，而有些函数只接受指针，根本无法处理值为 \texttt{'\textbackslash0'} 的内嵌字节。
+
+\texttt{char *} 这个谜题中最关键的一块缺失，是生命周期管理与所有权（正如第 4 章「容器动物园」开头所讨论的）。当 C 函数想要从调用者那里接收一个字符串时，它接受 \texttt{char *}，并通常把所涉字符的所有权管理问题留给调用者。可如果它想要返回一个字符串呢？那它就不得不返回 \texttt{char *}，并指望调用者记得释放它（\texttt{strdup}、\texttt{asprintf}），或者从调用者那里接收一个缓冲区，并指望它大到足以容纳输出（\texttt{sprintf}、\texttt{snprintf}、\texttt{strcat}）。在 C（以及标准前的 C++）中管理字符串所有权的困难如此之大，以至于涌现了大量用来解决该问题的“字符串库”：例如 Qt 的 \texttt{Q\allowbreak{}String}、glib 的 \texttt{G\allowbreak{}String} 等等。
+
+1998 年，C++ 带着一个奇迹步入这片混乱：一个标准的字符串类！全新的 \texttt{std::\allowbreak{}string} 以一种自然的方式封装了字符串的字节及其长度；它能够正确处理内嵌的空字节；它支持诸如 \texttt{hello + world} 这类以往很复杂的操作，方法是悄悄分配恰好所需的内存量；而且由于 RAII，它绝不会泄漏内存，也不会引发“底层字节究竟归谁所有”的困惑。最妙的是，它还提供了从 \texttt{char *} 的隐式转换：
+
+\begin{codebox}[cpp]
+    std::string greet(const std::string& name) {
+      return "hello " + name;
+    }
+    void test() {
+      std::string who = "world";
+      assert(greet(who) == "hello world");
+    }
+\end{codebox}
+
+如今，处理字符串的 C++ 函数（例如前面代码中的 \texttt{greet(\allowbreak{})\allowbreak{}}）可以接受 \texttt{std::\allowbreak{}string} 参数，并返回 \texttt{std::\allowbreak{}string} 结果。更妙的是，由于字符串类型已被标准化，短短几年之内，当你引入某个第三方库并将其整合进自己的代码库时，你就可以相当有把握地相信：该库中任何接受字符串（文件名、错误消息，诸如此类）的函数都会使用 \texttt{std::\allowbreak{}string}。所有人都能够通过共享 \texttt{std::\allowbreak{}string} 这一通用语，更高效、更有效地相互交流。
+
+\section{用 \texttt{reference\_\allowbreak{}wrapper} 标记引用类型}
+
+C++03 引入的另一个词汇类型是 \texttt{std::\allowbreak{}reference\_\allowbreak{}wrapper<\allowbreak{}T>\allowbreak{}}。它的实现很简单：
+
+\begin{codebox}[cpp]
+    namespace std {
+      template<typename T>
+      class reference_wrapper {
+        T *m_ptr;
+        public:
+        reference_wrapper(T& t) noexcept : m_ptr(&t) {}
+        operator T& () const noexcept { return *m_ptr; }
+        T& get() const noexcept { return *m_ptr; }
+      };
+      template<typename T>
+      reference_wrapper<T> ref(T& t);
+    } // std 命名空间
+\end{codebox}
+
+\texttt{std::\allowbreak{}reference\_\allowbreak{}wrapper} 的用途与 \texttt{std::\allowbreak{}string}、\texttt{int} 这类词汇类型略有不同；它专门用来“标记（tag）”那些我们希望表现得像引用一样的值，用在一些原生 C++ 引用无法如我们所愿地工作的场合：
+
+\begin{codebox}[cpp]
+     int result = 0;
+     auto task = [](int& r) {
+       r = 42;
+     };
+     // 试图使用原生引用无法通过编译。
+     //std::thread t(task, result);
+     // 正确地将 result 以“引用”方式传递给新线程。
+     std::thread t(task, std::ref(result));
+\end{codebox}
+
+\texttt{std::\allowbreak{}thread} 的构造函数编写了一些特定的特例，通过把 \texttt{reference\_\allowbreak{}wrapper} 参数“退化（decay）”为原生引用来处理它们。同样的特例也适用于标准库函数 \texttt{make\_\allowbreak{}pair}、\texttt{make\_\allowbreak{}tuple}、\texttt{bind}、\texttt{invoke}，以及所有基于 \texttt{invoke} 的东西（例如 \texttt{std::\allowbreak{}apply}、\texttt{std::\allowbreak{}function::\allowbreak{}operator(\allowbreak{})\allowbreak{}} 和 \texttt{std::\allowbreak{}async}）。
+
+\section{C++11 与代数类型}
+
+随着 C++11 逐渐成形，人们日益认识到，另一个适合“词汇化（vocabularization）”的领域，就是所谓代数类型（algebraic type）的领域。代数类型在函数式编程范式中自然涌现。其核心思想是思考一个类型的“域（domain）”——也就是该类型所有可能取值的集合。为了简单起见，你不妨想想 C++ 的 \texttt{enum} 类型，因为要谈论一个 \texttt{enum} 类型对象在不同时刻可能取到的不同值的数量，是很容易的：
+
+\begin{codebox}[cpp]
+    enum class Color {
+      RED = 1,
+      BLACK = 2,
+    };
+    enum class Size {
+      SMALL = 1,
+      MEDIUM = 2,
+      LARGE = 3,
+    };
+\end{codebox}
+
+给定 \texttt{Color} 与 \texttt{Size} 这两个类型，你能创建出一种数据类型，使其实例可以取 $2 \times 3 = 6$ 个值中的任意一个吗？能；这种类型表示 \texttt{Color} 与 \texttt{Size} 的“各取一个”，被称作积类型（product type），因为其可能取值的集合，是其各元素可能取值集合的笛卡尔积（Cartesian product）。
+
+那么，一种实例可以取 $2 + 3 = 5$ 个不同值中的任意一个的数据类型呢？同样可以；这种类型表示“要么是 \texttt{Color}，要么是 \texttt{Size}，但绝不会同时是两者”，被称作和类型（sum type）。（令人困惑的是，数学家并不用“笛卡尔和（Cartesian sum）”来称呼这个概念。）
+
+在 Haskell 这类函数式编程语言中，这两个练习会写成下面这样：
+
+\begin{codebox}[cpp]
+    data SixType = ColorandSizeOf Color Size;
+    data FiveType = ColorOf Color | SizeOf Size;
+\end{codebox}
+
+在 C++ 中，它们写成这样：
+
+\begin{codebox}[cpp]
+    using sixtype = std::pair<Color, Size>;
+    using fivetype = std::variant<Color, Size>;
+\end{codebox}
+
+类模板 \texttt{std::\allowbreak{}pair<\allowbreak{}A,\allowbreak{} B>\allowbreak{}} 表示一个有序的元素对：先是一个 \texttt{A} 类型的元素，后跟一个 \texttt{B} 类型的元素。它与一个含有两个元素的普通旧式 \texttt{struct} 非常相似，区别在于你不必亲自编写这个 \texttt{struct} 的定义：
+
+\begin{codebox}[cpp]
+    template<class A, class B>
+    struct pair {
+      A first;
+      B second;
+    };
+\end{codebox}
+
+注意，\texttt{std::\allowbreak{}pair<\allowbreak{}A,\allowbreak{} A>\allowbreak{}} 与 \texttt{std::\allowbreak{}array<\allowbreak{}A,\allowbreak{} 2>\allowbreak{}} 之间只有表面上的差别。我们或许可以说，\texttt{pair} 是 \texttt{array} 的异构（heterogeneous）版本（只不过 \texttt{pair} 被限制为只能容纳两个元素）。
+
+\section{使用 \texttt{std::\allowbreak{}tuple}}
+
+C++11 引入了一种完备的异构数组；它叫做 \texttt{std::\allowbreak{}tuple<\allowbreak{}Ts...>}。只含两种元素类型的元组——例如 \texttt{tuple<\allowbreak{}int,\allowbreak{} double>\allowbreak{}}——与 \texttt{pair<\allowbreak{}int,\allowbreak{} double>\allowbreak{}} 并无不同。但元组能容纳的不仅仅是两个元素；借助 C++11 可变参数模板（variadic template）的魔力，它还能容纳三元组、四元组、五元组……因此有了 \texttt{tuple} 这个通用名称。例如，\texttt{tuple<\allowbreak{}int,\allowbreak{} int,\allowbreak{} char,\allowbreak{} std::\allowbreak{}string>\allowbreak{}} 就类似于一个 \texttt{struct}，其成员依次是一个 \texttt{int}、另一个 \texttt{int}、一个 \texttt{char}，最后是一个 \texttt{std::\allowbreak{}string}。
+
+由于元组的第一个元素与第二个元素类型不同，我们无法使用“常规的” \texttt{operator[](\allowbreak{}size\_\allowbreak{}t)\allowbreak{}} 来按那些在运行时才可能变化的下标访问元素。相反，我们必须在编译时告诉编译器：我们打算访问元组的第几个元素，以便编译器能够推算出该表达式应该具有什么类型。C++ 在编译时提供信息的办法，是通过模板参数把它硬性塞进类型系统，而我们正是这么做的。当我们想要访问元组 \texttt{t} 的第一个元素时，就调用 \texttt{std::\allowbreak{}get<\allowbreak{}0>\allowbreak{}(\allowbreak{}t)\allowbreak{}}；要访问第二个元素，则调用 \texttt{std::\allowbreak{}get<\allowbreak{}1>\allowbreak{}(\allowbreak{}t)\allowbreak{}}，依此类推。
+
+这成了处理 \texttt{std::\allowbreak{}tuple} 的一种模式——同质（homogeneous）容器类型往往通过成员函数来访问和操纵自身，而异构的代数类型则往往通过自由函数模板来访问和操纵自身。
+
+不过，一般来说，你并不会对元组做太多操纵。除了模板元编程之外，它们的主要用例，是在需要一个单一值的场合中，作为一种经济的方式，把若干个值临时绑定在一起。例如，你可能还记得第 4 章「容器动物园」中“最简单的容器”一节里的 \texttt{std::\allowbreak{}tie}。它是一种廉价的方式，能把任意数量的值绑定成一个整体，从而可以用 \texttt{operator<} 进行字典序比较。字典序比较的“方向”，取决于你绑定这些值时的顺序：
+
+\begin{codebox}[cpp]
+    using Author = std::pair<std::string, std::string>;
+    std::vector<Author> authors = {
+      {"Fyodor", "Dostoevsky"},
+      {"Sylvia", "Plath"},
+      {"Vladimir", "Nabokov"},
+      {"Douglas", "Hofstadter"},
+    };
+    // 先按名再按姓排序。
+    std::sort(
+      authors.begin(), authors.end(),
+      [](auto&& a, auto&& b) {
+        return std::tie(a.first, a.second) < std::tie(b.first, b.second);
+      }
+    );
+    assert(authors[0] == Author("Douglas", "Hofstadter"));
+    // 先按姓再按名排序。
+    std::sort(
+      authors.begin(), authors.end(),
+      [](auto&& a, auto&& b) {
+        return std::tie(a.second, a.first) < std::tie(b.second, b.first);
+      }
+    );
+    assert(authors[0] == Author("Fyodor", "Dostoevsky"));
+\end{codebox}
+
+\texttt{std::\allowbreak{}tie} 之所以如此廉价，是因为它实际上创建的是指向其各实参内存位置的引用所组成的元组，而不是拷贝各实参的值。这就引出了 \texttt{std::\allowbreak{}tie} 的第二类常见用途：模拟 Python 等语言中的“多重赋值（multiple assignment）”：
+
+\begin{codebox}[cpp]
+    std::string s;
+    int i;
+    // 一次性赋值 s 和 i。
+    std::tie(s, i) = std::make_tuple("hello", 42);
+\end{codebox}
+
+注意，前面注释里的“一次性（at once）”一词，与并发（参见第 7 章「并发」）无关，也与副作用的执行顺序无关；我只是想说，这两个值可以在一条赋值语句中同时被赋值，而不必分成两条或更多的语句。
+
+正如前面的例子所示，\texttt{std::\allowbreak{}make\_\allowbreak{}tuple(\allowbreak{}a,\allowbreak{} b,\allowbreak{} c...)\allowbreak{}} 可用于创建一个值元组；也就是说，\texttt{make\_\allowbreak{}tuple} 确实会构造其实参值的拷贝，而不仅仅是取它们的地址。
+
+最后，在 C++17 中，我们可以使用构造函数模板参数推导，直接写 \texttt{std::\allowbreak{}tuple(\allowbreak{}a,\allowbreak{} b,\allowbreak{} c...)\allowbreak{}}；不过，除非你明确知道自己想要它的行为，否则最好还是避开这个特性。模板参数推导与 \texttt{std::\allowbreak{}make\_\allowbreak{}tuple} 唯一的不同之处，在于它会保留 \texttt{std::\allowbreak{}reference\_\allowbreak{}wrapper} 实参，而不是将它们退化为原生 C++ 引用：
+
+\begin{codebox}[cpp]
+    auto [i, j, k] = std::tuple{1, 2, 3};
+    // make_tuple 会将 reference_wrapper 退化……
+    auto t1 = std::make_tuple(i, std::ref(j), k);
+    static_assert(std::is_same_v< decltype(t1),
+      std::tuple<int, int&, int>
+    >);
+    // ……而推导出的构造函数则不会。
+    auto t2 = std::tuple(i, std::ref(j), k);
+    static_assert(std::is_same_v< decltype(t2),
+      std::tuple<int, std::reference_wrapper<int>, int>
+    >);
+\end{codebox}
+
+\subsection{操作元组的值}
+
+这些函数和模板大多只在模板元编程的语境中有用；你在日常工作中不太会用上它们：
+
+\texttt{std::\allowbreak{}get<\allowbreak{}I>\allowbreak{}(\allowbreak{}t)\allowbreak{}}：取得 \texttt{t} 的第 \texttt{I} 个元素的引用。
+
+\texttt{std::\allowbreak{}tuple\_\allowbreak{}size\_\allowbreak{}v<\allowbreak{}decltype(\allowbreak{}t)\allowbreak{}>}：给出给定元组的大小。由于这是元组类型的一个编译期常量属性，它被表达为一个以该类型作为参数的变量模板。如果你更想使用看起来更自然的语法，可以用以下两种方式之一来编写一个辅助函数：
+
+\begin{codebox}[cpp]
+        template<class T>
+        constexpr size_t tuple_size(T&&)
+        {
+          return std::tuple_size_v<std::remove_reference_t<T>>;
+        }
+        template<class... Ts>
+        constexpr size_t simpler_tuple_size(const std::tuple<Ts...>&)
+        {
+          return sizeof...(Ts);
+        }
+\end{codebox}
+
+\texttt{std::\allowbreak{}tuple\_\allowbreak{}element\_\allowbreak{}t<\allowbreak{}I,\allowbreak{} decltype(\allowbreak{}t)\allowbreak{}>}：给出给定元组类型的第 \texttt{I} 个元素的类型。同样，标准库暴露这一信息的方式，比核心语言的方式要笨拙一些。一般来说，要找出元组第 \texttt{I} 个元素的类型，你只需写 \texttt{decltype(\allowbreak{}std::\allowbreak{}get<\allowbreak{}I>\allowbreak{}(\allowbreak{}t)\allowbreak{})\allowbreak{}}。
+
+\texttt{std::\allowbreak{}tuple\_\allowbreak{}cat(\allowbreak{}t1,\allowbreak{} t2,\allowbreak{} t3...)\allowbreak{}}：把所有给定的元组首尾相连地拼接在一起。
+
+\texttt{std::\allowbreak{}forward\_\allowbreak{}as\_\allowbreak{}tuple(\allowbreak{}a,\allowbreak{} b,\allowbreak{} c...)\allowbreak{}}：创建一个引用组成的元组，就像 \texttt{std::\allowbreak{}tie} 一样；但不同于 \texttt{std::\allowbreak{}tie} 要求左值引用，\texttt{std::\allowbreak{}forward\_\allowbreak{}as\_\allowbreak{}tuple} 会接受任意种类的引用作为输入，并将它们完美转发（perfect forwarding）进元组，以便稍后能通过 \texttt{std::\allowbreak{}get<\allowbreak{}I>\allowbreak{}(\allowbreak{}t)\allowbreak{}...} 提取出来：
+
+\begin{codebox}[cpp]
+        template<typename F>
+        void run_zeroarg(const F& f);
+        template<typename F, typename... Args>
+        void run_multiarg(const F& f, Args&&... args)
+        {
+          auto fwd_args =
+            std::forward_as_tuple(std::forward<Args>(args)...);
+          auto lambda = [&f, fwd_args]() {
+            std::apply(f, fwd_args);
+          };
+          run_zeroarg(f);
+        }
+\end{codebox}
+
+\subsection{关于具名类的一点说明}
+
+正如我们在第 4 章「容器动物园」中所看到的，当我们把 \texttt{std::\allowbreak{}array<\allowbreak{}double,\allowbreak{} 3>\allowbreak{}} 与 \texttt{struct Vec3} 作比较时：使用 STL 类模板可以缩短开发时间，并通过复用经过充分测试的 STL 组件来消除错误的来源；但它也可能让你的代码可读性变差，或让你的类型拥有过多的功能。在我们第 4 章「容器动物园」的例子中，\texttt{std::\allowbreak{}array<\allowbreak{}double,\allowbreak{} 3>\allowbreak{}} 被证明是 \texttt{Vec3} 的一个糟糕选择，因为它暴露了一个我们不想要的 \texttt{operator<}。
+
+在你的接口和 API 中直接使用任何代数类型（\texttt{tuple}、\texttt{pair}、\texttt{optional} 或 \texttt{variant}）很可能都是个错误。你会发现，如果你为自己的“领域特定词汇（domain-specific vocabulary）”类型编写具名类，你的代码会更容易阅读、理解和维护——即便（尤其是）它们最终只是包在代数类型外面的一层薄薄的封装。
+
+\section{用 \texttt{std::\allowbreak{}variant} 表达可选项}
+
+如果说 \texttt{std::\allowbreak{}tuple<\allowbreak{}A,\allowbreak{}B,\allowbreak{}C>\allowbreak{}} 是积类型，那么 \texttt{std::\allowbreak{}variant<\allowbreak{}A,\allowbreak{}B,\allowbreak{}C>\allowbreak{}} 就是和类型。一个变体（variant）被允许持有 \texttt{A}、\texttt{B} 或 \texttt{C} 中的某一个——但任何时候都绝不会多于（或少于）其中一个。这个概念另一个名字是可辨识联合（discriminated union），因为变体的行为非常像原生 C++ 的 \texttt{union}；但与原生 \texttt{union} 不同，变体总是能够告诉你，在 \texttt{A}、\texttt{B} 或 \texttt{C} 这几个元素中，哪一个在任意给定时刻是“活跃（active）”的。这些元素的官方名称是“可选项（alternatives）”，因为任一时刻只能有一个处于活跃状态：
+
+\begin{codebox}[cpp]
+    std::variant<int, double> v1;
+    v1 = 1; // 激活“int”成员
+    assert(v1.index() == 0);
+    assert(std::get<0>(v1) == 1);
+    v1 = 3.14; // 激活“double”成员
+    assert(v1.index() == 1);
+    assert(std::get<1>(v1) == 3.14);
+    assert(std::get<double>(v1) == 3.14);
+    assert(std::holds_alternative<int>(v1) == false);
+    assert(std::holds_alternative<double>(v1) == true);
+    assert(std::get_if<int>(&v1) == nullptr);
+    assert(*std::get_if<double>(&v1) == 3.14);
+\end{codebox}
+
+与 \texttt{tuple} 一样，你可以用 \texttt{std::\allowbreak{}get<\allowbreak{}I>\allowbreak{}(\allowbreak{}v)\allowbreak{}} 取得变体的某个特定元素。如果你的变体对象的可选项各不相同（这应当是最常见的情形，除非你在进行深层的元编程），那么你既可以像使用下标那样，也可以像使用类型那样来调用 \texttt{std::\allowbreak{}get<\allowbreak{}T>\allowbreak{}(\allowbreak{}v)\allowbreak{}}——举个例子，请看前面的代码示例，其中 \texttt{std::\allowbreak{}get<\allowbreak{}0>\allowbreak{}(\allowbreak{}v1)\allowbreak{}} 与 \texttt{std::\allowbreak{}get<\allowbreak{}int>\allowbreak{}(\allowbreak{}v1)\allowbreak{}} 可以互换使用，因为变体 \texttt{v1} 的第零个可选项的类型就是 \texttt{int}。然而与 \texttt{tuple} 不同，作用于变体的 \texttt{std::\allowbreak{}get} 是可能失败的！如果你在 \texttt{v1} 当前持有 \texttt{int} 类型值时调用 \texttt{std::\allowbreak{}get<\allowbreak{}double>\allowbreak{}(\allowbreak{}v1)\allowbreak{}}，那么你会得到一个 \texttt{std::\allowbreak{}bad\_\allowbreak{}variant\_\allowbreak{}access} 类型的异常。\texttt{std::\allowbreak{}get\_\allowbreak{}if}
+
+是 \texttt{std::\allowbreak{}get} 的“不抛异常”版本。如前面的例子所示，\texttt{get\_\allowbreak{}if} 在所指定的候选项（alternative）当前处于激活状态时，会返回指向它的指针；否则返回一个空指针。因此，下面这几段代码片段彼此完全等价：
+
+\begin{codebox}[cpp]
+    // 最差……
+    try {
+      std::cout << std::get<int>(v1) << std::endl;
+    } catch (const std::bad_variant_access&) {}
+    // 仍然不好……
+    if (v1.index() == 0) {
+      std::cout << std::get<int>(v1) << std::endl;
+    }
+    // 稍好一些……
+    if (std::holds_alternative<int>(v1)) {
+      std::cout << std::get<int>(v1) << std::endl;
+    }
+    // ……最好。
+    if (int *p = std::get_if<int>(&v1)) {
+      std::cout << *p << std::endl;
+    }
+\end{codebox}
+
+\subsection{访问变体}
+
+在前面的例子中，我们展示了：当我们有一个变量 \texttt{std::\allowbreak{}variant<\allowbreak{}int,\allowbreak{} double>\allowbreak{} v}，调用 \texttt{std::\allowbreak{}get<\allowbreak{}double>\allowbreak{}(\allowbreak{}v)\allowbreak{}} 会在该变体当前持有 \texttt{double} 时给出当前值，而在变体持有 \texttt{int} 时抛出异常。这或许会让你觉得奇怪——既然 \texttt{int} 可以转换为 \texttt{double}，它为什么不直接给出转换后的值呢？
+
+如果我们想要这种行为，是可以得到的，但没法通过 \texttt{std::\allowbreak{}get} 实现。我们必须这样重新表达意图：“我有一个变体。如果它当前持有 \texttt{double}，就叫它 \texttt{d}，然后我想要得到 \texttt{double(\allowbreak{}d)\allowbreak{}}。如果它持有 \texttt{int i}，那么我想要得到 \texttt{double(\allowbreak{}i)\allowbreak{}}。”也就是说，我们心中有一组行为，并且想要对变体 \texttt{v} 当前持有的那个候选项，恰好调用其中某一种行为。标准库用一个或许有些晦涩的名字 \texttt{std::\allowbreak{}visit} 来表达这一算法：
+
+\begin{codebox}[cpp]
+    struct Visitor {
+      double operator()(double d) { return d; }
+      double operator()(int i) { return double(i); }
+      double operator()(const std::string&) { return -1; }
+    };
+    using Var = std::variant<int, double, std::string>;
+    void show(Var v)
+    {
+      std::cout << std::visit(Visitor{}, v) << std::endl;
+    }
+    void test()
+    {
+      show(3.14);
+      show(1);
+      show("hello world");
+    }
+\end{codebox}
+
+一般来说，当我们访问（visit）一个变体时，我们心中那些行为的本质都是相似的。由于我们用的是 C++，而 C++ 支持函数与运算符的重载，我们通常能用完全相同的语法来表达这些相似的行为。如果可以用相同语法表达，我们就可以把它们封装进一个模板函数，或者——最常见的情况——一个 C++14 的泛型 lambda（generic lambda），就像下面这样：
+
+\begin{codebox}[cpp]
+    std::visit([](const auto& alt) {
+      if constexpr (std::is_same_v<decltype(alt), const std::string&>) {
+        std::cout << double(-1) << std::endl;
+      } else {
+        std::cout << double(alt) << std::endl;
+      }
+    }, v);
+\end{codebox}
+
+注意这里使用了 C++17 的 \texttt{if constexpr}，用来处理那个本质上与其他情况都不同的特例。至于你更喜欢像这样显式地对 \texttt{decltype} 做分支判断，还是宁可像前面那段示例代码那样写一个辅助类 \texttt{Visitor}、并依赖重载决议（overload resolution）来为每个可能的候选项挑出正确的 \texttt{operator(\allowbreak{})\allowbreak{}} 重载，这多少是个口味问题。
+
+\texttt{std::\allowbreak{}visit} 还有一个可变参数（variadic）版本，它接受两个、三个甚至更多个 \texttt{variant} 对象，这些对象的类型可以相同也可以不同。这个版本的 \texttt{std::\allowbreak{}visit} 可以用来实现某种“多重分派（multiple dispatch）”，如下面的代码所示。不过，除非你真的在做相当深入的元编程（metaprogramming），否则你几乎肯定永远用不到这个版本的 \texttt{std::\allowbreak{}visit}：
+
+\begin{codebox}[cpp]
+    struct MultiVisitor {
+      template<class T, class U, class V>
+      void operator()(T, U, V) const { puts("wrong"); }
+      void operator()(char, int, double) const { puts("right!"); }
+    };
+    void test()
+    {
+      std::variant<int, double, char> v1 = 'x';
+      std::variant<char, int, double> v2 = 1;
+      std::variant<double, char, int> v3 = 3.14;
+      std::visit(MultiVisitor{}, v1, v2, v3); // 打印 "right!"
+    }
+\end{codebox}
+
+\subsection{那么 \texttt{make\_\allowbreak{}variant} 呢？兼谈值语义（value semantics）}
+
+既然你可以用 \texttt{std::\allowbreak{}make\_\allowbreak{}tuple} 创建一个元组（tuple）对象，或者用 \texttt{make\_\allowbreak{}pair} 创建一个对（pair），你很可能会合理地问：“\texttt{make\_\allowbreak{}variant} 在哪里？”结果是根本没有它。它之所以缺席，主要原因是：\texttt{tuple} 和 \texttt{pair} 都是积类型（product type），而 \texttt{variant} 是和类型（sum type）。要创建一个元组，你总得提供它全部 n 个元素的值，因此元素类型总是能够被推断出来。而对于 \texttt{variant}，你只需提供其中一个值——假设其类型为 \texttt{A}——但编译器在不知道 \texttt{B} 和 \texttt{C} 这两个类型身份的情况下，是无法创建出 \texttt{variant<\allowbreak{}A,\allowbreak{}B,\allowbreak{}C>\allowbreak{}} 对象的。所以，提供一个形如 \texttt{my::\allowbreak{}make\_\allowbreak{}variant<\allowbreak{}A,\allowbreak{}B,\allowbreak{}C>\allowbreak{}(\allowbreak{}a)\allowbreak{}} 的函数毫无意义，因为真正的类构造函数拼写起来比这还要简洁：\texttt{std::\allowbreak{}variant<\allowbreak{}A,\allowbreak{}B,\allowbreak{}C>\allowbreak{}(\allowbreak{}a)\allowbreak{}}。
+
+我们已经提到过 \texttt{make\_\allowbreak{}pair} 和 \texttt{make\_\allowbreak{}tuple} 存在的第二个原因：它们会自动把特殊的词汇类型（vocabulary type）\texttt{std::\allowbreak{}reference\_\allowbreak{}wrapper<\allowbreak{}T>\allowbreak{}} 衰减（decay）为 \texttt{T\&}，从而使得 \texttt{std::\allowbreak{}make\_\allowbreak{}pair(\allowbreak{}std::\allowbreak{}ref(\allowbreak{}a)\allowbreak{},\allowbreak{} std::\allowbreak{}cref(\allowbreak{}b)\allowbreak{})\allowbreak{}} 创建出类型为 \texttt{std::\allowbreak{}pair<\allowbreak{}A\&,\allowbreak{} const B\&>} 的对象。“引用对”或“引用元组”类型的对象行为十分古怪：你可以用通常的语义对它们进行比较和拷贝，但当你对这类对象进行赋值时，赋值运算符并不会“重新绑定（rebinding）”那些引用元素（让它们指向右侧的对象），而是实际地“穿透赋值（assigns through）”，改变被引用对象的值。正如我们在“处理 \texttt{std::\allowbreak{}tuple}”一节中的示例代码里所看到的，这种刻意为之的古怪特性，让我们能够把 \texttt{std::\allowbreak{}tie} 当作某种“多重赋值”语句来使用。
+
+所以，我们之所以会期望或希望在标准库里看到 \texttt{make\_\allowbreak{}variant} 函数，另一个理由就是它的引用衰减能力。然而，这一点由于一个简单的原因而无从谈起——标准禁止创建元素为引用类型的变体！我们在本章后面会看到，\texttt{std::\allowbreak{}optional} 和 \texttt{std::\allowbreak{}any} 同样被禁止持有引用类型。（不过，\texttt{std::\allowbreak{}variant<\allowbreak{}std::\allowbreak{}reference\_\allowbreak{}wrapper<\allowbreak{}T>\allowbreak{},\allowbreak{} ...>} 是完全合法的。）之所以有这条禁令，是因为库的设计者们尚未就“引用版的变体”究竟意味着什么达成共识。甚至，“引用的元组”又该意味着什么，也同样没有共识！今天的语言里之所以存在引用的元组，唯一的原因就是 \texttt{std::\allowbreak{}tie} 在 2011 年看起来是个好主意。到了 2017 年，没有人特别热衷于通过引入引用版的变体、可选值或“anys”来加剧这种混乱。
+
+我们已经确认，\texttt{std::\allowbreak{}variant<\allowbreak{}A,\allowbreak{}B,\allowbreak{}C>\allowbreak{}} 总是恰好持有一个类型为 \texttt{A}、\texttt{B} 或 \texttt{C} 的值——不多也不少。呃，严格地说这并不正确。在极为罕见的情况下，确实有可能构造出一个不含任何值的变体。唯一能让这种情况发生的方式是：先用一个 \texttt{A} 类型的值构造该变体，然后再给它赋一个 \texttt{B} 类型的值，且赋值过程要让 \texttt{A} 被成功地销毁，但 \texttt{B} 的构造函数抛出异常，从而 \texttt{B} 从未真正被置入（emplaced）。当这种情况发生时，该变体对象就进入了一种被称为“valueless by exception”（因异常而无值）的状态：
+
+\begin{codebox}[cpp]
+    struct A {
+      A() { throw "ha ha!"; }
+    };
+    struct B {
+      operator int () { throw "ha ha!"; }
+    };
+    struct C {
+      C() = default;
+      C& operator=(C&&) = default;
+      C(C&&) { throw "ha ha!"; }
+    };
+    void test()
+    {
+      std::variant<int, A, C> v1 = 42;
+      try {
+        v1.emplace<A>();
+      } catch (const char *haha) {}
+      assert(v1.valueless_by_exception());
+      try {
+        v1.emplace<int>(B());
+      } catch (const char *haha) {}
+      assert(v1.valueless_by_exception());
+    }
+\end{codebox}
+
+除非你写的代码里构造函数或转换运算符会抛出异常，否则这种事绝不会发生在你身上。此外，只要用 \texttt{operator=} 而不是 \texttt{emplace}，你就能在所有情况下避免产生无值的变体，唯一的例外是你拥有一个会抛出的移动构造函数：
+
+\begin{codebox}[cpp]
+    v1 = 42;
+    // 该赋值运算符右侧的构造会抛出异常；
+    // 但变体对象不受影响。
+    try { v1 = A(); } catch (...) {}
+    assert(std::get<int>(v1) == 42);
+    // 这种情况同样如此。
+    try { v1 = B(); } catch (...) {}
+    assert(std::get<int>(v1) == 42);
+    // 但会抛出的移动构造函数仍可能把它搞砸。
+    try { v1 = C(); } catch (...) {}
+    assert(v1.valueless_by_exception());
+\end{codebox}
+
+回想一下第 4 章「容器动物园」（The Container Zoo）中关于 \texttt{std::\allowbreak{}vector} 的讨论：你定义的类型的移动构造函数应当始终标记为 \texttt{noexcept}；所以，如果你虔诚地遵循这条建议，就根本无需去处理 \texttt{valueless\_\allowbreak{}by\_\allowbreak{}exception}。
+
+无论如何，当变体处于这种状态时，它的 \texttt{index(\allowbreak{})\allowbreak{}} 方法会返回 \texttt{size\_\allowbreak{}t(\allowbreak{}-1)\allowbreak{}}（这个常量也被称为 \texttt{std::\allowbreak{}variant\_\allowbreak{}npos}），而任何试图对它调用 \texttt{std::\allowbreak{}visit} 的操作都会抛出 \texttt{std::\allowbreak{}bad\_\allowbreak{}variant\_\allowbreak{}access} 类型的异常。
+
+\section{用 \texttt{std::\allowbreak{}optional}（可选值）延迟初始化}
+
+你或许已经在想，\texttt{std::\allowbreak{}variant} 的一个潜在用途，是用来表达“也许我有一个对象，也许没有”这个概念。例如，我们可以用标准标签类型 \texttt{std::\allowbreak{}monostate} 来表达“也许我没有”这种状态：
+
+\begin{codebox}[cpp]
+    std::map<std::string, int> g_limits = {
+      { "memory", 655360 }
+    };
+    std::variant<std::monostate, int>
+    get_resource_limit(const std::string& key)
+    {
+      if (auto it = g_limits.find(key); it != g_limits.end()) {
+        return it->second;
+      }
+      return std::monostate{};
+    }
+    void test()
+    {
+      auto limit = get_resource_limit("memory");
+      if (std::holds_alternative<int>(limit)) {
+        use( std::get<int>(limit) );
+      } else {
+        use( some_default );
+      }
+    }
+\end{codebox}
+
+你会高兴地知道，这并不是达成该目标的最佳方式！标准库专门提供了词汇类型 \texttt{std::\allowbreak{}optional<\allowbreak{}T>\allowbreak{}} 来处理“也许我有一个对象，也许没有”这个概念。
+
+\begin{codebox}[cpp]
+    std::optional<int>
+    get_resource_limit(const std::string& key)
+    {
+      if (auto it = g_limits.find(key); it != g_limits.end()) {
+        return it->second;
+      }
+      return std::nullopt;
+    }
+    void test()
+    {
+      auto limit = get_resource_limit("memory");
+      if (limit.has_value()) {
+        use( *limit );
+      } else {
+        use( some_default );
+      }
+    }
+\end{codebox}
+
+在代数数据类型（algebraic data type）的逻辑里，\texttt{std::\allowbreak{}optional<\allowbreak{}T>\allowbreak{}} 是一个和类型（sum type）：它可能的取值数量与 \texttt{T} 完全相同，再多一个。这多出来的一个值被称为“null”、“empty”或“disengaged”（未接合）状态，在源代码中用特殊常量 \texttt{std::\allowbreak{}nullopt} 来表示。
+
+不要把 \texttt{std::\allowbreak{}nullopt} 与名字相近的 \texttt{std::\allowbreak{}nullptr} 混淆！除了都隐隐约约地跟“空”有点关系之外，它们没有任何共同点。
+
+与带着一堆自由（非成员）函数的 \texttt{std::\allowbreak{}tuple} 和 \texttt{std::\allowbreak{}variant} 不同，\texttt{std::\allowbreak{}optional<\allowbreak{}T>\allowbreak{}} 类里满是方便的成员函数。如果可选值对象 \texttt{o} 当前持有一个 \texttt{T} 类型的值，那么 \texttt{o.\allowbreak{}has\_\allowbreak{}value(\allowbreak{})\allowbreak{}} 为 \texttt{true}。“持有值”的状态通常被称为“engaged”（已接合）；含有值的可选值对象是“engaged”的，而处于空状态的可选值对象则是“disengaged”（未接合）的。
+
+如果 \texttt{T} 上 \texttt{==}、\texttt{!=}、\texttt{<}、\texttt{<=}、\texttt{>} 和 \texttt{>=} 这些比较运算符有效，那么它们也都会为 \texttt{optional<\allowbreak{}T>\allowbreak{}} 重载。要比较两个可选值，或者把一个可选值与 \texttt{T} 类型的值作比较，你只需记住一点：处于未接合（disengaged）状态的可选值，比 \texttt{T} 的任何真实值都要“小”。
+
+\texttt{bool(\allowbreak{}o)\allowbreak{}} 是 \texttt{o.\allowbreak{}has\_\allowbreak{}value(\allowbreak{})\allowbreak{}} 的同义词，而 \texttt{!o} 则是 \texttt{!o.\allowbreak{}has\_\allowbreak{}value(\allowbreak{})\allowbreak{}} 的同义词。就我个人而言，建议你始终使用 \texttt{has\_\allowbreak{}value}，因为二者在运行时开销上并无差别，区别只在于代码的可读性。如果你确实用了那种缩写形式的向 \texttt{bool} 转换，要注意：对于 \texttt{std::\allowbreak{}optional<\allowbreak{}bool>\allowbreak{}}，\texttt{o == false} 和 \texttt{!o} 表达的是截然不同的意思！
+
+\texttt{o.\allowbreak{}value(\allowbreak{})\allowbreak{}} 返回 \texttt{o} 所含值的引用。如果 \texttt{o} 当前处于未接合状态，那么 \texttt{o.\allowbreak{}value(\allowbreak{})\allowbreak{}} 会抛出 \texttt{std::\allowbreak{}bad\_\allowbreak{}optional\_\allowbreak{}access} 类型的异常。
+
+\texttt{*o}（通过被重载的一元 \texttt{operator*}）返回 \texttt{o} 所含值的引用，但并不会检查是否处于接合状态。如果 \texttt{o} 当前处于未接合状态而你又调用了 \texttt{*o}，那就是未定义行为（UB），正如你对一个空指针调用 \texttt{*p} 一样。你可以通过一个现象记住这种行为：C++ 标准库喜欢用标点符号来标记那些最高效、最少做合法性检查的操作。例如，\texttt{std::\allowbreak{}vector::\allowbreak{}operator[]} 做的边界检查就比 \texttt{std::\allowbreak{}vector::\allowbreak{}at(\allowbreak{})\allowbreak{}} 少。因此同理，\texttt{std::\allowbreak{}optional::\allowbreak{}operator*} 做的边界检查也比 \texttt{std::\allowbreak{}optional::\allowbreak{}value(\allowbreak{})\allowbreak{}} 少。
+
+\texttt{o.\allowbreak{}value\_\allowbreak{}or(\allowbreak{}x)\allowbreak{}} 返回 \texttt{o} 所含值的副本；如果 \texttt{o} 处于未接合状态，则返回 \texttt{x} 转换为 \texttt{T} 类型后的副本。我们可以用 \texttt{value\_\allowbreak{}or} 把前面的示例代码重写成一行，既简练又易读：
+
+\begin{codebox}[cpp]
+    std::optional<int> get_resource_limit(const std::string&);
+    void test() {
+      auto limit = get_resource_limit("memory");
+      use( limit.value_or(some_default) );
+    }
+\end{codebox}
+
+前面的例子展示了如何把 \texttt{std::\allowbreak{}optional<\allowbreak{}T>\allowbreak{}} 用作处理“飞行中的（in flight，即作为函数返回类型或参数类型）一个 \texttt{T}”的手段。另一种常见而有用的方法，是把 \texttt{std::\allowbreak{}optional<\allowbreak{}T>\allowbreak{}} 用作处理“静止时（at rest，即作为类的数据成员）尚不是一个 \texttt{T}”的手段。例如，假设我们有一个不可默认构造的类型 \texttt{L}，比如某个 lambda 表达式所产生的闭包类型：
+
+\begin{codebox}[cpp]
+    auto make_lambda(int arg) {
+      return [arg](int x) { return x + arg; };
+    }
+    using L = decltype(make_lambda(0));
+    static_assert(!std::is_default_constructible_v<L>);
+    static_assert(!std::is_move_assignable_v<L>);
+\end{codebox}
+
+那么，拥有这种类型成员的类，也将无法默认构造：
+
+\begin{codebox}[cpp]
+    class ProblematicAdder {
+      L fn_;
+    };
+    static_assert(!std::is_default_constructible_v<ProblematicAdder>);
+\end{codebox}
+
+但是，通过给类一个 \texttt{std::\allowbreak{}optional<\allowbreak{}L>\allowbreak{}} 类型的成员，我们就能让它在需要默认构造能力的语境下使用：
+
+\begin{codebox}[cpp]
+    class Adder {
+      std::optional<L> fn_;
+      public:
+      void setup(int first_arg) {
+        fn_.emplace(make_lambda(first_arg));
+      }
+      int call(int second_arg) {
+        // 除非先调用 setup()，否则会抛出异常
+        return fn_.value()(second_arg);
+      }
+    };
+    static_assert(std::is_default_constructible_v<Adder>);
+    void test() {
+      Adder adder;
+      adder.setup(4);
+      int result = adder.call(5);
+      assert(result == 9);
+    }
+\end{codebox}
+
+如果没有 \texttt{std::\allowbreak{}optional}，要实现这种行为会非常困难。你可以用 placement-new 语法，或者借助一个 \texttt{union} 来实现，但本质上你至少得自己重新实现一大半的 \texttt{optional}。用 \texttt{std::\allowbreak{}optional} 要好得多！另外请注意，如果出于某种原因，你宁愿得到未定义行为、也不愿冒从 \texttt{call(\allowbreak{})\allowbreak{}} 抛出异常的风险，那只需要把 \texttt{fn\_\allowbreak{}.value(\allowbreak{})\allowbreak{}} 换成 \texttt{*fn\_\allowbreak{}} 即可。\texttt{std::\allowbreak{}optional} 确实是 C++17 新特性中最大的收获之一，熟悉它会让你受益匪浅。从 \texttt{optional}（它可以被描述为一种受限的单类型 \texttt{variant}）出发，我们现在走向另一个极端：代数数据类型意义上的“无穷大”。
+
+\section{再谈变体}
+
+\texttt{variant} 这种数据类型擅长表达简单的可选项，但到了 C++17，它还不太适合表达像 JSON 列表这样的递归数据类型。也就是说，下面这段 C++17 代码将无法编译：
+
+\begin{codebox}[cpp]
+    using JSONValue = std::variant<
+      std::nullptr_t,
+      bool,
+      double,
+      std::string,
+      std::vector<JSONValue>,
+      std::map<std::string, JSONValue>
+    >;
+\end{codebox}
+
+有几种可行的变通方案。其中最稳健、也最正确的一条，是继续使用 C++11 的 Boost 库 \texttt{boost::\allowbreak{}variant}，它通过标记类型 \texttt{boost::\allowbreak{}recursive\_\allowbreak{}variant\_\allowbreak{}} 专门支持递归的变体类型：
+
+\begin{codebox}[cpp]
+    using JSONValue = boost::variant<
+      std::nullptr_t,
+      bool,
+      double,
+      std::string,
+      std::vector<boost::recursive_variant_>,
+      std::map<std::string, boost::recursive_variant_>
+    >;
+\end{codebox}
+
+你也可以通过引入一个名为 \texttt{JSON\allowbreak{}Value} 的新类类型来绕过这个问题，这个类要么“有一个（HAS-A）”递归类型的 \texttt{std::\allowbreak{}variant}，要么“是一个（IS-A）”这样的 \texttt{std::\allowbreak{}variant}。注意，在下面的例子中我选择的是 HAS-A 而非 IS-A；从非多态（non-polymorphic）的标准库类型继承，几乎总是一个糟糕的主意。
+
+由于 C++ 允许对类类型做前向引用，所以下面这段代码能够通过编译：
+
+\begin{codebox}[cpp]
+    struct JSONValue {
+      std::variant<
+        std::nullptr_t,
+        bool,
+        double,
+        std::string,
+        std::vector<JSONValue>,
+        std::map<std::string, JSONValue>
+      > value_;
+    };
+\end{codebox}
+
+最后一种可能是改用标准库里的某个代数类型，它甚至
+
+比 \texttt{variant} 更强大。
+
+\section{用 std::any 容纳无限种替代类型}
+
+借改编亨利·福特的话来说，类型为 \texttt{std::\allowbreak{}variant<\allowbreak{}A,\allowbreak{} B,\allowbreak{} C>\allowbreak{}} 的对象可以持有某个类型的值——只要它是 \texttt{A}、\texttt{B} 或 \texttt{C}。但假设我们想持有真正任意类型的值呢？也许我们的程序会在运行时加载插件，而这些插件可能包含无法预测的新类型。我们无法在 \texttt{variant} 中指定这些类型。又或者，我们正处于上一节详述的“递归数据类型”情境中。
+
+针对这些情境，C++17 标准库提供了一种代数数据类型（algebraic data type）意义上的“无穷”：类型 \texttt{std::\allowbreak{}any}。它算是一种容器（参见第 4 章「容器动物园」），用于容纳任意类型的单个对象。该容器可能为空，也可能含有一个对象。你可以对 \texttt{any} 对象执行以下基本操作：
+
+\begin{itemize}
+\item 询问它当前是否持有一个对象
+\item 向其中放入一个新对象（销毁旧对象，无论它之前是什么）
+\item 询问所持有对象的类型
+\item 通过正确指明其类型，取回所持有的对象
+\end{itemize}
+
+在代码中，前三个操作如下所示：
+
+\begin{codebox}[cpp]
+    std::any a; // 构造一个空容器
+    assert(!a.has_value());
+    a = std::string("hello");
+    assert(a.has_value());
+    assert(a.type() == typeid(std::string));
+    a = 42;
+    assert(a.has_value());
+    assert(a.type() == typeid(int));
+\end{codebox}
+
+第四个操作稍微麻烦一些。它的拼写是 \texttt{std::\allowbreak{}any\_\allowbreak{}cast}，并且和用于 \texttt{variant} 的 \texttt{std::\allowbreak{}get} 类似，它有两种形式：一种是类似 \texttt{std::\allowbreak{}get} 的形式，失败时抛出 \texttt{std::\allowbreak{}bad\_\allowbreak{}any\_\allowbreak{}cast}；另一种是类似 \texttt{std::\allowbreak{}get\_\allowbreak{}if} 的形式，失败时返回空指针：
+
+\begin{codebox}[cpp]
+    if (std::string *p = std::any_cast<std::string>(&a)) {
+      use(*p);
+    } else {
+      // 没钓到！
+    }
+    try {
+      std::string& s = std::any_cast<std::string&>(a);
+      use(s);
+    } catch (const std::bad_any_cast&) {
+      // 没钓到！
+    }
+\end{codebox}
+
+注意，无论哪种情况，你都必须指明想要从 \texttt{any} 对象中取回的类型。如果你把类型弄错了，就会得到一个异常或空指针。没有什么办法能说“把持有的对象给我，不管它是什么类型”，因为那样的话那个表达式的类型又会是什么呢？
+
+回想一下，上一节中我们在 \texttt{std::\allowbreak{}variant} 上遇到类似问题时，是通过 \texttt{std::\allowbreak{}visit} 把一段泛型代码派发到所持有的可选项中来解决的。遗憾的是，\texttt{any} 并没有等价的 \texttt{std::\allowbreak{}visit}。原因既简单又不可逾越：分离编译（separate compilation）。假设在一个源文件 \texttt{a.\allowbreak{}cc} 中，我写了：
+
+\begin{codebox}[cpp]
+    template<class T> struct Widget {};
+    std::any get_widget() {
+      return std::make_any<Widget<int>>();
+    }
+\end{codebox}
+
+而在另一个源文件 \texttt{b.\allowbreak{}cc}（也许会被编译进不同的插件、\texttt{.dll}，或共享目标文件）中，我写了：
+
+\begin{codebox}[cpp]
+    template<class T> struct Widget {};
+    template<class T> int size(Widget<T>& w) {
+      return sizeof w;
+    }
+    void test()
+    {
+      std::any a = get_widget();
+      int sz = hypothetical_any_visit([](auto&& w){
+        return size(w);
+      }, a);
+      assert(sz == sizeof(Widget<int>));
+    }
+\end{codebox}
+
+在编译 \texttt{b.\allowbreak{}cc} 时，编译器该如何知道它需要为 \texttt{size(\allowbreak{}Widget<\allowbreak{}int>\allowbreak{}\&)\allowbreak{}} 生成模板实例，而不是（比如说）\texttt{size(\allowbreak{}Widget<\allowbreak{}double>\allowbreak{}\&)\allowbreak{}}？当有人把 \texttt{a.\allowbreak{}cc} 改成返回 \texttt{make\_\allowbreak{}any(\allowbreak{}Widget<\allowbreak{}char>\allowbreak{}\&)\allowbreak{}} 时，编译器又该如何知道它需要用 \texttt{size(\allowbreak{}Widget<\allowbreak{}char>\allowbreak{}\&)\allowbreak{}} 的全新实例重新编译 \texttt{b.\allowbreak{}cc}，并且 \texttt{size(\allowbreak{}Widget<\allowbreak{}int>\allowbreak{}\&)\allowbreak{}} 的实例已不再需要——当然，除非我们预期会链接到一个确实需要该实例的 \texttt{c.\allowbreak{}cc}！基本上，对于一个按定义可以容纳任意类型、并触发任意代码生成的容器，编译器根本无法弄清类型擦除式的访问（visitation）可能需要什么样的代码生成。
+
+因此，为了从 \texttt{any} 中提取所容纳值的任意函数，你必须预先知道那个被容纳值的类型可能是什么。（而如果猜错了——那就没钓到！）
+
+\subsection{std::any 与多态类类型}
+
+\texttt{std::\allowbreak{}any} 处于 \texttt{std::\allowbreak{}variant<\allowbreak{}A,\allowbreak{} B,\allowbreak{} C>\allowbreak{}} 的编译期多态与多态继承体系及 \texttt{dynamic\_\allowbreak{}cast} 的运行时多态之间。你或许会好奇 \texttt{std::\allowbreak{}any} 是否会在某种程度上与 \texttt{dynamic\_\allowbreak{}cast} 的机制交互。答案是“不，它不会”——而且也不存在任何标准手段来获得那种行为。\texttt{std::\allowbreak{}any} 是百分之百静态类型安全的：在不知道该数据确切静态类型的情况下，没有任何办法能“侵入”它并得到一个“指向数据的指针”（例如一个 \texttt{void *}）：
+
+\begin{codebox}[cpp]
+    struct Animal {
+      virtual ~Animal() = default;
+    };
+    struct Cat : Animal {};
+    void test()
+    {
+      std::any a = Cat{};
+      // 所持有的对象是一个 "Cat"……
+      assert(a.type() == typeid(Cat));
+      assert(std::any_cast<Cat>(&a) != nullptr);
+      // 请求基类 "Animal" 不会成功。
+      assert(a.type() != typeid(Animal));
+      assert(std::any_cast<Animal>(&a) == nullptr);
+      // 请求 void* 当然也不会成功！
+      assert(std::any_cast<void>(&a) == nullptr);
+    }
+\end{codebox}
+
+\section{简而言之：类型擦除}
+
+让我们简要地看看标准库可能如何实现 \texttt{std::\allowbreak{}any}。其核心思想被称为“类型擦除（type erasure）”，而我们达成它的方式是：先找出希望对所有类型 \texttt{T} 都支持的、关键且相关的操作，然后“擦除”掉任何其他某个具体类型 \texttt{T} 可能支持的、特立独行的操作。
+
+对于 \texttt{std::\allowbreak{}any} 而言，关键操作如下：
+
+\begin{itemize}
+\item 构造所容纳对象的一份拷贝
+\item 以“移动”方式构造所容纳对象的一份拷贝
+\item 获取所容纳对象的 \texttt{typeid}
+\end{itemize}
+
+构造与析构也是必需的，但这两项操作关注的是所容纳对象自身的生命周期管理，而不是“你能拿它做什么”，所以至少在此情形下我们无需考虑它们。
+
+于是我们构想出一个多态类类型（不妨称之为 \texttt{Any\allowbreak{}Base}），它只把那三个操作作为可重写的 \texttt{virtual} 方法提供支持；每当程序员真正把一个具体类型 \texttt{T} 的对象存入 \texttt{any} 时，我们就创建一个全新的派生类（称之为 \texttt{Any\allowbreak{}Impl<\allowbreak{}T>\allowbreak{}}）：
+
+\begin{codebox}[cpp]
+    class any;
+    struct AnyBase {
+      virtual const std::type_info& type() = 0;
+      virtual void copy_to(any&) = 0;
+      virtual void move_to(any&) = 0;
+      virtual ~AnyBase() = default;
+    };
+    template<typename T>
+    struct AnyImpl : AnyBase {
+      T t_;
+      const std::type_info& type() {
+        return typeid(T);
+      }
+      void copy_to(any& rhs) override {
+        rhs.emplace<T>(t_);
+      }
+      void move_to(any& rhs) override {
+        rhs.emplace<T>(std::move(t_));
+      }
+      // 析构函数不需要做任何事
+      // 在此情形下并无特殊之处
+    };
+\end{codebox}
+
+借助这些辅助类，实现 \texttt{std::\allowbreak{}any} 的代码变得相当简单，尤其是当我们使用一个智能指针（参见第 6 章「智能指针」）来管理 \texttt{Any\allowbreak{}Impl<\allowbreak{}T>\allowbreak{}} 对象的生命周期时：
+
+\begin{codebox}[cpp]
+    class any {
+      std::unique_ptr<AnyBase> p_ = nullptr;
+      public:
+      template<typename T, typename... Args>
+      std::decay_t<T>& emplace(Args&&... args) {
+        p_ = std::make_unique<AnyImpl<T>>(std::forward<Args>(args)...);
+      }
+      bool has_value() const noexcept {
+        return (p_ != nullptr);
+      }
+      void reset() noexcept {
+        p_ = nullptr;
+      }
+      const std::type_info& type() const {
+        return p_ ? p_->type() : typeid(void);
+      }
+      any(const any& rhs) {
+        *this = rhs;
+      }
+      any& operator=(const any& rhs) {
+        if (rhs.has_value()) {
+          rhs.p_->copy_to(*this);
+        }
+        return *this;
+      }
+    };
+\end{codebox}
+
+上面的代码示例省略了移动赋值（move-assignment）的实现。它可以像拷贝赋值那样实现，也可以简单地交换指针。标准库实际上倾向于在可能时交换指针，因为那可以保证是 \texttt{noexcept} 的；你可能会看到 \texttt{std::\allowbreak{}any} 不交换指针的唯一原因是，它使用了“小对象优化（small object optimization）”来为极小的、具有不抛异常移动构造能力的类型 \texttt{T} 完全避免堆分配。就本书写作时而言，libstdc++（GCC 所用的库）会对大小不超过 8 字节的类型使用小对象优化并避免堆分配；libc++（Clang 所用的库）则会对大小不超过 24 字节的类型使用小对象优化。
+
+与第 4 章「容器动物园」中讨论的标准容器不同，\texttt{std::\allowbreak{}any} 不接受分配器（allocator）参数，也不允许你自定义或配置其堆内存的来源。如果你在实时或内存受限的系统上使用 C++，而该系统不允许堆分配，那么就不应该使用 \texttt{std::\allowbreak{}any}。可以考虑诸如 Tiemo Jung 的 \texttt{tj::\allowbreak{}inplace\_\allowbreak{}any<\allowbreak{}Size,\allowbreak{} Alignment>\allowbreak{}} 这样的替代方案。如果其他方案都行不通，你现在也已经知道如何自己动手实现了！
+
+\subsection{std::any 与可拷贝性}
+
+注意，我们对 \texttt{Any\allowbreak{}Impl<\allowbreak{}T>\allowbreak{}::\allowbreak{}copy\_\allowbreak{}to} 的定义要求 \texttt{T} 是可拷贝构造（copy-constructible）的。标准库中的 \texttt{std::\allowbreak{}any} 同样如此；根本没有任何办法把一个只能移动（move-only）的类型存入 \texttt{std::\allowbreak{}any} 对象。绕过这一限制的办法是借助一种“垫片（shim）”包装器，其用途是让那个只能移动的对象在句法上满足可拷贝构造的要求，同时避免任何实际的拷贝：
+
+\begin{codebox}[cpp]
+    using Ptr = std::unique_ptr<int>;
+    template<class T>
+    struct Shim {
+      T get() { return std::move(*t_); }
+      template<class... Args>
+      Shim(Args&&... args) : t_(std::in_place,
+        std::forward<Args>(args)...) {}
+      Shim(Shim&&) = default;
+      Shim& operator=(Shim&&) = default;
+      Shim(const Shim&) { throw "oops"; }
+      Shim& operator=(const Shim&) { throw "oops"; }
+      private:
+      std::optional<T> t_;
+    };
+    void test()
+    {
+      Ptr p = std::make_unique<int>(42);
+      // Ptr 无法存入 std::any，因为它是只能移动的。
+      // std::any a = std::move(p);
+      // 但 Shim<Ptr> 可以！
+      std::any a = Shim<Ptr>(std::move(p));
+      assert(a.type() == typeid(Shim<Ptr>));
+      // 移动 Shim<Ptr> 没问题……
+      std::any b = std::move(a);
+      try {
+        // ……但拷贝 Shim<Ptr> 会抛出异常。
+        std::any c = b;
+      } catch (...) {}
+      // 将只能移动的 Ptr 从 Shim<Ptr> 中取回。
+      Ptr r = std::any_cast<Shim<Ptr>&>(b).get();
+      assert(*r == 42);
+    }
+\end{codebox}
+
+注意上面代码示例中对 \texttt{std::\allowbreak{}optional<\allowbreak{}T>\allowbreak{}} 的运用；它防止了我们的伪拷贝构造函数在 \texttt{T} 可能不可默认构造时出问题。
+
+\section{再来谈谈类型擦除：std::function}
+
+我们观察到，对于 \texttt{std::\allowbreak{}any}，关键操作如下：
+
+\begin{itemize}
+\item 构造所容纳对象的一份拷贝
+\item 以“移动”方式构造所容纳对象的一份拷贝
+\item 获取所容纳对象的 \texttt{typeid}
+\end{itemize}
+
+假设我们往这组关键操作中再加一项呢？不妨说我们的集合是：
+
+\begin{itemize}
+\item 构造所容纳对象的一份拷贝
+\item 以“移动”方式构造所容纳对象的一份拷贝
+\item 获取所容纳对象的 \texttt{typeid}
+\item 以一组特定的、固定的参数类型 \texttt{A...} 调用所容纳对象，并把结果转换为某个特定的固定类型 \texttt{R}
+\end{itemize}
+
+对这组操作进行类型擦除，对应的正是标准库类型 \texttt{std::\allowbreak{}function<\allowbreak{}R(\allowbreak{}A...)\allowbreak{}>}！
+
+\begin{codebox}[cpp]
+    int my_abs(int x) { return x < 0 ? -x : x; }
+    long unusual(long x, int y = 3) { return x + y; }
+    void test()
+    {
+      std::function<int(int)> f; // 构造一个空容器
+      assert(!f);
+      f = my_abs; // 在容器中存入一个函数
+      assert(f(-42) == 42);
+      f = [](long x) { return unusual(x); }; // 或者一个 lambda！
+      assert(f(-42) == -39);
+    }
+\end{codebox}
+
+拷贝 \texttt{std::\allowbreak{}function} 时，只要被容纳的对象带有状态，就总会制作该对象的一份拷贝。当然，如果被容纳的对象是一个函数指针，你不会察觉到任何差异；但如果你用一个用户自定义类类型的对象，或者用一个有状态的 lambda 来尝试，就能看到拷贝的发生：
+
+\begin{codebox}[cpp]
+    f = [i=0](int) mutable { return ++i; };
+    assert(f(-42) == 1);
+    assert(f(-42) == 2);
+    auto g = f;
+    assert(f(-42) == 3);
+    assert(f(-42) == 4);
+    assert(g(-42) == 3);
+    assert(g(-42) == 4);
+\end{codebox}
+
+正如 \texttt{std::\allowbreak{}any} 一样，\texttt{std::\allowbreak{}function<\allowbreak{}R(\allowbreak{}A...)\allowbreak{}} 允许你取回被容纳对象的 \texttt{typeid}，或者在你能静态地知道（或猜出）其类型的前提下，取回指向该对象本身的指针：
+
+\begin{codebox}[cpp]
+    f.target_type() 等价于 a.type()
+    f.target<T>() 等价于 std::any_cast<T*>(&a)
+    if (f.target_type() == typeid(int(*)(int))) {
+      int (*p)(int) = *f.target<int (*)(int)>();
+      use(p);
+    } else {
+      // 没钓到！
+    }
+\end{codebox}
+
+话虽如此，我在实际工作中从未见过这些方法的使用场景。一般来说，如果你非得去问一个 \texttt{std::\allowbreak{}function} 所容纳的类型是什么，那你已经做错了什么。
+
+\texttt{std::\allowbreak{}function} 最重要的使用场景，是作为一种词汇类型（vocabulary type），用于在模块边界之间传递“行为（behavior）”，而在那些使用模板不可能奏效的地方——例如，当你需要向某个外部库中的函数传递一个回调，或者当你在编写一个需要从调用方接收回调的库时：
+
+\begin{codebox}[cpp]
+    // templated_for_each 是一个模板，必须在调用的位置可见。
+    template<class F>
+    void templated_for_each(std::vector<int>& v, F f) {
+      for (int& i : v) {
+        f(i);
+      }
+    }
+    // type_erased_for_each 具有稳定的 ABI 和固定的地址。
+    // 只需其声明在作用域内即可调用。
+    extern void type_erased_for_each(std::vector<int>&,
+      std::function<void(int)>);
+\end{codebox}
+
+本章开头我们谈到了 \texttt{std::\allowbreak{}string}，那个用于在函数之间传递字符串的标准词汇类型；而现在，随着本章临近尾声，我们谈的却是 \texttt{std::\allowbreak{}function}，那个用于在函数之间传递函数的标准词汇类型！
+
+\subsection{std::function、可拷贝性与分配}
+
+与 \texttt{std::\allowbreak{}any} 一样，\texttt{std::\allowbreak{}function} 要求存入其中的任何对象都必须是可拷贝构造的。如果你大量使用捕获了 \texttt{std::\allowbreak{}future<\allowbreak{}T>\allowbreak{}}、\texttt{std::\allowbreak{}unique\_\allowbreak{}ptr<\allowbreak{}T>\allowbreak{}}，或其他只能移动类型的 lambda，这就会成为问题：此类 lambda 类型自身也将是只能移动的。本章前面“std::any 与可拷贝性”一节展示了一种解决办法：我们可以引入一个在句法上可拷贝、但一旦尝试拷贝就抛出异常的垫片（shim）。
+
+在处理 \texttt{std::\allowbreak{}function} 与 lambda 捕获时，往往更可取的做法是通过 \texttt{shared\_\allowbreak{}ptr} 来捕获那些只能移动的 lambda 捕获。我们将在下一章介绍 \texttt{shared\_\allowbreak{}ptr}：
+
+\begin{codebox}[cpp]
+    auto capture = [](auto& p) {
+      using T = std::decay_t<decltype(p)>;
+      return std::make_shared<T>(std::move(p));
+    };
+   std::promise<int> p;
+   std::function<void()> f = [sp = capture(p)]() {
+     sp->set_value(42);
+   };
+\end{codebox}
+
+与 \texttt{std::\allowbreak{}any} 一样，\texttt{std::\allowbreak{}function} 也不接受分配器参数，也不允许你自定义或配置其堆内存的来源。如果你在实时或内存受限的系统上使用 C++，而该系统不允许堆分配，那么就不应该使用 \texttt{std::\allowbreak{}function}。可以考虑诸如 Carl Cook 的 \texttt{sg14::\allowbreak{}inplace\_\allowbreak{}function<\allowbreak{}R(\allowbreak{}A...)\allowbreak{},\allowbreak{} Size,\allowbreak{} Alignment>\allowbreak{}} 这样的替代方案。
+
+\section{小结}
+
+像 \texttt{std::\allowbreak{}string} 和 \texttt{std::\allowbreak{}function} 这样的词汇类型，让我们在处理常见编程概念时得以共享一种通用语（lingua franca）。在 C++17 中，我们拥有一整套丰富的词汇类型来应对代数数据类型：\texttt{std::\allowbreak{}pair} 和 \texttt{std::\allowbreak{}tuple}（积类型，product types）、\texttt{std::\allowbreak{}optional} 和 \texttt{std::\allowbreak{}variant}（和类型，sum types），以及 \texttt{std::\allowbreak{}any}（和类型的极致——它几乎能存储任何东西）。不过，别得意忘形，以至于开始给每个函数都返回 \texttt{std::\allowbreak{}tuple} 和 \texttt{std::\allowbreak{}variant} 类型！具名类类型仍然是让你的代码保持可读性的最有效方式。
+
+用 \texttt{std::\allowbreak{}optional} 来表示某个值可能缺失，或者表示某个数据成员“尚未就绪（not-yet-ness）”的状态。
+
+用 \texttt{std::\allowbreak{}get\_\allowbreak{}if<\allowbreak{}T>\allowbreak{}(\allowbreak{}\&v)\allowbreak{}} 来查询 \texttt{variant} 的类型；用 \texttt{std::\allowbreak{}any\_\allowbreak{}cast<\allowbreak{}T>\allowbreak{}(\allowbreak{}\&a)\allowbreak{}} 来查询 \texttt{any} 的类型。记住，你提供的类型必须精确匹配；如果不匹配，你就会得到 \texttt{nullptr}。
+
+要注意，\texttt{make\_\allowbreak{}tuple} 和 \texttt{make\_\allowbreak{}pair} 做的可不只是构造 \texttt{tuple} 和 \texttt{pair} 对象；它们还会把 \texttt{reference\_\allowbreak{}wrapper} 对象衰变为原生引用。用 \texttt{std::\allowbreak{}tie} 和 \texttt{std::\allowbreak{}forward\_\allowbreak{}as\_\allowbreak{}tuple} 来创建引用的元组。\texttt{std::\allowbreak{}tie} 在多重复值赋值以及编写比较运算符时格外有用。\texttt{std::\allowbreak{}forward\_\allowbreak{}as\_\allowbreak{}tuple} 在元编程中很有用。
+
+要注意，\texttt{std::\allowbreak{}variant} 始终存在进入“因异常而无值（valueless by exception）”状态的可能性；但要知道，除非你写出了带有会抛出异常的移动构造函数的类，否则无需担心那种情况。另外：不要写出带有会抛出异常的移动构造函数的类！
+
+要注意，经过类型擦除的类型 \texttt{std::\allowbreak{}any} 和 \texttt{std::\allowbreak{}function} 会隐式地使用堆。第三方库提供了这些类型非标准的 \texttt{inplace\_\allowbreak{}} 版本。要注意，
+
+\texttt{std::\allowbreak{}any} 和 \texttt{std::\allowbreak{}function} 要求其包含的类型具有可拷贝性。若遇到这种情况，可使用"按 \texttt{shared\_\allowbreak{}ptr} 捕获"来应对。

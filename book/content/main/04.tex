@@ -1,0 +1,960 @@
+在前两章中，我们介绍了迭代器（iterator）与范围（range）的概念（第 2 章「迭代器与范围（Iterators and Ranges）」），以及那个庞大的、作用于由迭代器对定义的数据元素范围的标准泛型算法库（第 3 章「迭代器对算法（The Iterator-Pair Algorithms）」）。在本章中，我们将看看这些数据元素本身是在哪里被分配和存储的。也就是说，既然我们已经懂得了如何进行迭代，这个问题就变得急迫起来：我们到底在迭代什么？
+
+在标准模板库（STL）中，这个问题的答案通常是：我们是在迭代某个容器（container）所包含的元素的一个子范围。容器不过是一个 C++ 类（或类模板），它本质上包含（或拥有）一个同质的数据元素范围，并将该范围暴露出来以供泛型算法进行迭代。
+
+本章我们将涵盖的主题有：
+
+\begin{itemize}
+\item 一个对象拥有另一个对象的所有权（ownership）的概念（这正是容器与范围之间的本质区别）
+\item 序列容器（sequence container）（\texttt{array}、\texttt{vector}、\texttt{list} 和 \texttt{forward\_\allowbreak{}list}）
+\item 迭代器失效（iterator invalidation）与引用失效的陷阱
+\item 容器适配器（container adapter）（\texttt{stack}、\texttt{queue} 和 \texttt{priority\_\allowbreak{}queue}）
+\item 关联容器（associative container）（\texttt{set}、\texttt{map} 及它们的同类）
+\item 何时适合提供一个比较器（comparator）、哈希函数、相等比较器或分配器（allocator）作为额外的模板类型参数
+\end{itemize}
+
+\section{所有权的概念}
+
+当我们说对象 \texttt{A} 拥有（own）对象 \texttt{B} 时，我们的意思是对象 \texttt{A} 管理着对象 \texttt{B} 的生存期（lifetime）——也就是说，\texttt{A} 控制着对象 \texttt{B} 的构造、拷贝、移动与销毁。对象 \texttt{A} 的使用者可以（也应该）“忘记”去管理 \texttt{B}（例如，通过显式调用 \texttt{delete B}、\texttt{fclose(\allowbreak{}B)\allowbreak{}} 等）。
+
+让对象 \texttt{A} “拥有”对象 \texttt{B} 最简单的方式，就是让 \texttt{B} 成为 \texttt{A} 的一个成员变量。例如：
+
+\begin{codebox}[cpp]
+    struct owning_A {
+      B b_;
+    };
+    struct non_owning_A {
+      B& b_;
+    };
+    void test()
+    {
+      B b;
+      // a1 取得对 [b 的副本] 的所有权。
+      owning_A a1 { b };
+      // a2 仅仅是持有对 b 的引用；
+      // a2 并不拥有 b。
+      non_owning_A a2 { b };
+    }
+\end{codebox}
+
+另一种方式是让 \texttt{A} 持有一个指向 \texttt{B} 的指针，并在 \texttt{\textasciitilde A(\allowbreak{})\allowbreak{}}（如果有必要，还包括 \texttt{A} 的拷贝与移动操作）中编写适当的代码，以清理与该指针相关联的资源：
+
+\begin{codebox}[cpp]
+    struct owning_A {
+      B *b_;
+      explicit owning_A(B *b) : b_(b) {}
+      owning_A(owning_A&& other) : b_(other.b_) {
+        other.b_ = nullptr;
+      }
+      owning_A& operator= (owning_A&& other) {
+        delete b_;
+        b_ = other.b_;
+        other.b_ = nullptr;
+        return *this;
+      }
+      ~owning_A() {
+        delete b_;
+      }
+    };
+    struct non_owning_A {
+      B *b_;
+    };
+    void test()
+    {
+      B *b = new B;
+      // a1 取得对 *b 的所有权。
+      owning_A a1 { b };
+      // a2 仅仅是持有指向 *b 的指针；
+      // a2 并不拥有 *b。
+      non_owning_A a2 { b };
+    }
+\end{codebox}
+
+所有权的概念与 C++ 特有的那句口号“资源获取即初始化（Resource Allocation Is Initialization）”紧密绑定，你经常会看到它被缩写为 RAII。（那个笨重的缩写本应更贴切地叫做“资源释放即销毁（Resource Freeing Is Destruction）”，但那个首字母缩写已经被占用了。）
+
+标准容器类的目标，是提供对某一堆数据对象 \texttt{B} 的访问，同时确保这些对象的所有权始终是明确的——也就是说，容器总是拥有其数据元素的所有权。（反过来，一个迭代器，或者一对定义了某个范围的迭代器，从不拥有其数据元素；我们在第 3 章「迭代器对算法（The Iterator-Pair Algorithms）」中看到，诸如 \texttt{std::\allowbreak{}remove\_\allowbreak{}if} 这样的标准迭代器算法实际上从不释放任何元素，而是以各种方式对元素的值进行重排。）
+
+在本章余下的部分，我们将探索各种标准容器（container）类。
+
+\section{最简单的容器：\texttt{std::\allowbreak{}array<\allowbreak{}T,\allowbreak{} N>\allowbreak{}}}
+
+最简单的标准容器类是 \texttt{std::\allowbreak{}array<\allowbreak{}T,\allowbreak{} N>\allowbreak{}}，它的行为就像一个内置的（“C 风格”）数组。传给 \texttt{std::\allowbreak{}array} 的第一个模板参数表示数组元素的类型，第二个模板参数表示数组中元素的数量。这是标准库中极少数模板参数是一个整数值、而不是某个类型名称的地方之一。
+
+\myGraphic{0.9}{images/fig_p088_1.png}{}
+
+普通的 C 风格数组，作为核心语言的一部分（而且还是可以追溯到 20 世纪 70 年代的那一部分！），并不提供任何需要线性时间才能运行的内建操作。C 风格数组允许你用 \texttt{operator[]} 进行下标访问，并比较它们的地址，因为这些操作都可以在常数时间内完成；但如果你想把一个 C 风格数组的全部内容赋值给另一个，或者比较两个数组的内容，你会发现没法直接做到。你将不得不使用我们在第 3 章「迭代器对算法（The Iterator-Pair Algorithms）」中讨论过的某些标准算法，比如 \texttt{std::\allowbreak{}copy} 或 \texttt{std::\allowbreak{}equal}（函数模板 \texttt{std::\allowbreak{}swap} 本身已经是一个“算法”，对 C 风格数组是生效的。如果它不生效那就太遗憾了：）
+
+\begin{codebox}[cpp]
+    std::string c_style[4] = {
+      "the", "quick", "brown", "fox"
+    };
+    assert(c_style[2] == "brown");
+    assert(std::size(c_style) == 4);
+    assert(std::distance(std::begin(c_style), std::end(c_style)) == 4);
+    // 通过 operator= 进行拷贝是不被支持的。
+    std::string other[4];
+    std::copy(std::begin(c_style), std::end(c_style), std::begin(other));
+    // 交换是被支持的……当然，是线性时间。
+    using std::swap;
+    swap(c_style, other);
+    // 比较不被支持；你必须使用某个标准算法。
+    // 更糟的是，operator== 做了“错误”的事：地址比较！
+    assert(c_style != other);
+    assert(std::equal(
+      c_style, c_style + 4,
+      other, other + 4
+    ));
+    assert(!std::lexicographical_compare(
+      c_style, c_style + 4,
+      other, other + 4
+    ));
+\end{codebox}
+
+\texttt{std::\allowbreak{}array} 的行为就像一个 C 风格数组，但带有更多的语法糖。它提供了 \texttt{.begin(\allowbreak{})\allowbreak{}} 和 \texttt{.end(\allowbreak{})\allowbreak{}} 成员函数；并且重载了 \texttt{=}、\texttt{==} 和 \texttt{<} 运算符，使它们去做符合直觉的事情。所有这些操作仍然需要花费与数组大小成线性关系的时间，因为它们必须逐个遍历数组，一次复制（或交换，或比较）一个元素。
+
+关于 \texttt{std::\allowbreak{}array} 有一个槽点（你会在其中几个标准容器类上反复看到），那就是：当你用一组花括号里的初始化列表来构造一个 \texttt{std::\allowbreak{}array} 时，你实际上需要写两层花括号。一层是给类型为 \texttt{std::\allowbreak{}array<\allowbreak{}T,\allowbreak{} N>\allowbreak{}} 的“外层对象”用的，另一层是给类型为 \texttt{T[N]} 的“内层数据成员”用的。乍一接触这有点烦人，但只要你用过几次，这种双层花括号的写法很快就会变成你的本能：
+
+\begin{codebox}[cpp]
+    std::array<std::string, 4> arr = {{
+      "the", "quick", "brown", "fox"
+    }};
+    assert(arr[2] == "brown");
+    // .begin()、.end() 和 .size() 都已提供。
+    assert(arr.size() == 4);
+    assert(std::distance(arr.begin(), arr.end()) == 4);
+    // 通过 operator= 进行拷贝是被支持的……线性时间。
+    std::array<std::string, 4> other;
+    other = arr;
+    // 交换同样被支持……线性时间。
+    using std::swap;
+    swap(arr, other);
+    // operator== 做自然的事：值比较！
+    assert(&arr != &other); // The arrays have different addresses...
+    assert(arr == other); // ...but still compare lexicographically equal.
+    assert(arr >= other); // Relational operators are also supported.
+\end{codebox}
+
+\texttt{std::\allowbreak{}array} 的另一个好处是你可以从函数中返回它，而这一点对 C 风格数组是做不到的：
+
+\begin{codebox}[cpp]
+    // 你不能从函数中返回 C 风格数组。
+    // auto cross_product(const int (&a)[3], const int (&b)[3]) -> int[3];
+    // 但你可以返回 std::array。
+    auto cross_product(const std::array<int, 3>& a,
+     const std::array<int, 3>& b) -> std::array<int, 3>
+    {
+      return {{
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+      }};
+    }
+\end{codebox}
+
+因为 \texttt{std::\allowbreak{}array} 拥有拷贝构造函数和拷贝赋值运算符，你也可以把它们存进容器里：例如，\texttt{std::\allowbreak{}vector<\allowbreak{}std::\allowbreak{}array<\allowbreak{}int,\allowbreak{} 3>\allowbreak{}>} 是没问题的，而 \texttt{std::\allowbreak{}vector<\allowbreak{}int[3]>} 则行不通。
+
+然而，如果你发现自己经常地从函数返回数组、或者经常把数组存进容器，你就应该考虑一下“数组”是否真的是适合你需求的抽象。把它封装进某种类类型中会不会更合适？
+
+在我们的 \texttt{cross\_\allowbreak{}product} 例子中，把“三个整数的数组”封装进一个类类型被证明是个极好的主意。这不但让我们能给各个成员命名（\texttt{x}、\texttt{y} 和 \texttt{z}），而且我们还能更轻松地初始化 \texttt{Vec3} 类类型的对象（不必再写第二层花括号！），并且——对于我们未来的理智而言或许最为重要——我们可以避免去定义那些对我们的数学领域而言实际上毫无意义的比较运算符，比如 \texttt{operator<}。使用 \texttt{std::\allowbreak{}array} 时，我们不得不面对这样一个事实：数组 \texttt{\{1,\allowbreak{} 2,\allowbreak{} 3\}} 会“小于”数组 \texttt{\{1,\allowbreak{} 3,\allowbreak{} -9\}}——但当我们定义自己的 \texttt{class Vec3} 时，我们完全可以只字不提 \texttt{operator<}，从而确保没人会在数学语境中意外地误用它：
+
+\begin{codebox}[cpp]
+    struct Vec3 {
+      int x, y, z;
+      Vec3(int x, int y, int z) : x(x), y(y), z(z) {}
+    };
+    bool operator==(const Vec3& a, const Vec3& b) {
+      return std::tie(a.x, a.y, a.z) ==
+         std::tie(b.x, b.y, b.z);
+    }
+    bool operator!=(const Vec3& a, const Vec3& b) {
+      return !(a == b);
+    }
+    // 运算符 < <= > >= 对 Vec3 没有意义
+    Vec3 cross_product(const Vec3& a, const Vec3& b) {
+      return {
+        a.y * b.z - a.z * b.y,
+        a.z * b.x - a.x * b.z,
+        a.x * b.y - a.y * b.x,
+      };
+    }
+\end{codebox}
+
+\texttt{std::\allowbreak{}array} 把它的元素存放在自身内部。因此，\texttt{sizeof (\allowbreak{}std::\allowbreak{}array<\allowbreak{}int,\allowbreak{} 100>\allowbreak{})\allowbreak{}} 等于 \texttt{sizeof (\allowbreak{}int[100])\allowbreak{}}，也等于 \texttt{100 * sizeof (\allowbreak{}int)\allowbreak{}}。千万不要犯把巨型数组当作局部变量放到栈上的错误！
+
+\begin{codebox}[cpp]
+    void dont_do_this()
+    {
+      // 这个变量占用了 4 兆字节的栈空间——
+      // 足以爆掉你的栈并引发段错误（segmentation fault）！
+      int arr[1'000'000];
+    }
+    void dont_do_this_either()
+    {
+      // 把它改成 C++ 的 std::array 并不能解决这个问题。
+      std::array<int, 1'000'000> arr;
+    }
+\end{codebox}
+
+处理“巨型数组”的任务，要交给我们清单上的下一个容器：\texttt{std::\allowbreak{}vector}。
+
+\section{主力容器：\texttt{std::\allowbreak{}vector<\allowbreak{}T>\allowbreak{}}}
+
+\texttt{std::\allowbreak{}vector} 表示一段连续的数据元素数组，但它分配在堆（heap）上，而不是栈上。这相比 \texttt{std::\allowbreak{}array} 有两方面改进：首先，它让我们能够创建一个真正巨大的数组而不至于爆栈。其次，它让我们能够动态地调整底层数组的大小——不像 \texttt{std::\allowbreak{}array<\allowbreak{}int,\allowbreak{} 3>\allowbreak{}}，数组的大小是类型中不可变的一部分，而一个 \texttt{std::\allowbreak{}vector<\allowbreak{}int>\allowbreak{}} 并没有内在的大小。向量的 \texttt{.size(\allowbreak{})\allowbreak{}} 方法实际上会给出关于向量当前状态的有用信息。
+
+一个 \texttt{std::\allowbreak{}vector} 还有一个显著的属性：它的容量（capacity）。向量的容量总是至少和它的大小一样大，它表示在需要重新分配底层数组之前，该向量当前能够容纳的元素数量：
+
+\myGraphic{0.9}{images/fig_p092_1.png}{}
+
+除了可调整大小这一点之外，\texttt{vector} 的行为与 \texttt{array} 类似。和数组一样，向量是可拷贝的（以线性时间拷贝其全部数据元素），也是可比较的（\texttt{std::\allowbreak{}vector<\allowbreak{}T>\allowbreak{}::\allowbreak{}operator<} 会委托给 \texttt{T::\allowbreak{}operator<}，从而报告操作数的字典序）。
+
+一般来说，\texttt{std::\allowbreak{}vector} 是整个标准库中使用最频繁的容器。任何时候，当你需要存储“很多”元素（或者“我不确定我有多少元素”）时，你的第一反应都应该是使用一个向量。为什么？因为向量给了你一个可调整大小的容器所具备的全部灵活性，同时又不失连续数组的全部简洁与高效。
+
+连续数组是（在典型硬件上）最高效的数据结构，因为它们提供了良好的局部性（locality），也就是所谓的“缓存友好性（cache-friendliness）”。当你顺着向量从 \texttt{.begin(\allowbreak{})\allowbreak{}} 遍历到 \texttt{.end(\allowbreak{})\allowbreak{}} 时，你也是在顺着内存顺序遍历，这意味着计算机的硬件能够以极高的准确度预测你接下来要查看的那块内存。相比之下，在一个链表中，从 \texttt{.begin(\allowbreak{})\allowbreak{}} 遍历到 \texttt{.end(\allowbreak{})\allowbreak{}} 很可能涉及到在地址空间中到处跟随指针，并以毫无章法的顺序访问内存位置。在链表里，你访问的几乎每一个地址都和前一个地址毫无关联，因此它们中没有一个会处在 CPU 的缓存中。而在向量（或数组）中，情况恰恰相反：你访问的每一个地址都通过简单的线性关系与前一个地址相关联，于是 CPU 就能在你用到那些值之前，把它们全部准备好并等着你取用。
+
+即便你的数据比一个简单的“值列表”要“更有结构”，你也常常可以凑合着用一个向量来存储它。我们将在本章临近结尾的地方看到，如何用向量来模拟一个栈或优先队列。
+
+\subsection{调整 std::vector 的大小}
+
+\texttt{std::\allowbreak{}vector} 有一整套与增删元素有关的成员函数。这些成员函数在 \texttt{std::\allowbreak{}array} 中并不存在，因为 \texttt{std::\allowbreak{}array} 不可调整大小；但它们在我们本章要讨论的大多数其他容器中都存在。所以现在就熟悉它们是好主意。
+
+让我们从 \texttt{vector} 本身特有的两个原语操作开始：\texttt{.resize(\allowbreak{})\allowbreak{}} 和 \texttt{.reserve(\allowbreak{})\allowbreak{}}。
+
+\texttt{vec.\allowbreak{}reserve(\allowbreak{}c)\allowbreak{}} 更新向量的容量——它为底层数组中多达 \texttt{c} 个元素（总共）“预留”出空间。如果 \texttt{c <= vec.\allowbreak{}capacity(\allowbreak{})\allowbreak{}}，那么什么也不会发生；但如果 \texttt{c > vec.\allowbreak{}capacity(\allowbreak{})\allowbreak{}}，那么向量就不得不重新分配它的底层数组。
+
+重新分配遵循一个等价于下面这样的算法：
+
+\begin{codebox}[cpp]
+    template<typename T>
+    inline void destroy_n_elements(T *p, size_t n)
+    {
+      for (size_t i = 0; i < n; ++i) {
+        p[i].~T();
+      }
+    }
+    template<typename T>
+    class vector {
+      T *ptr_ = nullptr;
+      size_t size_ = 0;
+      size_t capacity_ = 0;
+      public:
+      // ...
+      void reserve(size_t c) {
+        if (capacity_ >= c) {
+          // 什么都不做
+          return;
+        }
+        // 暂时，我们先忽略这个问题：
+        // “如果 malloc 失败怎么办？”
+        T *new_ptr = (T *)malloc(c * sizeof (T));
+        for (size_t i=0; i < size_; ++i) {
+          if constexpr (std::is_nothrow_move_constructible_v<T>) {
+            // 如果元素可以被移动而无需承担
+            // 抛出异常的风险，那我们就移动这些元素。
+            ::new (&new_ptr[i]) T(std::move(ptr_[i]));
+          } else {
+            // 如果移动元素可能会抛出异常，
+            // 那么移动就不安全。先拷贝这些元素，
+            // 直到我们确信已经成功；然后再销毁
+            // 旧的元素。
+            try {
+              ::new (&new_ptr[i]) T(ptr_[i]);
+            } catch (...) {
+              destroy_n_elements(new_ptr, i);
+              free(new_ptr);
+              throw;
+            }
+          }
+        }
+        // 在成功地移动或拷贝了元素之后，
+        // 销毁旧数组，并让 ptr_ 指向新的数组。
+        destroy_n_elements(ptr_, size_);
+        free(ptr_);
+        ptr_ = new_ptr;
+        capacity_ = c;
+      }
+      ~vector() {
+        destroy_n_elements(ptr_, size_);
+        free(ptr_);
+      }
+    };
+\end{codebox}
+
+如果你是一路按次序读这本书的，你或许会认出，这个 \texttt{.reserve(\allowbreak{})\allowbreak{}} 函数里那个关键的 for 循环，与我们在第 3 章「迭代器对算法（The Iterator-Pair Algorithms）」中见过的 \texttt{std::\allowbreak{}uninitialized\_\allowbreak{}copy(\allowbreak{}a,\allowbreak{}b,\allowbreak{}c)\allowbreak{}} 的实现非常相似。的确，如果你要在一个并非“分配器感知（allocator-aware）”的容器上实现 \texttt{.reserve(\allowbreak{})\allowbreak{}}（见第 8 章「分配器（Allocators）」），你或许会复用那个标准算法：
+
+\begin{codebox}[cpp]
+    // 如果元素可以被移动而无需承担
+    // 抛出异常的风险，那我们就移动这些元素。
+    std::conditional_t<
+      std::is_nothrow_move_constructible_v<T>,
+      std::move_iterator<T*>,
+      T*
+      > first(ptr_);
+    try {
+      // 通过一个标准算法来移动或拷贝元素。
+      std::uninitialized_copy(first, first + size_, new_ptr);
+    } catch (...) {
+      free(new_ptr);
+      throw;
+    }
+    // 在成功地移动或拷贝了元素之后，
+    // 销毁旧数组，并让 ptr_ 指向新的数组。
+    std::destroy(ptr_, ptr_ + size_);
+    free(ptr_);
+    ptr_ = new_ptr;
+    capacity_ = c;
+\end{codebox}
+
+\texttt{vec.\allowbreak{}resize(\allowbreak{}s)\allowbreak{}} 改变向量的大小——它把元素从向量的末尾砍掉（在此过程中调用它们的析构函数），或者向向量中添加额外的元素（默认-
+
+构造它们），直到向量的大小等于 \texttt{s}。若 \texttt{s > vec.\allowbreak{}capacity(\allowbreak{})\allowbreak{}}，那么向量就必须像 \texttt{.reserve(\allowbreak{})\allowbreak{}} 情形那样重新分配其底层数组。你可能已经注意到，当向量重新分配底层数组时，元素会改变地址：重新分配前 \texttt{vec[0]} 的地址与重新分配后 \texttt{vec[0]} 的地址并不相同。任何指向向量旧元素的指针都会变成「悬垂指针（dangling pointer）」。而由于 \texttt{std::\allowbreak{}vector::\allowbreak{}iterator} 本质上也只是一个指针，任何指向向量旧元素的迭代器也会随之失效。这种现象称为迭代器失效（iterator invalidation），它是 C++ 代码中 bug 的重要来源。当你同时处理迭代器并对向量调整大小时，千万要当心！
+
+下面是几个经典的迭代器失效案例：
+
+\begin{codebox}[cpp]
+    std::vector<int> v = {3, 1, 4};
+    auto iter = v.begin();
+    v.reserve(6); // iter 已失效！
+    // 这看起来像是在产生结果
+    // {3, 1, 4, 3, 1, 4}；但如果第一次插入
+    // 触发了重新分配，那么下一次插入
+    // 就会从一个悬垂迭代器读取垃圾数据！
+    v = std::vector{3, 1, 4};
+    std::copy(
+      v.begin(),
+      v.end(),
+      std::back_inserter(v)
+    );
+\end{codebox}
+
+还有另一个案例，许多其他编程语言中也常遇到：在迭代容器的同时从中擦除元素，会产生难以察觉的 bug：
+
+\begin{codebox}[cpp]
+    auto end = v.end();
+    for (auto it = v.begin(); it != end; ++it) {
+      if (*it == 4) {
+        v.erase(it); // 错误！
+      }
+    }
+    // 每次循环都让向量重新获取其 .end()
+    // 确实能修复这个 bug……
+    for (auto it = v.begin(); it != v.end(); ) {
+      if (*it == 4) {
+        it = v.erase(it);
+      } else {
+        ++it;
+      }
+    }
+    // ……但使用「擦除—移除」惯用法
+    // 效率要高得多。
+    v.erase(
+      std::remove_if(v.begin(), v.end(), [](auto&& elt) {
+        return elt == 4;
+      }),
+      v.end()
+    );
+\end{codebox}
+
+\subsection{在 std::vector 中插入与擦除}
+
+\texttt{vec.\allowbreak{}push\_\allowbreak{}back(\allowbreak{}t)\allowbreak{}} 把一个元素添加到向量的末尾。没有对应的 \texttt{.push\_\allowbreak{}front(\allowbreak{})\allowbreak{}} 成员函数，因为正如本节开头示意图所示，没有高效的方式能把元素压入向量的前端。
+
+\texttt{vec.\allowbreak{}emplace\_\allowbreak{}back(\allowbreak{}args...)\allowbreak{}} 是一个完美转发的可变参数函数模板，行为类似 \texttt{.push\_\allowbreak{}back(\allowbreak{}t)\allowbreak{}}，区别在于：它不是在向量末尾放置 \texttt{t} 的一个副本，而是放置一个如同以 \texttt{T(\allowbreak{}args...)\allowbreak{}} 构造出来的 \texttt{T} 对象。
+
+\texttt{push\_\allowbreak{}back} 和 \texttt{emplace\_\allowbreak{}back} 都具有所谓的「均摊常数时间（amortized constant time）」性能。要理解这意味着什么，可以想一想：如果对一个朴素的向量连续调用一百次 \texttt{v.\allowbreak{}emplace\_\allowbreak{}back(\allowbreak{})\allowbreak{}}，会发生什么。每次调用时，向量都需要稍微变大一点；于是它重新分配底层数组，并把旧数组中的全部 \texttt{v.\allowbreak{}size(\allowbreak{})\allowbreak{}} 个元素移动到新数组。很快，你花在把旧数据搬来搬去上的时间，就会超过真正「压入」新数据的时间！
+
+幸运的是，\texttt{std::\allowbreak{}vector} 足够聪明，能避开这个陷阱。每当诸如 \texttt{v.\allowbreak{}emplace\_\allowbreak{}back(\allowbreak{})\allowbreak{}} 这样的操作触发重新分配时，向量不会只在新数组中为 \texttt{capacity(\allowbreak{})\allowbreak{} + 1} 个元素腾出空间，而是会为 \texttt{k * capacity(\allowbreak{})\allowbreak{}} 个元素腾出空间（其中 \texttt{k} 在 libc++ 与 libstdc++ 中为 2，在 Visual Studio 中约为 1.5）。因此，尽管随着向量增长，单次重新分配的开销越来越大，但每次 \texttt{push\_\allowbreak{}back} 所触发的重新分配次数却越来越少——于是平均来看，单次 \texttt{push\_\allowbreak{}back} 的代价是常数。这个技巧称为几何扩容（geometric resizing）。
+
+\texttt{vec.\allowbreak{}insert(\allowbreak{}it,\allowbreak{} t)\allowbreak{}} 在向量中间、由迭代器 \texttt{it} 指示的位置处插入一个元素。若 \texttt{it == vec.\allowbreak{}end(\allowbreak{})\allowbreak{}}，则等价于 \texttt{push\_\allowbreak{}back}；若 \texttt{it == vec.\allowbreak{}begin(\allowbreak{})\allowbreak{}}，则相当于一个简陋版的 \texttt{push\_\allowbreak{}front}。注意，只要你不是在向量末尾插入，底层数组中插入点之后的所有元素都会被向后移动以腾出空间；这可能代价高昂。
+
+一般来说，这些 \texttt{.insert(\allowbreak{})\allowbreak{}} 重载对你都没什么用处，但你可能仍想有所了解，以便在你不小心给 \texttt{.insert(\allowbreak{})\allowbreak{}} 传错参数、导致重载决议（overload resolution）最终选中的不是你期望的那个、而是其中某一个时，能够解读那些晦涩的错误信息（或晦涩的运行时 bug）：
+
+\begin{codebox}[cpp]
+    std::vector<int> v = {1, 2};
+    std::vector<int> w = {5, 6};
+    // 插入单个元素。
+    v.insert(v.begin() + 1, 3);
+    assert((v == std::vector{1, 3, 2}));
+    // 插入单个元素的 n 个副本。
+    v.insert(v.end() - 1, 3, 4);
+    assert((v == std::vector{1, 3, 4, 4, 4, 2}));
+    // 插入一整段元素范围。
+    v.insert(v.begin() + 3, w.begin(), w.end());
+    assert((v == std::vector{1, 3, 4, 5, 6, 4, 4, 2}));
+    // 插入一个花括号列表形式的元素。
+    v.insert(v.begin(), {7, 8});
+    assert((v == std::vector{7, 8, 1, 3, 4, 5, 6, 4, 4, 2}));
+\end{codebox}
+
+\texttt{vec.\allowbreak{}emplace(\allowbreak{}it,\allowbreak{} args...)\allowbreak{}} 之于 \texttt{insert}，正如 \texttt{emplace\_\allowbreak{}back} 之于 \texttt{push\_\allowbreak{}back}：它是那个 C++03 函数的完美转发版本。在可能的情况下，优先使用 \texttt{emplace} 和 \texttt{emplace\_\allowbreak{}back}，而非 \texttt{insert} 和 \texttt{push\_\allowbreak{}back}。
+
+\texttt{vec.\allowbreak{}erase(\allowbreak{}it)\allowbreak{}} 擦除向量中间、由迭代器 \texttt{it} 指示位置处的单个元素。还有一个双迭代器版本 \texttt{vec.\allowbreak{}erase(\allowbreak{}it,\allowbreak{} it)\allowbreak{}}，用于擦除一段连续的元素。注意这个双迭代器版本，正是我们在上一章的「擦除—移除」惯用法（erase-remove idiom）中所用的那个。
+
+若只想删除向量的最后一个元素，你可以用 \texttt{vec.\allowbreak{}erase(\allowbreak{}vec.\allowbreak{}end(\allowbreak{})\allowbreak{}-1)\allowbreak{}} 或 \texttt{vec.\allowbreak{}erase(\allowbreak{}vec.\allowbreak{}end(\allowbreak{})\allowbreak{}-1,\allowbreak{} vec.\allowbreak{}end(\allowbreak{})\allowbreak{})\allowbreak{}}；但由于这是常见操作，标准库以 \texttt{vec.\allowbreak{}pop\_\allowbreak{}back(\allowbreak{})\allowbreak{}} 的形式提供了一个同义写法。仅用 \texttt{std::\allowbreak{}vector} 的 \texttt{push\_\allowbreak{}back(\allowbreak{})\allowbreak{}} 和 \texttt{pop\_\allowbreak{}back(\allowbreak{})\allowbreak{}} 方法，你就能实现一个可动态增长的栈。
+
+\subsection{std::vector<bool> 的陷阱}
+
+\texttt{std::\allowbreak{}vector} 模板有一个特例：\texttt{std::\allowbreak{}vector<\allowbreak{}bool>\allowbreak{}}。由于 \texttt{bool} 数据类型只有两种可能取值，八个 \texttt{bool} 的值可以被打包进一个字节。\texttt{std::\allowbreak{}vector<\allowbreak{}bool>\allowbreak{}} 利用了这一优化，这意味着它占用的堆分配内存，比你自然预期的要少八倍。
+
+\myGraphic{0.9}{images/fig_p098_1.png}{}
+
+这种打包的代价在于，\texttt{vector<\allowbreak{}bool>\allowbreak{}::\allowbreak{}operator[]} 的返回类型不能是 \texttt{bool\&}，因为向量在任何地方都不存储真正的 \texttt{bool} 对象。因此，\texttt{operator[]} 返回的是一个定制类类型 \texttt{std::\allowbreak{}vector<\allowbreak{}bool>\allowbreak{}::\allowbreak{}reference}，它可转换为 \texttt{bool}，但其自身并不是 \texttt{bool}（这类类型常被称为「代理类型（proxy type）」或「代理引用（proxy reference）」）。
+
+\texttt{operator[] const} 的结果类型「官方」为 \texttt{bool}，但在实践中，某些库（尤其是 libc++）对 \texttt{operator[] const} 也返回代理类型。这意味着，使用 \texttt{vector<\allowbreak{}bool>\allowbreak{}} 的代码不仅微妙，有时还不可移植；如果能避开，我建议尽量避免使用 \texttt{vector<\allowbreak{}bool>\allowbreak{}}：
+
+\begin{codebox}[cpp]
+    std::vector<bool> vb = {true, false, true, false};
+    // vector<bool>::reference 有一个公开成员函数：
+    vb[3].flip();
+    assert(vb[3] == true);
+    // 下面这行无法通过编译！
+    // bool& oops = vb[0];
+    auto ref = vb[0];
+    assert((!std::is_same_v<decltype(ref), bool>));
+    assert(sizeof vb[0] > sizeof (bool));
+    if (sizeof std::as_const(vb)[0] == sizeof (bool)) {
+      puts("Your library vendor is libstdc++ or Visual Studio");
+    } else {
+      puts("Your library vendor is libc++");
+    }
+\end{codebox}
+
+\subsection{非 noexcept 移动构造函数的陷阱}
+
+回想一下「Resizing a std::vector」一节中 \texttt{vector::\allowbreak{}resize(\allowbreak{})\allowbreak{}} 的实现。当向量重新调整大小时，它会重新分配底层数组，并把元素移动到新数组——除非元素类型不是「不抛异常的（nothrow）可移动构造的」，那样它就会改为拷贝元素！这意味着，若你不特意声明自己的移动构造函数为 \texttt{noexcept}，那么对你自定义类类型向量进行扩容就会被不必要地「悲观化（pessimized）」。
+
+请看下面这些类定义：
+
+\begin{codebox}[cpp]
+    struct Bad {
+      int x = 0;
+      Bad() = default;
+      Bad(const Bad&) { puts("copy Bad"); }
+      Bad(Bad&&) { puts("move Bad"); }
+    };
+    struct Good {
+      int x = 0;
+      Good() = default;
+      Good(const Good&) { puts("copy Good"); }
+      Good(Good&&) noexcept { puts("move Good"); }
+    };
+    class ImplicitlyGood {
+      std::string x;
+      Good y;
+    };
+    class ImplicitlyBad {
+      std::string x;
+      Bad y;
+    };
+\end{codebox}
+
+我们可以用如下这样的测试脚手架（test harness），单独测试这些类的行为。运行 \texttt{test(\allowbreak{})\allowbreak{}} 会打印出「copy Bad——move Good——copy Bad——move Good」。真是恰如其分的箴言！
+
+\begin{codebox}[cpp]
+    template<class T>
+    void test_resizing()
+    {
+      std::vector<T> vec(1);
+      // 强制向量重新分配。
+      vec.resize(vec.capacity() + 1);
+    }
+    void test()
+    {
+      test_resizing<Good>();
+      test_resizing<Bad>();
+      test_resizing<ImplicitlyGood>();
+      test_resizing<ImplicitlyBad>();
+    }
+\end{codebox}
+
+这是一个微妙而晦涩的要点，但在实践中会对你的 C++ 代码效率产生重大影响。一条很好的经验法则（rule of thumb）是：每当你声明自己的移动构造函数或 \texttt{swap} 函数时，务必将其声明为 \texttt{noexcept}。
+
+\section{快速的混合体：std::deque<T>}
+
+与 \texttt{std::\allowbreak{}vector} 类似，\texttt{std::\allowbreak{}deque} 呈现的是连续数组的接口——它支持随机访问，并且其元素被存储在连续的块中，以便对缓存友好。但与 \texttt{vector} 不同，它的元素只是「按块」连续。一个 \texttt{deque} 由任意数量的「块（chunk）」组成，每块包含固定数量的元素。在容器的任意一端插入更多元素代价都很低廉；在中间插入元素则依然代价高昂。在内存中，它大致如下所示：
+
+\myGraphic{0.9}{images/fig_p101_1.png}{}
+
+\texttt{std::\allowbreak{}deque<\allowbreak{}T>\allowbreak{}} 暴露了与 \texttt{std::\allowbreak{}vector<\allowbreak{}T>\allowbreak{}} 完全相同的成员函数，包括重载的 \texttt{operator[]}。除了向量已有的 \texttt{push\_\allowbreak{}back} 和 \texttt{pop\_\allowbreak{}back} 方法外，\texttt{deque} 还提供了高效的 \texttt{push\_\allowbreak{}front} 和 \texttt{pop\_\allowbreak{}front}。
+
+注意，当你反复向向量 \texttt{push\_\allowbreak{}back} 时，最终会触发底层数组的重新分配，从而令你所有的迭代器以及对容器内元素的指针和引用全部失效。对于 \texttt{deque}，迭代器失效依然会发生，但除非你在 \texttt{deque} 中间插入或擦除元素（此时 \texttt{deque} 的一端或另一端必须向外移动以腾出空间，或向内移动以填补空缺），否则单个元素永远不会改动自己的地址：
+
+\begin{codebox}[cpp]
+    std::vector<int> vec = {1, 2, 3, 4};
+    std::deque<int> deq = {1, 2, 3, 4};
+    int *vec_p = &vec[2];
+    int *deq_p = &deq[2];
+    for (int i=0; i < 1000; ++i) {
+      vec.push_back(i);
+      deq.push_back(i);
+    }
+    assert(vec_p != &vec[2]);
+    assert(deq_p == &deq[2]);
+\end{codebox}
+
+\texttt{std::\allowbreak{}deque<\allowbreak{}T>\allowbreak{}} 的另一个优势是，不存在针对 \texttt{std::\allowbreak{}deque<\allowbreak{}bool>\allowbreak{}} 的特化；无论 \texttt{T} 是什么，该容器都呈现统一的公开接口。
+
+\texttt{std::\allowbreak{}deque<\allowbreak{}T>\allowbreak{}} 的劣势在于，其迭代器的自增与解引用开销明显更大，因为它们必须在下图所示的指针数组中穿梭导航。这一劣势相当显著，因此除非你恰好需要在容器两端都进行快速插入与删除，否则坚持使用 \texttt{vector} 才是合理的选择。
+
+\section{一身绝技：std::list<T>}
+
+容器 \texttt{std::\allowbreak{}list<\allowbreak{}T>\allowbreak{}} 在内存中表示一个链表。示意地看，它如下图所示：
+
+\myGraphic{0.9}{images/fig_p102_1.png}{}
+
+注意，链表中的每个节点都包含指向其「下一个」与「上一个」节点的指针，因此这是一个双向链表。双向链表的益处在于，其迭代器可以在链表中向前和向后移动——也就是说，\texttt{std::\allowbreak{}list<\allowbreak{}T>\allowbreak{}::\allowbreak{}iterator} 是一种双向迭代器（bidirectional iterator），但它不是随机访问迭代器；要到达链表中的第 n 个元素，仍然需要 $O(n)$ 的时间。
+
+\texttt{std::\allowbreak{}list} 支持与 \texttt{std::\allowbreak{}vector} 许多相同的操作，那些需要随机访问的操作（例如 \texttt{operator[]}）除外。它有能力为链表前端添加压入与弹出的成员函数，因为在链表上压入和弹出并不需要昂贵的移动操作。
+
+一般来说，\texttt{std::\allowbreak{}list} 的性能远不及 \texttt{std::\allowbreak{}vector} 或 \texttt{std::\allowbreak{}deque} 这样的连续数据结构，因为沿指针去访问「随机」分配到的地址，比沿指针访问连续内存块更不利于缓存。因此，你应当把 \texttt{std::\allowbreak{}list} 视为一种通常不受欢迎的容器；只有当你的确需要它比 \texttt{vector} 做得更好的某件事时，才该把它从工具箱里拿出来。
+
+\subsection{std::list 有哪些绝技？}
+
+首先，链表不存在迭代器失效的问题！\texttt{lst.\allowbreak{}push\_\allowbreak{}back(\allowbreak{}v)\allowbreak{}} 与 \texttt{lst.\allowbreak{}push\_\allowbreak{}front(\allowbreak{}v)\allowbreak{}} 始终以常数时间运行，并且永远不需要「调整大小」或「移动」任何数据。
+
+其次，许多在 \texttt{vector} 上代价高昂、或需要外部存储（「临时空间」）的可变操作，对链表而言变得廉价。下面是一些例子：
+
+\texttt{lst.\allowbreak{}splice(\allowbreak{}it,\allowbreak{} otherlst)\allowbreak{}} 把 \texttt{otherlst} 的整个内容「拼接（splice）」进 \texttt{lst}，如同反复调用 \texttt{lst.\allowbreak{}insert(\allowbreak{}it++,\allowbreak{} other\_\allowbreak{}elt)\allowbreak{}}；区别在于，那些「被插入」的节点实际上是被从右侧的 \texttt{otherlst} 盗取而来。整个拼接操作只需进行几次指针交换即可完成。此操作之后，\texttt{otherlst.\allowbreak{}size(\allowbreak{})\allowbreak{} == 0}。
+
+\texttt{lst.\allowbreak{}merge(\allowbreak{}otherlst)\allowbreak{}} 同样只通过指针交换就把 \texttt{otherlst} 倒空、并入 \texttt{lst}，但效果是「合并有序链表」。例如：
+
+\begin{codebox}[cpp]
+    std::list<int> a = {3, 6};
+    std::list<int> b = {1, 2, 3, 5, 6};
+    a.merge(b);
+    assert(b.empty());
+    assert((a == std::list{1, 2, 3, 3, 5, 6, 6}));
+\end{codebox}
+
+与所有涉及比较的 STL 操作一样，它也存在一个接受比较器的版本：\texttt{lst.\allowbreak{}merge(\allowbreak{}otherlst,\allowbreak{} less)\allowbreak{}}。
+
+另一个只能靠指针交换来完成的操作，是就地反转链表：\texttt{lst.\allowbreak{}reverse(\allowbreak{})\allowbreak{}} 会把所有「下一个」与「上一个」链接对调，使得链表的头部变成尾部，反之亦然。
+
+注意，所有这些操作都是就地修改链表，并且通常返回 \texttt{void}。
+
+链表中另一类廉价（但在连续容器中不廉价）的操作是元素移除。回想第 3 章「The Iterator-Pair Algorithms」，标准库提供了诸如 \texttt{std::\allowbreak{}remove\_\allowbreak{}if} 和 \texttt{std::\allowbreak{}unique} 这样的算法，供连续容器使用；这些算法会把「被移除」的元素搅动到容器末尾，从而能一次性通过 \texttt{erase(\allowbreak{})\allowbreak{}} 剔除。
+
+对 \texttt{std::\allowbreak{}list} 而言，搅动元素比直接就地擦除它们更昂贵。因此，\texttt{std::\allowbreak{}list} 提供了以下成员函数，其名称不幸地与非擦除版的 STL 算法十分相似：
+
+\texttt{lst.\allowbreak{}remove(\allowbreak{}v)\allowbreak{}} 移除并擦除所有等于 \texttt{v} 的元素。
+
+\texttt{lst.\allowbreak{}remove\_\allowbreak{}if(\allowbreak{}p)\allowbreak{}} 移除并擦除所有满足一元谓词（unary predicate） \texttt{p(\allowbreak{}e)\allowbreak{}} 的元素 \texttt{e}。
+
+\texttt{lst.\allowbreak{}unique(\allowbreak{})\allowbreak{}} 移除并擦除每一段连续相等元素中除第一个之外的所有元素。与所有涉及比较的 STL 操作一样，它也存在一个接受比较器的版本：\texttt{lst.\allowbreak{}unique(\allowbreak{}eq)\allowbreak{}} 会在满足 \texttt{p(\allowbreak{}e1,\allowbreak{} e2)\allowbreak{}} 时移除并擦除 \texttt{e2}。
+
+\texttt{lst.\allowbreak{}sort(\allowbreak{})\allowbreak{}} 就地对链表排序。这一点特别有用，因为重排算法（permutative algorithm） \texttt{std::\allowbreak{}sort(\allowbreak{}ctr.\allowbreak{}begin(\allowbreak{})\allowbreak{},\allowbreak{} ctr.\allowbreak{}end(\allowbreak{})\allowbreak{})\allowbreak{}} 在不可随机访问的 \texttt{std::\allowbreak{}list::\allowbreak{}iterator} 上无法工作。
+
+奇怪的是，\texttt{lst.\allowbreak{}sort(\allowbreak{})\allowbreak{}} 只能对整个容器排序，而不能像 \texttt{std::\allowbreak{}sort} 那样接受一个子范围。但如果你只想对 \texttt{lst} 的一个子范围排序，可以——跟我一起说——只需几次指针交换就能办到！
+
+\begin{codebox}[cpp]
+    std::list<int> lst = {3, 1, 4, 1, 5, 9, 2, 6, 5};
+    auto begin = std::next(lst.begin(), 2);
+    auto end = std::next(lst.end(), -2);
+    // 只排序范围 [begin, end)
+    std::list<int> sub;
+    sub.splice(sub.begin(), lst, begin, end);
+    sub.sort();
+    lst.splice(end, sub);
+    assert(sub.empty());
+    assert((lst == std::list{3, 1, 1, 2, 4, 5, 9, 6, 5}));
+\end{codebox}
+
+\section{将就使用 std::forward\_\allowbreak{}list<T>}
+
+标准容器 \texttt{std::\allowbreak{}forward\_\allowbreak{}list<\allowbreak{}T>\allowbreak{}} 是一种与 \texttt{std::\allowbreak{}list} 类似的链表，但提供的便利功能更少——无法获取其大小，也无法反向迭代。它在内存中的形态与 \texttt{std::\allowbreak{}list<\allowbreak{}T>\allowbreak{}} 相似，但节点更小：
+
+\myGraphic{0.9}{images/fig_p105_1.png}{}
+
+尽管如此，\texttt{std::\allowbreak{}forward\_\allowbreak{}list} 几乎保留了 \texttt{std::\allowbreak{}list} 的全部「绝技」。它唯一无法完成的操作是 \texttt{splice}（因为它涉及在给定迭代器「之前」插入）和 \texttt{push\_\allowbreak{}back}（因为它涉及在常数时间内找到链表末尾）。
+
+\texttt{forward\_\allowbreak{}list} 用 \texttt{\_\allowbreak{}after} 版本来替代这些缺失的成员函数：\texttt{flst.\allowbreak{}erase\_\allowbreak{}after(\allowbreak{}it)\allowbreak{}} 用于擦除给定位置之后的元素；\texttt{flst.\allowbreak{}insert\_\allowbreak{}after(\allowbreak{}it,\allowbreak{} v)\allowbreak{}} 用于在给定位置之后插入一个新元素；\texttt{flst.\allowbreak{}splice\_\allowbreak{}after(\allowbreak{}it,\allowbreak{} otherflst)\allowbreak{}} 用于插入 \texttt{otherflst} 的元素
+
+在给定位置之后。与 \texttt{std::\allowbreak{}list} 一样，除非确实需要 \texttt{forward\_\allowbreak{}list} 特有的那一套能力，否则你应当完全避免使用它。
+
+\section{用 \texttt{std::\allowbreak{}stack<\allowbreak{}T>\allowbreak{}} 和 \texttt{std::\allowbreak{}queue<\allowbreak{}T>\allowbreak{}} 抽象}
+
+我们已经见识过三种不同的标准库容器，它们都带有成员函数 \texttt{push\_\allowbreak{}back(\allowbreak{})\allowbreak{}}、\texttt{pop\_\allowbreak{}back(\allowbreak{})\allowbreak{}}（另外，虽然我们之前没有提到，还有 \texttt{back(\allowbreak{})\allowbreak{}}，用于取回容器最后一个元素的引用）。如果想自己实现一个栈（stack）数据结构，这些恰好就是我们需要的操作。
+
+标准库提供了一种便捷的方式来抽象「栈」这个概念，对应的容器就是（还能有谁呢？）\texttt{std::\allowbreak{}stack}。不过，与我们之前见过的容器不同的是，\texttt{std::\allowbreak{}stack} 多带了一个模板参数。
+
+\texttt{std::\allowbreak{}stack<\allowbreak{}T,\allowbreak{} Ctr>\allowbreak{}} 表示一个元素类型为 \texttt{T} 的栈，其底层存储由一个 \texttt{Ctr} 容器类型的实例来管理。例如，\texttt{stack<\allowbreak{}T,\allowbreak{} vector<\allowbreak{}T>\allowbreak{}>} 用向量（vector）来管理元素，\texttt{stack<\allowbreak{}T,\allowbreak{} list<\allowbreak{}T>\allowbreak{}>} 用链表（list）来管理，依此类推。模板参数 \texttt{Ctr} 的默认值其实是 \texttt{std::\allowbreak{}deque<\allowbreak{}T>\allowbreak{}}；你可能还记得，\texttt{deque} 占用的内存比 \texttt{vector} 多，但它有个好处：永远不需要对其底层数组重新分配内存，也不需要在插入后移动元素。
+
+要与 \texttt{std::\allowbreak{}stack<\allowbreak{}T,\allowbreak{} Ctr>\allowbreak{}} 交互，你只能使用这几个操作：\texttt{push}（对应底层容器的 \texttt{push\_\allowbreak{}back}）、\texttt{pop}（对应 \texttt{pop\_\allowbreak{}back}）、\texttt{top}（对应 \texttt{back}），以及 \texttt{size}、\texttt{empty} 等少数访问函数：
+
+\begin{codebox}[cpp]
+    std::stack<int> stk;
+    stk.push(3); stk.push(1); stk.push(4);
+    assert(stk.top() == 4);
+    stk.pop();
+    assert(stk.top() == 1);
+    stk.pop();
+    assert(stk.top() == 3);
+\end{codebox}
+
+\texttt{std::\allowbreak{}stack} 有一个古怪的特性：它支持比较运算符 \texttt{==}、\texttt{!=}、\texttt{<}、\texttt{<=}、\texttt{>} 和 \texttt{>=}；而且这些运算符是通过比较底层容器来工作的（使用底层容器类型自己所定义的语义）。由于底层容器类型通常是按字典序比较的，结果就是：比较两个栈时，是按「从底到顶」的字典序来比较的。
+
+\begin{codebox}[cpp]
+    std::stack<int> a, b;
+    a.push(3); a.push(1); a.push(4);
+    b.push(2); b.push(7);
+    assert(a != b);
+    assert(a.top() < b.top()); // 即 4 < 7
+    assert(a > b); // 因为 3 > 2
+\end{codebox}
+
+如果你只用 \texttt{==} 和 \texttt{!=}，或者依赖 \texttt{operator<} 来为 \texttt{std::\allowbreak{}set} 或 \texttt{std::\allowbreak{}map} 产生一致的排序，那倒没什么问题；不过你第一次见到这种行为时，肯定会感到意外！
+
+标准库同样为「队列（queue）」提供了抽象。\texttt{std::\allowbreak{}queue<\allowbreak{}T,\allowbreak{} Ctr>\allowbreak{}} 暴露了 \texttt{push\_\allowbreak{}back} 和 \texttt{pop\_\allowbreak{}front} 方法（对应底层容器的 \texttt{push\_\allowbreak{}back} 和 \texttt{pop\_\allowbreak{}front}），以及 \texttt{front}、\texttt{back}、\texttt{size}、\texttt{empty} 等少数访问函数。
+
+既然这个容器必须尽可能高效地支持这些基本操作，你应该能猜到 \texttt{Ctr} 的默认值是什么。没错，就是 \texttt{std::\allowbreak{}deque<\allowbreak{}T>\allowbreak{}}，那个低开销的双端队列（deque）。
+
+请注意，如果你要从零开始用 \texttt{std::\allowbreak{}deque<\allowbreak{}T>\allowbreak{}} 实现一个队列，你可以选择从双端队列的前端压入、从后端弹出，或者从后端压入、从前段弹出。标准的 \texttt{std::\allowbreak{}queue<\allowbreak{}T,\allowbreak{} std::\allowbreak{}deque<\allowbreak{}T>\allowbreak{}>} 特意选择了从后端压入、从前段弹出，只要想想现实世界中的「队列」就不难记住。当你在售票窗口或食堂排队（queue）时，你从队尾加入，轮到你到了队首才会被服务——反过来绝无可能！选择那些技术含义能准确映射现实对应物的技术术语（例如 \texttt{queue}、\texttt{front}、\texttt{back}），是一种很有用的技艺。
+
+\section{有用的适配器：\texttt{std::\allowbreak{}priority\_\allowbreak{}queue<\allowbreak{}T>\allowbreak{}}}
+
+在第 3 章「迭代器对算法」中，我们介绍了「堆（heap）」算法族：\texttt{make\_\allowbreak{}heap}、\texttt{push\_\allowbreak{}heap} 和 \texttt{pop\_\allowbreak{}heap}。你可以利用这些算法，赋予一段元素范围（range）最大堆（max-heap）性质。如果你始终维护数据的最大堆性质作为一个不变式（invariant），就得到了一个通常称为优先队列（priority queue）的数据结构。在数据结构的教科书里，优先队列常被画成某种二叉树，但正如我们在第 3 章「迭代器对算法」中所见，最大堆性质并不要求一个显式的、基于指针的树结构。
+
+标准库容器 \texttt{std::\allowbreak{}priority\_\allowbreak{}queue<\allowbreak{}T,\allowbreak{} Ctr,\allowbreak{} Cmp>\allowbreak{}} 表示一个优先队列，它在内部表现为一个 \texttt{Ctr} 实例，其中 \texttt{Ctr} 的元素始终保持最大堆（max-heap）次序（由比较器（comparator）类型 \texttt{Cmp} 的一个实例来决定）。这种情况下 \texttt{Ctr} 的默认值就是 \texttt{std::\allowbreak{}vector<\allowbreak{}T>\allowbreak{}}。请记住，\texttt{vector} 是最高效的容器；\texttt{std::\allowbreak{}stack} 和 \texttt{std::\allowbreak{}queue} 之所以选择 \texttt{deque} 作为默认值，唯一的原因是它们不想在元素插入后再移动元素。但对于优先队列来说，元素一直在动——随着其他元素的插入或删除，在最大堆里上上下下地移动。因此，用 \texttt{deque} 作为底层容器并没有什么特别的好处；于是标准库遵循了我一直在像擂鼓一样反复强调的那条规则——除非有特定理由需要别的容器，否则就用 \texttt{std::\allowbreak{}vector}！
+
+\texttt{Cmp} 的默认值是标准库类型 \texttt{std::\allowbreak{}less<\allowbreak{}T>\allowbreak{}}，它代表 \texttt{operator<}。换句话说，\texttt{std::\allowbreak{}priority\_\allowbreak{}queue} 容器默认使用的比较器，与来自第 3 章「迭代器对算法」的 \texttt{std::\allowbreak{}push\_\allowbreak{}heap} 和 \texttt{std::\allowbreak{}pop\_\allowbreak{}heap} 算法相同。
+
+\texttt{std::\allowbreak{}priority\_\allowbreak{}queue<\allowbreak{}T,\allowbreak{} Ctr>\allowbreak{}} 暴露的成员函数是 \texttt{push}、\texttt{pop} 和 \texttt{top}。从概念上讲，底层容器前端的那个元素就位于堆的「顶部」。有一点要记住：在最大堆中，堆「顶」的元素是最大的那个——可以把这些元素想象成在玩「山大王（King of the Hill）」游戏，最大的那个胜出，最终留在堆顶。
+
+\texttt{pq.\allowbreak{}push(\allowbreak{}v)\allowbreak{}} 向优先队列中插入一个新元素，就仿佛在底层容器上调用了 \texttt{std::\allowbreak{}push\_\allowbreak{}heap(\allowbreak{})\allowbreak{}}。
+
+\texttt{pq.\allowbreak{}top(\allowbreak{})\allowbreak{}} 返回当前位于优先队列顶部的元素的引用，就仿佛在底层容器上调用了 \texttt{ctr.\allowbreak{}front(\allowbreak{})\allowbreak{}}。
+
+\texttt{pq.\allowbreak{}pop(\allowbreak{})\allowbreak{}} 弹出最大的元素并更新堆，就仿佛在底层容器上调用了 \texttt{std::\allowbreak{}pop\_\allowbreak{}heap(\allowbreak{})\allowbreak{}}。
+
+要想得到最小堆（min-heap）而非最大堆，只需反转你提供给 \texttt{priority\_\allowbreak{}queue} 模板的比较器的语义即可：
+
+\begin{codebox}[cpp]
+    std::priority_queue<int> pq1;
+    std::priority_queue<int, std::vector<int>, std::greater<>> pq2;
+    for (int v : {3, 1, 4, 1, 5, 9}) {
+      pq1.push(v);
+      pq2.push(v);
+    }
+    assert(pq1.top() == 9); // 默认是最大堆
+    assert(pq2.top() == 1); // 主动选择的最小堆
+\end{codebox}
+
+\section{树结构：\texttt{std::\allowbreak{}set<\allowbreak{}T>\allowbreak{}} 与 \texttt{std::\allowbreak{}map<\allowbreak{}K,\allowbreak{} V>\allowbreak{}}}
+
+类模板 \texttt{std::\allowbreak{}set<\allowbreak{}T>\allowbreak{}} 为任何实现了 \texttt{operator<} 的类型 \texttt{T}，提供了「唯一集合（unique set）」的接口。与所有涉及比较的 STL 操作一样，它也提供了一个接受比较器的版本：\texttt{std::\allowbreak{}set<\allowbreak{}T,\allowbreak{} Cmp>\allowbreak{}} 使用 \texttt{Cmp(\allowbreak{}a,\allowbreak{}b)\allowbreak{}} 而非 \texttt{(\allowbreak{}a < b)\allowbreak{}} 来对数据元素排序，从而提供「唯一集合」功能。
+
+\texttt{std::\allowbreak{}set} 在概念上是一棵二叉搜索树（binary search tree），类似于 Java 的 \texttt{Tree\allowbreak{}Set}。在所有流行的实现中，它具体是一棵红黑树（red-black tree），这是一种特殊的自平衡（self-balancing）二叉搜索树：即使你不断地在树中插入和删除元素，它也绝不会变得过于不平衡，这意味着 \texttt{insert} 和 \texttt{find} 平均总是以 $O(\log n)$ 的时间运行。请注意其内存布局中涉及的指针数量：
+
+\myGraphic{0.9}{images/fig_p109_1.png}{（std::set 的红黑树内存布局）}
+
+既然，按定义，二叉搜索树的元素是按排序次序（由小到大）存储的，\texttt{std::\allowbreak{}set} 提供 \texttt{push\_\allowbreak{}front} 或 \texttt{push\_\allowbreak{}back} 这样的成员函数就没有意义。相反，要向集合中添加元素 \texttt{v}，你用 \texttt{s.\allowbreak{}insert(\allowbreak{}v)\allowbreak{}}；要删除元素，你用 \texttt{s.\allowbreak{}erase(\allowbreak{}v)\allowbreak{}} 或 \texttt{s.\allowbreak{}erase(\allowbreak{}it)\allowbreak{}}：
+
+\begin{codebox}[cpp]
+    std::set<int> s;
+    for (int i : {3, 1, 4, 1, 5}) {
+      s.insert(i);
+    }
+    // 集合中的元素按排序存放并去重。
+    assert((s == std::set{1, 3, 4, 5}));
+    auto it = s.begin();
+    assert(*it == 1);
+    s.erase(4);
+    s.erase(it); // 删除 *it，其值为 1
+    assert((s == std::set{3, 5}));
+\end{codebox}
+
+\texttt{s.\allowbreak{}insert(\allowbreak{}v)\allowbreak{}} 的返回值很有意思。当我们向 \texttt{vector} 中 \texttt{insert} 时，只有两种可能的结果：要么值被成功加入向量（我们得到一个指向新插入元素的迭代器（iterator）），要么插入失败并抛出异常。而当我们向集合中 \texttt{insert} 时，还有第三种可能的结果：插入可能根本不会发生，因为集合里已经有一个 \texttt{v} 的副本了！这虽然不值得用异常的（exceptional）控制流来处理，但调用者可能还是想知道这件事。
+
+因此，\texttt{s.\allowbreak{}insert(\allowbreak{}v)\allowbreak{}} 总是返回一对（pair）返回值：\texttt{ret.\allowbreak{}first} 是指向数据结构中 \texttt{v} 副本的常规迭代器（无论它是否刚刚被插入），而 \texttt{ret.\allowbreak{}second} 在所指的 \texttt{v} 刚刚被插入时为 \texttt{true}，在该 \texttt{v} 本来就在集合中为 \texttt{false}：
+
+\begin{codebox}[cpp]
+    std::set<int> s;
+    auto [it1, b1] = s.insert(1);
+    assert(*it1 == 1 && b1 == true);
+    auto [it2, b2] = s.insert(2);
+    assert(*it2 == 2 && b2 == true);
+    auto [it3, b3] = s.insert(1); // 再次插入
+    assert(*it3 == 1 && b3 == false);
+\end{codebox}
+
+上面那段代码中的方括号变量定义，使用的是 C++17 的结构化绑定（structured bindings）。
+
+正如紧接在前面的那个例子所示，集合中的元素是按次序存储的——不仅在概念上如此，而且肉眼可见：\texttt{*s.\allowbreak{}begin(\allowbreak{})\allowbreak{}} 会是集合中最小的元素，而 \texttt{*std::\allowbreak{}prev(\allowbreak{}s.\allowbreak{}end(\allowbreak{})\allowbreak{})\allowbreak{}} 会是最大的元素。使用标准算法或基于范围的 \texttt{for} 循环来遍历集合，会得到按升序排列的元素（请记住，「升序」的含义由你选择的比较器决定——也就是类模板 \texttt{set} 的 \texttt{Cmp} 参数）。
+
+\texttt{set} 基于树的结构意味着，某些标准算法（如 \texttt{std::\allowbreak{}find} 和 \texttt{std::\allowbreak{}lower\_\allowbreak{}bound}，见第 3 章「迭代器对算法」）仍然能用，但效率很低——算法的迭代器会在树的山脚处上上下下地耗费大量时间，而如果我们能直接访问树结构本身，就可以从树根直接往下，很快找到某个元素的位置。因此，\texttt{std::\allowbreak{}set} 提供了一些成员函数，可用来替代那些低效的算法：
+
+\begin{codebox}[cpp]
+For std::find(s.begin(), s.end(), v), use s.find(v)
+For std::lower_bound(s.begin(), s.end(), v), use s.lower_bound(v)
+For std::upper_bound(s.begin(), s.end(), v), use s.upper_bound(v)
+For std::count(s.begin(), s.end(), v), use s.count(v)
+For std::equal_range(s.begin(), s.end(), v), use s.equal_range(v)
+\end{codebox}
+
+请注意，\texttt{s.\allowbreak{}count(\allowbreak{}v)\allowbreak{}} 永远只会返回 0 或 1，因为集合的元素是去重过的。这使得 \texttt{s.\allowbreak{}count(\allowbreak{}v)\allowbreak{}} 成为集合成员判定（set-membership）操作的一个便利同义词——也就是 Python 里会写成 \texttt{v in s}、Java 里会写成 \texttt{s.\allowbreak{}contains(\allowbreak{}v)\allowbreak{}} 的操作。
+
+\texttt{std::\allowbreak{}map<\allowbreak{}K,\allowbreak{} V>\allowbreak{}} 与 \texttt{std::\allowbreak{}set<\allowbreak{}K>\allowbreak{}} 几乎一样，只是每个键 \texttt{K} 都被允许关联一个值 \texttt{V}；这就构成了一个类似于 Java 的 \texttt{Tree\allowbreak{}Map} 或 Python 的 \texttt{dict} 的数据结构。一如既往，如果你需要按键的某个不同于其自然 \texttt{K::\allowbreak{}operator<} 的排序方式，还有 \texttt{std::\allowbreak{}map<\allowbreak{}K,\allowbreak{} V,\allowbreak{} Cmp>\allowbreak{}}。虽然你多半不会把 \texttt{std::\allowbreak{}map} 想成「只是对 \texttt{std::\allowbreak{}set} 的一层关于键值对（pair）的薄封装」，但它在内存中恰恰就是那个样子：
+
+\myGraphic{0.9}{images/fig_p111_1.png}{（std::map 在内存中的结构）}
+
+\texttt{std::\allowbreak{}map} 支持用 \texttt{operator[]} 进行下标索引，但带有一个令人意外的转折。当你用 \texttt{vec[42]} 去下标访问一个大小为 0 的向量时，会得到未定义行为（UB）。而当你用 \texttt{m[42]} 去下标访问一个大小为 0 的映射时，该映射会很贴心地把自己插入键值对 \texttt{\{42,\allowbreak{} \{\}\}}，并返回该键值对中第二个元素的引用！
+
+这种古怪的行为实际上有助于写出赏心悦目的代码：
+
+\begin{codebox}[cpp]
+    std::map<std::string, std::string> m;
+    m["hello"] = "world";
+    m["quick"] = "brown";
+    m["hello"] = "dolly";
+    assert(m.size() == 2);
+\end{codebox}
+
+但如果你不留神，它也会让人困惑：
+
+\begin{codebox}[cpp]
+    assert(m["literally"] == "");
+    assert(m.size() == 3);
+\end{codebox}
+
+你会注意到，映射并不存在 \texttt{operator[] const}，因为 \texttt{operator[]} 始终保留着向 \texttt{*this} 插入一个新的键值对的可能性。如果你有一个 const 映射——或者只是一个你现在确实不想插入元素的映射——那么对它进行非修改（non-mutating）查询的恰当方式，是使用 \texttt{m.\allowbreak{}find(\allowbreak{}k)\allowbreak{}}。另一个要避免 \texttt{operator[]} 的理由是：如果你的映射的值类型 \texttt{V} 不是默认可构造（default-constructible）的，那么 \texttt{operator[]} 根本就无法编译。在那种情况下（说真的：任何情况下），你都应该使用 \texttt{m.\allowbreak{}insert(\allowbreak{}kv)\allowbreak{}} 或 \texttt{m.\allowbreak{}emplace(\allowbreak{}k,\allowbreak{} v)\allowbreak{}}，去按你期望的样子精确插入那个新的键值对，而不是先默认构造一个值，再对其赋值去覆盖它。下面是一个例子：
+
+\begin{codebox}[cpp]
+    // 容易让人困惑的是，"value_type" 指的是整个键值对。
+    // 类型 K 和 V 分别称为 "key_type" 和 "mapped_type"。
+    using Pair = decltype(m)::value_type;
+    if (m.find("hello") == m.end()) {
+      m.insert(Pair{"hello", "dolly"});
+      // ……或者等价地……
+      m.emplace("hello", "dolly");
+    }
+\end{codebox}
+
+在后 C++11 时代（post–C++11）的普遍共识是：\texttt{std::\allowbreak{}map} 和 \texttt{std::\allowbreak{}set} 基于指针的树，对缓存极不友好，因此你默认应当避免使用它们，而优先选用 \texttt{std::\allowbreak{}unordered\_\allowbreak{}map} 和 \texttt{std::\allowbreak{}unordered\_\allowbreak{}set}。
+
+\subsection{关于透明比较器（transparent comparators）的一点说明}
+
+在最后一个代码示例中，我写了 \texttt{m.\allowbreak{}find(\allowbreak{}"hello")\allowbreak{}}。请注意，\texttt{"hello"} 的类型是 \texttt{const char[6]}，而 \texttt{decltype(\allowbreak{}m)\allowbreak{}::\allowbreak{}key\_\allowbreak{}type} 是 \texttt{std::\allowbreak{}string}，并且（因为我们没有指定任何特别的东西）\texttt{decltype(\allowbreak{}m)\allowbreak{}::\allowbreak{}key\_\allowbreak{}compare} 是 \texttt{std::\allowbreak{}less<\allowbreak{}std::\allowbreak{}string>\allowbreak{}}。这意味着，当我们调用 \texttt{m.\allowbreak{}find(\allowbreak{}"hello")\allowbreak{}} 时，我们调用的函数其第一个参数类型是 \texttt{std::\allowbreak{}string}——因此我们会隐式构造 \texttt{std::\allowbreak{}string(\allowbreak{}"hello")\allowbreak{}} 作为传给 \texttt{find} 的实参。一般而言，\texttt{m.\allowbreak{}find} 的实参会被隐式转换为 \texttt{decltype(\allowbreak{}m)\allowbreak{}::\allowbreak{}key\_\allowbreak{}type}，这可能是一笔昂贵的转换开销。
+
+如果我们的 \texttt{operator<} 行为得当，就可以通过把 \texttt{m} 的比较器改成某个带有异质（heterogeneous）\texttt{operator(\allowbreak{})\allowbreak{}} 并且还定义了成员类型别名（typedef）\texttt{is\_\allowbreak{}transparent} 的类，来避免这笔开销，像这样：
+
+\begin{codebox}[cpp]
+    struct MagicLess {
+      using is_transparent = std::true_type;
+      template<class T, class U>
+      bool operator()(T&& t, U&& u) const {
+        return std::forward<T>(t) < std::forward<U>(u);
+      }
+    };
+    void test()
+    {
+      std::map<std::string, std::string, MagicLess> m;
+      // STL 把 std::less<> 提供为 MagicLess 的同义词。
+      std::map<std::string, std::string, std::less<>> m2;
+      // 现在 'find' 不再构造 std::string 了！
+      auto it = m2.find("hello");
+    }
+\end{codebox}
+
+这里的「魔法」全都发生在 \texttt{std::\allowbreak{}map} 的库实现内部；\texttt{find} 成员函数会专门检查成员 \texttt{is\_\allowbreak{}transparent} 并据此改变其行为。成员函数 \texttt{count}、\texttt{lower\_\allowbreak{}bound}、\texttt{upper\_\allowbreak{}bound} 和 \texttt{equal\_\allowbreak{}range} 也都会改变行为。但奇怪的是，成员函数 \texttt{erase} 却不会！这大概是因为重载决议（overload resolution）很难区分有意的 \texttt{m.\allowbreak{}erase(\allowbreak{}v)\allowbreak{}} 和有意的 \texttt{m.\allowbreak{}erase(\allowbreak{}it)\allowbreak{}}。无论如何，如果你也想在删除时进行异质比较，可以用两步来实现：
+
+\begin{codebox}[cpp]
+    auto [begin, end] = m.equal_range("hello");
+    m.erase(begin, end);
+\end{codebox}
+
+\section{异类：\texttt{std::\allowbreak{}multiset<\allowbreak{}T>\allowbreak{}} 与 \texttt{std::\allowbreak{}multimap<\allowbreak{}K,\allowbreak{} V>\allowbreak{}}}
+
+用 STL 的术语来说，「集合（set）」是一个有序、去重的元素集合。那么自然地，「多重集合（multiset）」就是一个有序、不去重的元素集合！它的内存布局与 \texttt{std::\allowbreak{}set} 的布局完全相同；不同的只是它的不变式（invariant）。请注意下面这张图：\texttt{std::\allowbreak{}multiset} 允许存在两个值都为 42 的元素：
+
+\myGraphic{0.9}{images/fig_p114_1.png}{（std::multiset 允许重复元素）}
+
+\texttt{std::\allowbreak{}multiset<\allowbreak{}T,\allowbreak{} Cmp>\allowbreak{}} 的行为与 \texttt{std::\allowbreak{}set<\allowbreak{}T,\allowbreak{} Cmp>\allowbreak{}} 完全一样，只是它可以存储重复的元素。\texttt{std::\allowbreak{}multimap<\allowbreak{}K,\allowbreak{} V,\allowbreak{} Cmp>\allowbreak{}} 也是如此：
+
+\begin{codebox}[cpp]
+    std::multimap<std::string, std::string> mm;
+    mm.emplace("hello", "world");
+    mm.emplace("quick", "brown");
+    mm.emplace("hello", "dolly");
+    assert(mm.size() == 3);
+    // 键值对按排序次序存放。
+    // 键相同的键值对，保证按它们被插入的次序存放。
+    auto it = mm.begin();
+    using Pair = decltype(mm)::value_type;
+    assert(*(it++) == Pair("hello", "world"));
+    assert(*(it++) == Pair("hello", "dolly"));
+    assert(*(it++) == Pair("quick", "brown"));
+\end{codebox}
+
+在多重集合或多重映射中，\texttt{mm.\allowbreak{}find(\allowbreak{}v)\allowbreak{}} 返回一个指向某个匹配 \texttt{v} 的元素（或键值对）的迭代器——不一定是遍历次序中的第一个。\texttt{mm.\allowbreak{}erase(\allowbreak{}v)\allowbreak{}} 会删除所有键等于 \texttt{v} 的元素（或键值对）。而 \texttt{mm[v]} 并不存在。例如：
+
+\begin{codebox}[cpp]
+    std::multimap<std::string, std::string> mm = {
+      {"hello", "world"},
+      {"quick", "brown"},
+      {"hello", "dolly"},
+    };
+    assert(mm.count("hello") == 2);
+    mm.erase("hello");
+    assert(mm.count("hello") == 0);
+\end{codebox}
+
+\subsection{移动元素而不真正移动它们}
+
+回想一下，对于 \texttt{std::\allowbreak{}list}，我们曾能够把多个链表拼接（splice）在一起，并将元素从一个
+
+把它从一个 \texttt{std::\allowbreak{}list} 转移到另一个，如此等等，借助 \texttt{std::\allowbreak{}list} 的「独门绝技」。到了 C++17，基于树的容器也获得了类似的绝技！合并两个 \texttt{std::\allowbreak{}set} 或 \texttt{std::\allowbreak{}map}（或者多重集合或多重映射）的语法，表面上和合并已排序的 \texttt{std::\allowbreak{}list} 的语法极为相似：
+
+\begin{codebox}[cpp]
+    std::map<std::string, std::string> m = {
+      {"hello", "world"},
+      {"quick", "brown"},
+    };
+    std::map<std::string, std::string> otherm = {
+      {"hello", "dolly"},
+      {"sad", "clown"},
+    };
+    // 这看起来应该很眼熟！
+    m.merge(otherm);
+    assert((otherm == decltype(m){
+      {"hello", "dolly"},
+    }));
+    assert((m == decltype(m){
+      {"hello", "world"},
+      {"quick", "brown"},
+      {"sad", "clown"},
+    }));
+\end{codebox}
+
+然而，请注意出现重复元素时会发生什么！重复的元素不会被转移；它们会被留在右侧的 map 中！这与你从 Python 之类的语言迁移过来时的预期完全相反——在 Python 中，\texttt{d.\allowbreak{}update(\allowbreak{}otherd)\allowbreak{}} 会把右侧字典里的所有映射插入到左侧字典里，覆盖掉原先已有的内容。
+
+与 \texttt{d.\allowbreak{}update(\allowbreak{}otherd)\allowbreak{}} 等价的 C++ 写法是 \texttt{m.\allowbreak{}insert(\allowbreak{}otherm.\allowbreak{}begin(\allowbreak{})\allowbreak{},\allowbreak{}\ otherm.\allowbreak{}end(\allowbreak{})\allowbreak{})\allowbreak{}}。只有在你确定不想覆盖重复项、并且可以接受破坏 \texttt{otherm} 的旧值时，使用 \texttt{m.\allowbreak{}merge(\allowbreak{}otherm)\allowbreak{}} 才说得通（例如，当它是一个即将离开作用域的临时对象时）。
+
+在基于树的容器之间转移元素的另一种方式，是使用成员函数 \texttt{extract} 和 \texttt{insert} 来逐个转移元素：
+
+\begin{codebox}[cpp]
+    std::map<std::string, std::string> m = {
+      {"hello", "world"},
+      {"quick", "brown"},
+    };
+    std::map<std::string, std::string> otherm = {
+      {"hello", "dolly"},
+      {"sad", "clown"},
+    };
+    using Pair = decltype(m)::value_type;
+    // 插入可能成功……
+    auto nh1 = otherm.extract("sad");
+    assert(nh1.key() == "sad" && nh1.mapped() == "clown");
+    auto [it2, inserted2, nh2] = m.insert(std::move(nh1));
+    assert(*it2 == Pair("sad", "clown") && inserted2 == true &&
+    nh2.empty());
+    // ……也可能被已有元素挡住。
+    auto nh3 = otherm.extract("hello");
+    assert(nh3.key() == "hello" && nh3.mapped() == "dolly");
+    auto [it4, inserted4, nh4] = m.insert(std::move(nh3));
+    assert(*it4 == Pair("hello", "world") && inserted4 == false &&
+    !nh4.empty());
+    // 覆盖已有元素很麻烦。
+    m.insert_or_assign(nh4.key(), nh4.mapped());
+    // 通常最简单的做法就是删掉挡住我们想要插入的元素。
+    m.erase(it4);
+    m.insert(std::move(nh4));
+\end{codebox}
+
+\texttt{extract} 返回的对象类型被称为节点句柄（node handle）——本质上是指向数据结构内部的指针。你可以使用访问方法 \texttt{nh.\allowbreak{}key(\allowbreak{})\allowbreak{}} 和 \texttt{nh.\allowbreak{}mapped(\allowbreak{})\allowbreak{}} 来操作 \texttt{std::\allowbreak{}map} 中某个条目的组成部分（对于 \texttt{std::\allowbreak{}set} 的元素，则用 \texttt{nh.\allowbreak{}value(\allowbreak{})\allowbreak{}} 操作其唯一的数据成员）。这样一来，你可以提取、操作并重新插入一个键，而无需对其实际数据进行任何拷贝或移动！在下面这段代码里，「操作」就是一次对 \texttt{std::\allowbreak{}transform} 的调用：
+
+\begin{codebox}[cpp]
+    std::map<std::string, std::string> m = {
+      {"hello", "world"},
+      {"quick", "brown"},
+    };
+    assert(m.begin()->first == "hello");
+    assert(std::next(m.begin())->first == "quick");
+    // 把 {"quick", "brown"} 这个映射的键改为全大写，
+    // 全程不触发任何内存分配。
+    auto nh = m.extract("quick");
+    std::transform(nh.key().begin(), nh.key().end(), nh.key().begin(),
+    ::toupper);
+    m.insert(std::move(nh));
+    assert(m.begin()->first == "QUICK");
+    assert(std::next(m.begin())->first == "hello");
+\end{codebox}
+
+如你所见，这个功能的接口不如 \texttt{lst.\allowbreak{}splice(\allowbreak{}it,\allowbreak{}\ otherlst)\allowbreak{}} 那样干净利落；接口上的微妙之处，正是它直到 C++17 才进入标准库的原因之一。不过，有一个聪明的细节值得注意：假设你从一个 set 里 \texttt{extract} 出一个节点，然后还没来得及把它 \texttt{insert} 进目标 set 就抛出了异常。那个被遗弃的节点会怎样——它会泄漏吗？事实证明，标准库的设计者想到了这种可能性；如果一个节点句柄在被插入新家之前其析构函数就被调用，那么该析构函数会正确地清理掉与该节点相关的内存。因此，单独的 \texttt{extract}（不带 \texttt{insert}）的行为就等同于 \texttt{erase}！
+
+\section{哈希表：\texttt{std::\allowbreak{}unordered\_\allowbreak{}set<\allowbreak{}T>\allowbreak{}} 与 \texttt{std::\allowbreak{}unordered\_\allowbreak{}map<\allowbreak{}K,\allowbreak{} V>\allowbreak{}}}
+
+\texttt{std::\allowbreak{}unordered\_\allowbreak{}set} 类模板表示一种链式哈希表（chained hash table）——也就是说，它是一个固定大小的「桶（bucket）」数组，每个桶里存放着一个单向链表的数据元素。随着新数据元素被加入容器，每个元素都会被放到与其值「哈希（hash）」相关联的那个链表中。这与 Java 的 \texttt{Hash\allowbreak{}Set} 几乎如出一辙。它在内存中的样子如下所示：
+
+\myGraphic{0.9}{images/fig_p118_1.png}{（链式哈希表示意图）}
+
+关于哈希表的文献浩如烟海，而 \texttt{std::\allowbreak{}unordered\_\allowbreak{}set} 远谈不上代表了最先进水平；但由于它减少了一定程度上的指针追踪（pointer-chasing），其性能往往优于基于树的 \texttt{std::\allowbreak{}set}。
+
+\texttt{std::\allowbreak{}unordered\_\allowbreak{}set} 被设计成 \texttt{std::\allowbreak{}set} 的即插即用替代品，因此它提供我们已经见过的相同接口：\texttt{insert} 与 \texttt{erase}，外加用 \texttt{begin} 与 \texttt{end} 进行迭代。不过，与 \texttt{std::\allowbreak{}set} 不同，\texttt{std::\allowbreak{}unordered\_\allowbreak{}set} 的元素并不按排序顺序存储（顾名思义，它是无序的），而且它只提供前向迭代器，而不像 \texttt{std::\allowbreak{}set} 那样提供双向迭代器。（看看前面的示意图——那里有「next」指针却没有「previous」指针，因此在 \texttt{std::\allowbreak{}unordered\_\allowbreak{}set} 中反向迭代是不可能的。）
+
+\texttt{std::\allowbreak{}unordered\_\allowbreak{}map<\allowbreak{}K,\allowbreak{} V>\allowbreak{}} 之于 \texttt{std::\allowbreak{}unordered\_\allowbreak{}set<\allowbreak{}T>\allowbreak{}}，正如 \texttt{std::\allowbreak{}map<\allowbreak{}K,\allowbreak{} V>\allowbreak{}} 之于 \texttt{std::\allowbreak{}set<\allowbreak{}T>\allowbreak{}}。也就是说，它在内存中的样子完全相同，只是它存储的是键值对，而不只是键：
+
+\myGraphic{0.9}{images/fig_p119_1.png}{（无序映射的内存布局示意图）}
+
+与 \texttt{set} 和 \texttt{map} 一样（它们接受一个可选的 comparator 参数），\texttt{unordered\_\allowbreak{}set} 和 \texttt{unordered\_\allowbreak{}map} 也接受若干可选参数。这两个可选参数分别是 \texttt{Hash}（默认为 \texttt{std::\allowbreak{}hash<\allowbreak{}K>\allowbreak{}}）和 \texttt{Key\allowbreak{}Equal}（默认为 \texttt{std::\allowbreak{}equal\_\allowbreak{}to<\allowbreak{}K>\allowbreak{}}，也就是 \texttt{operator==}）。传入不同的哈希函数或不同的键比较函数，会让哈希表改用这些函数，而不是使用默认值。如果你正在对接某个老派的 C++ 类类型，而它既没有实现值语义也没有实现 \texttt{operator==}，这么做或许有用：
+
+\begin{codebox}[cpp]
+    class Widget {
+    public:
+      virtual bool IsEqualTo(Widget const *b) const;
+      virtual int GetHashValue() const;
+    };
+    struct myhash {
+      size_t operator()(const Widget *w) const {
+        return w->GetHashValue();
+      }
+    };
+    struct myequal {
+      bool operator()(const Widget *a, const Widget *b) const {
+        return a->IsEqualTo(b);
+      }
+    };
+    std::unordered_set<Widget *, myhash, myequal> s;
+\end{codebox}
+
+\subsection{负载因子与桶列表}
+
+与 Java 的 \texttt{Hash\allowbreak{}Set} 一样，\texttt{std::\allowbreak{}unordered\_\allowbreak{}set} 暴露了关于其桶的各种管理细节。你可能永远都不需要去跟这些管理函数打交道！
+
+\texttt{s.\allowbreak{}bucket\_\allowbreak{}count(\allowbreak{})\allowbreak{}} 返回数组中当前的桶数量。
+
+\texttt{s.\allowbreak{}bucket(\allowbreak{}v)\allowbreak{}} 返回元素 \texttt{v} 若存在于此 \texttt{unordered\_\allowbreak{}set} 中时所在的桶的索引 \texttt{i}。
+
+\texttt{s.\allowbreak{}bucket\_\allowbreak{}size(\allowbreak{}i)\allowbreak{}} 返回第 \texttt{i} 个桶中元素的数量。可以观察到，恒有 \texttt{s.\allowbreak{}count(\allowbreak{}v)\allowbreak{} <= s.\allowbreak{}bucket\_\allowbreak{}size(\allowbreak{}s.\allowbreak{}bucket(\allowbreak{}v)\allowbreak{})\allowbreak{}}。
+
+\begin{codebox}[cpp]
+s.load_factor() returns s.size() / s.bucket_count() as a float value.
+\end{codebox}
+
+\texttt{s.\allowbreak{}rehash(\allowbreak{}n)\allowbreak{}} 将桶数组的大小精确地增大（或减小）到 \texttt{n}。
+
+你或许已经注意到，到目前为止 \texttt{load\_\allowbreak{}factor} 似乎有点格格不入；\texttt{s.\allowbreak{}size(\allowbreak{})\allowbreak{} /\allowbreak{} s.\allowbreak{}bucket\_\allowbreak{}count(\allowbreak{})\allowbreak{}} 到底有什么要紧，竟然值得拥有自己专属的成员函数？
+
+嗯，这正是 \texttt{unordered\_\allowbreak{}set} 在元素数量增长时自我扩容的机制。
+
+每个 \texttt{unordered\_\allowbreak{}set} 对象 \texttt{s} 都有一个值 \texttt{s.\allowbreak{}max\_\allowbreak{}load\_\allowbreak{}factor(\allowbreak{})\allowbreak{}}，它精确指示了 \texttt{s.\allowbreak{}load\_\allowbreak{}factor(\allowbreak{})\allowbreak{}} 被允许增长到多大。如果一次插入会把 \texttt{s.\allowbreak{}load\_\allowbreak{}factor(\allowbreak{})\allowbreak{}} 推过上限，那么 \texttt{s} 就会重新分配它的桶数组，并对元素重新哈希，以便让 \texttt{s.\allowbreak{}load\_\allowbreak{}factor(\allowbreak{})\allowbreak{}} 保持小于 \texttt{s.\allowbreak{}max\_\allowbreak{}load\_\allowbreak{}factor(\allowbreak{})\allowbreak{}}。
+
+\texttt{s.\allowbreak{}max\_\allowbreak{}load\_\allowbreak{}factor(\allowbreak{})\allowbreak{}} 默认是 \texttt{1.0}。你可以用单参数重载把它设成另一个值 \texttt{k}：\texttt{s.\allowbreak{}max\_\allowbreak{}load\_\allowbreak{}factor(\allowbreak{}k)\allowbreak{}}。不过，基本从来没必要、也不是好主意。
+
+有一个确实说得通的管理操作是 \texttt{s.\allowbreak{}reserve(\allowbreak{}k)\allowbreak{}}。就像向量的 \texttt{vec.\allowbreak{}reserve(\allowbreak{}k)\allowbreak{}} 那样，这个 \texttt{reserve} 成员函数的意思是「我打算做一些插入操作，使这个容器的大小提升到接近 \texttt{k} 的量级。请现在就为那 \texttt{k} 个元素预先分配足够的空间」。对于 \texttt{vector} 而言，这意味着分配一个包含 \texttt{k} 个元素的数组。对于 \texttt{unordered\_\allowbreak{}set} 而言，这意味着分配一个大小为 \texttt{k /\allowbreak{} max\_\allowbreak{}load\_\allowbreak{}factor(\allowbreak{})\allowbreak{}} 个指针的桶数组，这样即使插入了 \texttt{k} 个元素（并伴随预期数量的冲突），负载因子也仍然只会是 \texttt{max\_\allowbreak{}load\_\allowbreak{}factor(\allowbreak{})\allowbreak{}}。
+
+\section{内存从何而来？}
+
+其实，在整章里我一直都在骗你！本章描述过的每个容器——除了 \texttt{std::\allowbreak{}array}——都还接受一个可选的模板类型参数。这个参数叫做分配器（allocator），它指示了「重新分配底层数组」或「在链表上分配一个新节点」这类操作的内存从何而来。\texttt{std::\allowbreak{}array} 不需要分配器，因为它把自己所有的内存都放在自身内部；但其他所有容器类型都需要知道该从哪里获取它们的分配。
+
+这个模板参数的默认值是标准库类型 \texttt{std::\allowbreak{}allocator<\allowbreak{}T>\allowbreak{}}，对大多数用户来说这肯定够用了。关于分配器，我们会在第 8 章「分配器」中详谈。
+
+\section{小结}
+
+本章我们学到了如下内容：容器（container）管理着一组元素的所有权（ownership）。STL 容器始终是围绕元素类型参数化的类模板，有时还会围绕其他相关参数参数化。除了 \texttt{std::\allowbreak{}array<\allowbreak{}T,\allowbreak{} N>\allowbreak{}} 之外，每个容器都可以用一个分配器类型来参数化，以指定它分配和释放内存的方式。使用比较的容器可以用一个比较器类型来参数化。考虑使用透明的比较器类型，例如 \texttt{std::\allowbreak{}less<>}，而不是同构比较器。
+
+使用 \texttt{std::\allowbreak{}vector} 时，要当心重新分配和地址失效。使用大多数容器类型时，要当心迭代器失效。
+
+标准库的理念是：不支持任何天生低效的操作（例如 \texttt{vector::\allowbreak{}push\_\allowbreak{}front}）；同时支持任何天生高效的操作（例如 \texttt{list::\allowbreak{}splice}）。如果你能为一个特定操作想出一种高效的实现，那么 STL 多半已经用某个名字把它实现了；你只需要弄清它到底怎么拼写。
+
+拿不准时，就用 \texttt{std::\allowbreak{}vector}。只有在需要其他容器类型的独门绝技时才使用它们。具体来说，避开基于指针的容器（\texttt{set}、\texttt{map}、\texttt{list}），除非你需要它们的特殊本领（维持有序；提取、合并与拼接）。
+
+像 \texttt{cppreference.\allowbreak{}com} 这样的在线参考资料，是你弄清这些事情的最佳资源。
